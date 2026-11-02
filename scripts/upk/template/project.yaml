@@ -1,0 +1,47 @@
+spec_version: "2.1"
+app_id: io.nowen.note
+version: {{VERSION}}
+support_arch:
+{{SUPPORT_ARCH_LIST}}
+supports:
+  - app
+  - pc
+is_docker_app: true
+only_admin: false
+port: 3001
+open_type: tab
+tag_types:
+  - utility
+  - devtool
+depend_fw_version: 1.13.0.0000
+depend_docker_version: 1.7.0.0000
+parameters:
+  - key: DATA_PATH
+    type: path
+    multi: false
+    required: true
+    changeable: false
+    i18n:
+      en-US:
+        name: Data Directory
+        description: Persistent directory for database, attachments and backups (e.g. /volume1/AppData/nowen-note)
+      zh-CN:
+        name: 数据目录
+        description: 用于存储数据库、附件、备份的持久化目录（例如 /volume1/AppData/nowen-note）
+i18n:
+  en-US:
+    name: Nowen Note
+    description: Self-hosted, privacy-first markdown notes with AI assistance, attachments, full-text search and one-click backup.
+    author: Nowen Note
+    official: https://github.com/nowen-note/nowen-note
+    help: https://github.com/nowen-note/nowen-note/blob/main/README.en.md
+    publisher: Nowen Note
+    publisher_link: https://github.com/nowen-note/nowen-note
+  zh-CN:
+    name: 弄文笔记
+    description: 自托管、注重隐私的 Markdown 笔记应用，支持 AI 助手、附件、全文检索与一键备份。
+    author: 弄文笔记
+    official: https://github.com/nowen-note/nowen-note
+    help: https://github.com/nowen-note/nowen-note/blob/main/README.md
+    publisher: 弄文笔记
+    publisher_link: https://github.com/nowen-note/nowen-note

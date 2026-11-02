@@ -1,0 +1,97 @@
+#!/bin/sh
+# =============================================================================
+# nowen-note 容器启动脚本
+# -----------------------------------------------------------------------------
+# 职责：让镜像"开箱即用"——用户不必手动配置 JWT_SECRET 就能启动，同时保持
+# 生产环境"不使用硬编码默认密钥"的安全基线。
+#
+# 逻辑：
+#   1. 若调用方已显式设置 JWT_SECRET（长度 >= 16）→ 直接使用，不做任何改动。
+#      （高级用户 / K8s / compose 可以继续用外部注入）
+#   2. 否则：在持久化卷 /app/data 下维护一个 .jwt_secret 文件
+#        a. 文件已存在且合法 → 读取并导出，保证重启后 token 不失效
+#        b. 文件不存在 → 生成 64 字节强随机密钥（openssl > /dev/urandom 兜底），
+#           写入文件并 chmod 600，作为本机部署的"一次性生成、永久持有"密钥
+#   3. 对 SHARE_JWT_SECRET 同样处理（用独立文件，未设置则由 backend 从
+#      JWT_SECRET 派生，故此脚本只为它准备"如果以后想强制独立"的占位，不强制生成）
+#
+# 设计考量：
+#   - 密钥落到 /app/data（docker-compose 挂 volume 的位置），容器销毁重建后
+#     保持一致 → 用户不会被莫名其妙登出。
+#   - 每台部署机独立随机值 → 不存在"所有部署共用同一个默认密钥"的风险。
+#   - 任意时刻用户仍可通过 `-e JWT_SECRET=xxx` 覆盖，脚本不会触碰这种情况。
+# =============================================================================
+
+set -eu
+
+DATA_DIR="${NOWEN_DATA_DIR:-/app/data}"
+SECRET_FILE="$DATA_DIR/.jwt_secret"
+
+mkdir -p "$DATA_DIR"
+
+# 版本号自动纠偏：
+# NAS / 应用市场更新容器时，有些平台会复用旧容器的环境变量，导致
+# NOWEN_APP_VERSION 仍停在旧版本（例如 1.1.4），而镜像里的前端/后端已经是新版本。
+# 启动时优先用镜像内 package.json 纠正 NOWEN_APP_VERSION；只有显式设置
+# NOWEN_APP_VERSION_OVERRIDE 时才允许外部强制覆盖。
+PACKAGED_APP_VERSION="$(node -e 'const fs=require("fs"); for (const [p,n] of [["/app/package.json","nowen-note"],["/app/backend/package.json","nowen-note-backend"]]) { try { const pkg=JSON.parse(fs.readFileSync(p,"utf8")); if (pkg.name===n && pkg.version) { process.stdout.write(String(pkg.version)); process.exit(0); } } catch (_) {} }' 2>/dev/null || true)"
+if [ -n "${NOWEN_APP_VERSION_OVERRIDE:-}" ]; then
+  NOWEN_APP_VERSION="$NOWEN_APP_VERSION_OVERRIDE"
+  export NOWEN_APP_VERSION
+  echo "[entrypoint] NOWEN_APP_VERSION forced by NOWEN_APP_VERSION_OVERRIDE=$NOWEN_APP_VERSION"
+elif [ -n "$PACKAGED_APP_VERSION" ]; then
+  if [ "${NOWEN_APP_VERSION:-}" != "$PACKAGED_APP_VERSION" ]; then
+    echo "[entrypoint] NOWEN_APP_VERSION normalized: ${NOWEN_APP_VERSION:-<empty>} -> $PACKAGED_APP_VERSION"
+  fi
+  NOWEN_APP_VERSION="$PACKAGED_APP_VERSION"
+  export NOWEN_APP_VERSION
+fi
+
+# 生成强随机密钥（64 字节 base64，约 88 字符）。优先 openssl，回退 /dev/urandom
+gen_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 48
+  else
+    # base64 所有 Linux 基础镜像都有；head -c 64 从 urandom 取 64 字节
+    head -c 64 /dev/urandom | base64 | tr -d '\n'
+  fi
+}
+
+# 只有当 JWT_SECRET 未设置或过短时才自动接管。
+# backend 的校验标准是 length >= 16，与此处保持一致。
+if [ -z "${JWT_SECRET:-}" ] || [ "$(printf %s "${JWT_SECRET:-}" | wc -c)" -lt 16 ]; then
+  if [ -s "$SECRET_FILE" ] && [ "$(wc -c < "$SECRET_FILE")" -ge 16 ]; then
+    # 复用已有密钥：重启 / 容器重建后用户不被登出
+    JWT_SECRET="$(cat "$SECRET_FILE")"
+    echo "[entrypoint] JWT_SECRET loaded from $SECRET_FILE (persisted on first boot)"
+  else
+    # 首次启动：生成并持久化
+    NEW_SECRET="$(gen_secret)"
+    # trim 可能的尾随换行
+    NEW_SECRET="$(printf %s "$NEW_SECRET" | tr -d '\n')"
+    printf %s "$NEW_SECRET" > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE" || true
+    JWT_SECRET="$NEW_SECRET"
+    echo "[entrypoint] JWT_SECRET auto-generated and stored at $SECRET_FILE"
+    echo "[entrypoint]   → 每台部署机拥有独立随机密钥；如需手动指定可通过环境变量覆盖"
+  fi
+  export JWT_SECRET
+else
+  echo "[entrypoint] JWT_SECRET provided via environment (length=$(printf %s "$JWT_SECRET" | wc -c)), using as-is"
+fi
+
+# Private NAS deployments prepare a strong first-run password before the HTTP server starts.
+# Existing databases retain their current accounts; seedDatabase only uses this for an empty DB.
+if [ "${NOWEN_SECURE_BOOTSTRAP:-0}" = "1" ]; then
+  INITIAL_PASSWORD_FILE="$DATA_DIR/.initial_admin_password"
+  if [ ! -s "$INITIAL_PASSWORD_FILE" ]; then
+    (umask 077; gen_secret | tr -d '\n' > "$INITIAL_PASSWORD_FILE")
+  fi
+  chmod 600 "$INITIAL_PASSWORD_FILE"
+  NOWEN_INITIAL_ADMIN_PASSWORD="$(cat "$INITIAL_PASSWORD_FILE")"
+  export NOWEN_INITIAL_ADMIN_PASSWORD
+  echo "[entrypoint] First-run admin credential prepared in $INITIAL_PASSWORD_FILE (used only for a new database)"
+fi
+
+# 交棒给原 CMD
+exec "$@"

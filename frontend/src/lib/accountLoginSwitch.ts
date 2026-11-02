@@ -1,0 +1,164 @@
+import { setServerUrl, testServerConnection } from "@/lib/api";
+import { getResolvedApiBaseUrl } from "@/lib/serverUrl";
+import { getDeviceId } from "@/lib/deviceId";
+import { loadRememberedCredentials } from "@/lib/rememberLogin";
+import type { User } from "@/types";
+import { clearAuthTokens, refreshAccessToken, storeAuthTokens } from "@/lib/authSession";
+import { completeMobileAccountLogin, isAndroidNativeRuntime, requestMobileAccountLogin } from "@/lib/mobileLocalMode";
+import {
+  type AccountLoginHistoryItem,
+  CURRENT_ACCOUNT_HISTORY_ID_KEY,
+  loadAccountLoginToken,
+  markAccountLoginRequiresReauth,
+  saveAccountLoginHistory,
+  setPendingAccountReauth,
+} from "@/lib/accountLoginHistory";
+
+export type AccountLoginSwitchResult =
+  | { status: "switched"; token: string; user: User }
+  | { status: "requires_reauth"; message?: string }
+  | { status: "network_error"; message?: string }
+  | { status: "storage_error" }
+  | { status: "failed"; message?: string };
+
+const AUTH_INVALID_CODES = new Set([
+  "ACCOUNT_DISABLED",
+  "TOKEN_REVOKED",
+  "USER_NOT_FOUND",
+  "TOKEN_INVALID",
+  "SESSION_REVOKED",
+  "SESSION_EXPIRED",
+  "UNAUTHENTICATED",
+]);
+
+const EXPLICIT_REAUTH_CODES = new Set([
+  "ACCOUNT_DISABLED",
+  "TOKEN_REVOKED",
+  "USER_NOT_FOUND",
+  "SESSION_EXPIRED",
+]);
+
+async function prepareReauth(account: AccountLoginHistoryItem, message?: string): Promise<AccountLoginSwitchResult> {
+  await markAccountLoginRequiresReauth(account.id);
+  setPendingAccountReauth({ id: account.id, serverUrl: account.serverUrl, username: account.username });
+  setServerUrl(account.serverUrl);
+  if (isAndroidNativeRuntime()) requestMobileAccountLogin();
+  clearAuthTokens();
+  if ((window as any).nowenDesktop?.isDesktop) {
+    // 防止刷新到登录页时 Electron full 模式重新注入本地账号，覆盖目标服务器。
+    localStorage.setItem("nowen-prefer-cloud", "1");
+  }
+  try { window.dispatchEvent(new CustomEvent("nowen:token-changed")); } catch { /* ignore */ }
+  return { status: "requires_reauth", message };
+}
+
+async function commitSwitch(
+  account: AccountLoginHistoryItem,
+  token: string,
+  refreshToken: string | undefined,
+  user: User,
+): Promise<AccountLoginSwitchResult> {
+  setServerUrl(account.serverUrl);
+  if (isAndroidNativeRuntime()) completeMobileAccountLogin();
+  storeAuthTokens({ token, refreshToken: refreshToken ?? null });
+  localStorage.setItem(CURRENT_ACCOUNT_HISTORY_ID_KEY, account.id);
+  await saveAccountLoginHistory({ serverUrl: account.serverUrl, token, refreshToken, user });
+  try { window.dispatchEvent(new CustomEvent("nowen:token-changed")); } catch { /* ignore */ }
+  return { status: "switched", token, user };
+}
+
+async function retryWithRememberedPassword(
+  account: AccountLoginHistoryItem,
+  invalidMessage?: string,
+): Promise<AccountLoginSwitchResult> {
+  const saved = await loadRememberedCredentials().catch(() => null);
+  const sameServer = saved?.serverUrl.replace(/\/+$/, "").toLowerCase()
+    === account.serverUrl.replace(/\/+$/, "").toLowerCase();
+  if (!saved?.hasPassword || !saved.password || !sameServer || saved.username !== account.username) {
+    return prepareReauth(account, invalidMessage);
+  }
+
+  try {
+    const response = await fetch(`${getResolvedApiBaseUrl(account.serverUrl)}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: saved.username,
+        password: saved.password,
+        deviceId: getDeviceId(),
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body?.token || !body?.user?.id || !body?.user?.username) {
+      return prepareReauth(account, body?.error || invalidMessage);
+    }
+    return commitSwitch(account, body.token, body.refreshToken, body.user as User);
+  } catch (error: any) {
+    return { status: "network_error", message: error?.message || "无法连接目标服务器" };
+  }
+}
+
+export async function switchAccountLogin(account: AccountLoginHistoryItem): Promise<AccountLoginSwitchResult> {
+  const probe = await testServerConnection(account.serverUrl);
+  if (!probe.ok) return { status: "network_error", message: probe.error };
+  const apiBaseUrl = probe.apiBaseUrl || getResolvedApiBaseUrl(account.serverUrl);
+  const loaded = await loadAccountLoginToken(account.id);
+  if (!loaded.ok || !loaded.token) {
+    if (loaded.error === "TOKEN_UNAVAILABLE") return retryWithRememberedPassword(account);
+    return { status: "storage_error" };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    // /api/me 经过全局 JWT + session 中间件，会正确拒绝已被下线的 jti。
+    // /api/auth/verify 在旧服务端只校验 JWT 签名，会把已撤销会话误判为有效。
+    const response = await fetch(`${apiBaseUrl}/me`, {
+      headers: { Authorization: `Bearer ${loaded.token}` },
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => ({}));
+    const code = typeof body?.code === "string" ? body.code : "";
+    if (response.status === 401 || AUTH_INVALID_CODES.has(code)) {
+      if (EXPLICIT_REAUTH_CODES.has(code)) {
+        return prepareReauth(account, body?.error);
+      }
+      if (loaded.refreshToken) {
+        try {
+          const token = await refreshAccessToken(apiBaseUrl, {
+            refreshToken: loaded.refreshToken,
+            persist: false,
+          });
+          if (token) {
+            const retry = await fetch(`${apiBaseUrl}/me`, {
+              headers: { Authorization: `Bearer ${token}` },
+              signal: controller.signal,
+            });
+            const retryBody = await retry.json().catch(() => ({}));
+            if (retry.ok && retryBody?.id && retryBody?.username) {
+              return commitSwitch(account, token, loaded.refreshToken, retryBody as User);
+            }
+            if (retry.status >= 500) {
+              return { status: "network_error", message: retryBody?.error || `HTTP ${retry.status}` };
+            }
+          }
+        } catch (refreshError: any) {
+          if (refreshError?.terminal) return prepareReauth(account, body?.error);
+          return { status: "network_error", message: refreshError?.message || "无法连接目标服务器" };
+        }
+      }
+      return retryWithRememberedPassword(account, body?.error);
+    }
+    if (!response.ok) {
+      return { status: "network_error", message: body?.error || `HTTP ${response.status}` };
+    }
+    if (!body?.id || !body?.username) {
+      return { status: "failed", message: "服务器返回的账号信息不完整" };
+    }
+    return commitSwitch(account, loaded.token, loaded.refreshToken, body as User);
+  } catch (error: any) {
+    return { status: "network_error", message: error?.message || "无法连接目标服务器" };
+  } finally {
+    clearTimeout(timer);
+  }
+}

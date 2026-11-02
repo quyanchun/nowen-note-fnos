@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nowen Note 采集</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <div class="brand">
+          <img src="../icons/icon-32.png" class="logo" alt="" />
+          <div>
+            <h1>Nowen Note</h1>
+            <p id="account-preview" class="account-preview">统一采集入口</p>
+          </div>
+        </div>
+        <button id="open-options-footer" class="icon-button" title="设置" aria-label="设置">⚙</button>
+      </header>
+
+      <div id="not-configured" class="empty-state hidden">
+        <strong>尚未连接 Nowen Note</strong>
+        <p>请先填写服务器地址并登录账号。</p>
+        <button id="open-options" class="btn primary">打开设置</button>
+      </div>
+
+      <main id="main" class="hidden">
+        <section class="card mode-card">
+          <label class="field-label" for="clip-mode">采集方式</label>
+          <select id="clip-mode" class="control mode-select">
+            <option value="quickNote">速记</option>
+            <option value="article">完整正文</option>
+            <option value="simplified">简化正文</option>
+            <option value="selection">当前选区</option>
+            <option value="fullpage">完全克隆页面</option>
+            <option value="screenshot">当前屏幕截图</option>
+            <option value="fullScreenshot">整个页面截图</option>
+          </select>
+          <div id="page-title-row" class="page-preview">
+            <span class="page-kicker">当前页面</span>
+            <span id="page-title" class="page-title">加载中...</span>
+          </div>
+        </section>
+
+        <section id="quick-note-panel" class="card hidden">
+          <div class="section-heading">
+            <div>
+              <h2>快速记录</h2>
+              <p>支持 Markdown，不需要先打开 Nowen 页面。</p>
+            </div>
+          </div>
+          <label class="field">
+            <span class="field-label">标题</span>
+            <input id="quick-title" class="control" type="text" maxlength="200" placeholder="可留空，将从正文首行生成" />
+          </label>
+          <label class="field">
+            <span class="field-label">正文</span>
+            <textarea id="quick-content" class="control quick-content" rows="7" placeholder="# 想法\n\n直接输入 Markdown..."></textarea>
+          </label>
+        </section>
+
+        <section class="card">
+          <div class="section-heading compact">
+            <div>
+              <h2>保存位置</h2>
+              <p>个人空间和工作区按当前账号加载。</p>
+            </div>
+            <span id="permission-badge" class="permission-badge">可写</span>
+          </div>
+          <div class="grid-two">
+            <label class="field">
+              <span class="field-label">空间</span>
+              <select id="workspace" class="control"></select>
+            </label>
+            <label class="field">
+              <span class="field-label">笔记本</span>
+              <select id="notebook" class="control"></select>
+            </label>
+          </div>
+          <p id="permission-hint" class="hint"></p>
+        </section>
+
+        <section class="card">
+          <div class="grid-two">
+            <label class="field">
+              <span class="field-label">标签</span>
+              <input id="tags" class="control" type="text" placeholder="技术, 剪藏" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="field-label">内容格式</span>
+              <select id="output-format" class="control">
+                <option value="markdown">Markdown</option>
+                <option value="html">HTML</option>
+              </select>
+            </label>
+          </div>
+          <div class="option-row">
+            <label class="check-option">
+              <input id="pin-note" type="checkbox" />
+              <span>保存后置顶</span>
+            </label>
+            <label id="image-option" class="field inline-field">
+              <span class="field-label">图片</span>
+              <select id="image-mode" class="control compact-control">
+                <option value="inline">下载到 Nowen</option>
+                <option value="link">保留外链</option>
+                <option value="skip">忽略图片</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section id="web-options-panel" class="card">
+          <label class="field">
+            <span class="field-label">附加评论</span>
+            <textarea id="comment" class="control" rows="2" placeholder="可选：记录为什么收藏这篇内容"></textarea>
+          </label>
+
+          <div class="ai-box">
+            <label class="check-option ai-toggle">
+              <input id="ai-enhance" type="checkbox" />
+              <span>使用 AI 优化</span>
+            </label>
+            <button id="ai-toggle-details" type="button" class="text-button">任务设置</button>
+            <div id="ai-details" class="ai-details hidden">
+              <label><input type="checkbox" data-task="summary" /> 摘要</label>
+              <label><input type="checkbox" data-task="tags" /> 自动标签</label>
+              <label><input type="checkbox" data-task="outline" /> 大纲</label>
+              <label><input type="checkbox" data-task="title" /> 重写标题</label>
+              <label><input type="checkbox" data-task="highlight" /> 重点</label>
+              <label><input type="checkbox" data-task="translation" /> 翻译</label>
+              <select id="ai-mode" class="control ai-mode">
+                <option value="prepend">AI 内容置顶</option>
+                <option value="append">AI 内容追加</option>
+                <option value="replace">仅保留 AI 内容</option>
+              </select>
+            </div>
+          </div>
+        </section>
+
+        <button id="clip" class="btn primary save-button">保存到 Nowen Note</button>
+
+        <div id="progress" class="progress hidden">
+          <span class="spinner"></span>
+          <span id="progress-text">准备中...</span>
+        </div>
+
+        <div id="result" class="result hidden">
+          <div id="result-message"></div>
+          <a id="result-link" class="note-link hidden" href="#" target="_blank" rel="noopener noreferrer">打开笔记 ↗</a>
+          <div id="warning-list" class="warning-list hidden"></div>
+          <details id="image-failures" class="failure-details hidden">
+            <summary>查看未保存的图片</summary>
+            <ul id="image-failure-list"></ul>
+          </details>
+        </div>
+
+        <footer>
+          <span id="server-preview"></span>
+          <button id="reset-current-account" class="footer-button">恢复当前账号默认选择</button>
+        </footer>
+      </main>
+    </div>
+    <script type="module" src="./popup.ts"></script>
+  </body>
+</html>

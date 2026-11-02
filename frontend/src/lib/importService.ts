@@ -1,0 +1,261 @@
+import {
+  readMarkdownFromZipWithMeta as readMarkdownFromZipWithMetaBase,
+  readMarkdownFiles as readMarkdownFilesBase,
+  importNotes as importNotesBase,
+} from "./importService.base";
+import type {
+  ImportFileInfo,
+  ImportOptions,
+  ImportProgress,
+  ImportTargetContentFormat,
+  ZipImportMeta,
+} from "./importService.base";
+import {
+  requestRoundTripImportReview,
+  submitRoundTripPackage,
+  type RoundTripImportStrategy,
+} from "./roundTripImportReview";
+import { requestRoundTripPermissionReview } from "./roundTripPermissionReview";
+import { normalizeImportedHtmlContent } from "./singleFileHtmlImport";
+
+export {
+  tiptapExtensions,
+  MAX_PDF_SIZE,
+  PDF_NO_TEXT_LAYER_FLAG,
+  PDF_TOO_LARGE_FLAG,
+  deriveNotebookNameFromFile,
+  markdownToSimpleHtml,
+  convertToTiptapJson,
+  extractPlainText,
+  importMarkdownAsNote,
+} from "./importService.base";
+export type {
+  ImportFileInfo,
+  ImportOptions,
+  ImportProgress,
+  ImportTargetContentFormat,
+  ZipImportMeta,
+  ImportMarkdownAsNoteResult,
+} from "./importService.base";
+
+type RoundTripImportFile = ImportFileInfo & {
+  __nowenRoundTripPackage?: File;
+  __nowenPackageVersion?: number;
+  __nowenPackageKind?: string;
+};
+
+export interface PackageManifestPreview {
+  format?: string;
+  formatVersion?: number;
+  packageKind?: string;
+  app?: string;
+  exportedAt?: string;
+  counts?: {
+    notebooks?: number;
+    notes?: number;
+    attachments?: number;
+  };
+}
+
+const HTML_IMPORT_SOURCES = new Set(["html", "xiaomi", "oppo", "vivo", "oneplus"]);
+
+export function parseRoundTripPackageManifest(source: string): PackageManifestPreview | null {
+  let manifest: PackageManifestPreview;
+  try {
+    manifest = JSON.parse(source) as PackageManifestPreview;
+  } catch {
+    return null;
+  }
+  if (manifest?.format !== "nowen-package") return null;
+  if (![1, 2].includes(Number(manifest.formatVersion))) {
+    throw new Error(`不支持的 Nowen 数据包版本：${String(manifest.formatVersion ?? "未知")}`);
+  }
+  return manifest;
+}
+
+async function readRoundTripManifest(file: File): Promise<PackageManifestPreview | null> {
+  let source: string;
+  try {
+    const JSZip = (await import("jszip")).default;
+    const zip = await JSZip.loadAsync(file);
+    const entry = zip.file("manifest.json");
+    if (!entry) return null;
+    source = await entry.async("string");
+  } catch {
+    return null;
+  }
+  return parseRoundTripPackageManifest(source);
+}
+
+export function createRoundTripPackageImportFile(
+  file: File,
+  manifest: PackageManifestPreview,
+): ImportFileInfo {
+  const title = file.name.replace(/(?:\.nowen)?\.zip$/i, "") || "Nowen 数据包";
+  return {
+    name: file.name,
+    title,
+    content: "",
+    size: file.size,
+    selected: true,
+    source: "nowen-package",
+    __nowenRoundTripPackage: file,
+    __nowenPackageVersion: Number(manifest.formatVersion),
+    __nowenPackageKind: manifest.packageKind || "nowen",
+  } as RoundTripImportFile;
+}
+
+/**
+ * Browser-saved HTML (especially SingleFile) needs a DOM-aware preprocessing pass before the
+ * generic importer sees it. The base reader still owns file validation/title/source detection;
+ * this wrapper only narrows the document to its article root and de-duplicates embedded images.
+ */
+export async function readMarkdownFiles(files: FileList | File[]): Promise<ImportFileInfo[]> {
+  const fileInfos = await readMarkdownFilesBase(files);
+  return fileInfos.map((fileInfo) => {
+    if (!HTML_IMPORT_SOURCES.has(String(fileInfo.source || ""))) return fileInfo;
+    return {
+      ...fileInfo,
+      content: normalizeImportedHtmlContent(fileInfo.content),
+    };
+  });
+}
+
+/**
+ * Nowen 自己导出的 Markdown ZIP 和 .nowen.zip 都携带 round-trip manifest。
+ * 这类包不能再走“逐个 Markdown 文件推断目录”的旧链路，否则空目录、普通附件、
+ * 排序和稳定 ID 映射都会丢失。这里只返回一个包级占位项，正式导入交给服务端事务。
+ */
+export async function readMarkdownFromZipWithMeta(
+  file: File,
+): Promise<{ files: ImportFileInfo[]; meta: ZipImportMeta | null }> {
+  const manifest = await readRoundTripManifest(file);
+  if (!manifest) return readMarkdownFromZipWithMetaBase(file);
+
+  const packageEntry = createRoundTripPackageImportFile(file, manifest);
+  const meta = {
+    version: String(manifest.formatVersion || ""),
+    app: "nowen-note",
+    exportedAt: manifest.exportedAt,
+    totalNotes: manifest.counts?.notes,
+    notebooks: [],
+  } as ZipImportMeta;
+  return { files: [packageEntry], meta };
+}
+
+export async function readMarkdownFromZip(file: File): Promise<ImportFileInfo[]> {
+  return (await readMarkdownFromZipWithMeta(file)).files;
+}
+
+function targetLabel(workspaceId?: string): string {
+  if (!workspaceId || workspaceId === "personal") return "个人空间";
+  return "所选工作区";
+}
+
+/**
+ * Round-trip package import is atomic. Copy remains the safe default; merge reuses exact sibling
+ * folders; sync only updates stable source mappings that have no local edits.
+ */
+export async function importNotes(
+  fileInfos: ImportFileInfo[],
+  notebookId?: string,
+  onProgress?: (progress: ImportProgress) => void,
+  options?: ImportOptions,
+): Promise<{ success: boolean; count: number }> {
+  const selected = fileInfos.filter((item) => item.selected) as RoundTripImportFile[];
+  const packageItems = selected.filter((item) => item.__nowenRoundTripPackage instanceof File);
+  if (!packageItems.length) return importNotesBase(fileInfos, notebookId, onProgress, options);
+  if (packageItems.length !== 1 || selected.length !== 1) {
+    onProgress?.({ phase: "error", current: 0, total: selected.length, message: "Nowen 数据包必须单独导入" });
+    return { success: false, count: 0 };
+  }
+
+  const file = packageItems[0].__nowenRoundTripPackage!;
+  const submitOptionsFor = (strategy: RoundTripImportStrategy) => ({
+    workspaceId: options?.workspaceId,
+    targetNotebookId: strategy === "sync" ? undefined : notebookId || undefined,
+  });
+  try {
+    onProgress?.({ phase: "reading", current: 0, total: 1, message: "正在校验目录、附件和来源映射…" });
+    const copyPreview = await submitRoundTripPackage(file, {
+      ...submitOptionsFor("copy"),
+      dryRun: true,
+      strategy: "copy",
+    });
+    const decision = await requestRoundTripImportReview(copyPreview, {
+      fileName: file.name,
+      targetLabel: options?.targetLabel || targetLabel(options?.workspaceId),
+      source: "shared-import",
+      initialStrategy: "copy",
+      loadPreview: (strategy) => submitRoundTripPackage(file, {
+        ...submitOptionsFor(strategy),
+        dryRun: true,
+        strategy,
+      }),
+    });
+    if (!decision.accepted) {
+      onProgress?.({ phase: "error", current: 0, total: 1, message: "已取消导入，未写入任何数据" });
+      return { success: false, count: 0 };
+    }
+
+    const selectedPreview = decision.strategy === "copy"
+      ? copyPreview
+      : await submitRoundTripPackage(file, {
+          ...submitOptionsFor(decision.strategy),
+          dryRun: true,
+          strategy: decision.strategy,
+        });
+    const permissionDecision = await requestRoundTripPermissionReview(selectedPreview.package?.permissions);
+    const conflicts = Array.isArray(selectedPreview?.conflicts) ? selectedPreview.conflicts.length : 0;
+    onProgress?.({
+      phase: "uploading",
+      current: 0,
+      total: 1,
+      message: decision.strategy === "sync"
+        ? `正在执行安全增量同步${conflicts ? `（${conflicts} 项变更或冲突）` : ""}…`
+        : decision.strategy === "merge"
+          ? `正在按合并计划导入${conflicts ? `（${conflicts} 项处理）` : ""}…`
+          : conflicts > 0
+            ? `已确认 ${conflicts} 个重名处理方案，正在创建独立副本`
+            : "预检已确认，正在原样恢复目录和附件…",
+    });
+    const result = await submitRoundTripPackage(file, {
+      ...submitOptionsFor(decision.strategy),
+      dryRun: false,
+      strategy: decision.strategy,
+      applyPermissions: permissionDecision.applyPermissions,
+      permissionMappings: permissionDecision.permissionMappings,
+    });
+
+    const createdNotes = Number(result?.counts?.notes || 0);
+    const updatedNotes = Number(result?.counts?.updatedNotes || 0);
+    const affectedCount = createdNotes + updatedNotes;
+    const warningCount = Array.isArray(result?.warnings) ? result.warnings.length : 0;
+    const mergedCount = Number(result?.counts?.mergedNotebooks || 0);
+    const renamedCount = Number(result?.counts?.renamedNotes || 0);
+    const unchangedCount = Number(result?.counts?.unchangedNotes || 0);
+    const localConflictCount = Number(result?.counts?.localConflicts || 0);
+
+    onProgress?.({
+      phase: "done",
+      current: affectedCount,
+      total: affectedCount,
+      message: decision.strategy === "sync"
+        ? `同步完成，新增 ${createdNotes} 篇、更新 ${updatedNotes} 篇、无需变更 ${unchangedCount} 篇${localConflictCount ? `，${localConflictCount} 项本地修改已保留` : ""}`
+        : decision.strategy === "merge"
+          ? `导入完成，共 ${createdNotes} 篇笔记，复用 ${mergedCount} 个目录${renamedCount ? `，${renamedCount} 篇同名笔记已编号` : ""}`
+          : warningCount > 0
+            ? `导入完成，共 ${createdNotes} 篇笔记，${warningCount} 项需要检查`
+            : `导入完成，共 ${createdNotes} 篇笔记`,
+    });
+    return { success: true, count: decision.strategy === "sync" ? affectedCount : createdNotes };
+  } catch (error) {
+    onProgress?.({
+      phase: "error",
+      current: 0,
+      total: 1,
+      message: `导入失败：${error instanceof Error ? error.message : String(error)}`,
+    });
+    return { success: false, count: 0 };
+  }
+}

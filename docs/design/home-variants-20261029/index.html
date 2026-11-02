@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nowen Note 首页 · 四版视觉方案</title>
+<style>
+  :root{
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --serif: "Songti SC", "Source Han Serif SC", "Noto Serif SC", "SimSun", serif;
+    --line:#e8eaee;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    font-family:var(--sans);
+    background:#eceef1;
+    color:#1b1d22;
+    -webkit-font-smoothing:antialiased;
+    padding-bottom:60px;
+  }
+  /* ---------- 页面外壳 ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:20;
+    background:rgba(255,255,255,.86);
+    backdrop-filter:saturate(180%) blur(14px);
+    border-bottom:1px solid #dcdfe4;
+  }
+  .topbar-in{
+    max-width:1320px; margin:0 auto; padding:14px 28px;
+    display:flex; align-items:center; gap:22px; flex-wrap:wrap;
+  }
+  .title{font-size:14px; font-weight:600; letter-spacing:.2px;}
+  .title small{font-weight:400; color:#7b8290; margin-left:10px; font-size:12px; letter-spacing:0;}
+  .tabs{display:flex; gap:6px; margin-left:auto;}
+  .tab{
+    appearance:none; border:1px solid transparent; background:transparent;
+    font-family:inherit; font-size:13px; color:#4c525d; cursor:pointer;
+    padding:7px 14px; border-radius:8px; display:flex; align-items:center; gap:8px;
+    transition:.16s;
+  }
+  .tab b{
+    font-size:11px; font-weight:700; width:16px; height:16px; border-radius:4px;
+    background:#e6e8ec; color:#5c626d; display:grid; place-items:center;
+  }
+  .tab:hover{background:#f0f1f4;}
+  .tab.on{background:#1b1d22; color:#fff;}
+  .tab.on b{background:rgba(255,255,255,.2); color:#fff;}
+
+  .stage{max-width:1320px; margin:0 auto; padding:26px 28px 0;}
+  .case{display:none;}
+  .case.on{display:block; animation:in .3s ease;}
+  @keyframes in{from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;}}
+
+  .case-head{display:flex; align-items:baseline; gap:12px; margin:0 0 14px;}
+  .case-head .k{
+    font:700 11px/22px var(--sans); letter-spacing:.1em; color:#fff;
+    background:#1b1d22; border-radius:5px; padding:0 7px; height:22px; display:inline-block;
+  }
+  .case-head h2{margin:0; font-size:17px; font-weight:650; letter-spacing:-.2px;}
+  .case-head p{margin:0; font-size:12.5px; color:#6d7480;}
+
+  .viewport{
+    position:relative; width:100%; overflow:hidden;
+    border-radius:14px; background:#fff;
+    box-shadow:0 1px 2px rgba(16,24,40,.06), 0 12px 34px -12px rgba(16,24,40,.22);
+    transition:height .2s;
+  }
+  .screen{
+    position:absolute; top:0; left:50%; margin-left:-640px;
+    width:1280px; height:820px; overflow:hidden;
+    transform-origin:top center;
+  }
+  .case-note{
+    display:flex; gap:26px; flex-wrap:wrap;
+    margin:14px 2px 34px; font-size:12.5px; line-height:1.85; color:#545b66;
+  }
+  .case-note div{flex:1 1 260px; min-width:240px;}
+  .case-note b{color:#1b1d22; font-weight:600;}
+
+  /* =====================================================
+     A · 墨纸  Editorial
+     ===================================================== */
+  .v1{background:#fdfdfb; color:#22221f;}
+  .v1 .v1-in{position:absolute; inset:0; padding:46px 0 40px 108px;}
+  .v1-bar{display:flex; align-items:center; justify-content:space-between; width:800px;}
+  .v1-brand{display:flex; align-items:center; gap:11px;}
+  .v1-mark{
+    width:30px; height:30px; border:1px solid #22221f; border-radius:4px;
+    display:grid; place-items:center; font:600 17px/1 var(--serif);
+  }
+  .v1-brand span{font-size:13.5px; font-weight:600; letter-spacing:.2px;}
+  .v1-links{display:flex; gap:20px; font-size:12.5px; color:#9a9a91; letter-spacing:.3px;}
+  .v1-links span:hover{color:#22221f;}
+  .v1-eye{
+    margin:74px 0 0; font-size:10.5px; letter-spacing:.28em; color:#a5a59b;
+    font-weight:500;
+  }
+  .v1-h1{
+    margin:20px 0 0; font-family:var(--serif); font-weight:600;
+    font-size:60px; line-height:1.24; letter-spacing:1px; color:#1e1e1b;
+  }
+  .v1-h1 em{font-style:normal; color:#8f8f85;}
+  .v1-lede{margin:20px 0 0; font-size:14.5px; color:#8b8b81; letter-spacing:.4px;}
+  .v1-tabs{
+    margin:56px 0 0; display:flex; gap:24px; font-size:13px; align-items:center;
+  }
+  .v1-tabs b{font-weight:600; color:#22221f; padding-bottom:6px; border-bottom:1.5px solid #22221f;}
+  .v1-tabs i{font-style:normal; color:#a0a097;}
+  .v1-search{
+    margin-top:22px; width:800px; display:flex; align-items:center; gap:12px;
+    border-bottom:1px solid #d8d8cd; padding:0 2px 13px;
+  }
+  .v1-search svg{width:17px; height:17px; color:#a5a59b; flex:none;}
+  .v1-search .ph{font-size:14.5px; color:#b0b0a5; flex:1;}
+  .v1-search .ent{font-size:11px; color:#b8b8ad; border:1px solid #dedeD3; border-radius:3px; padding:1px 5px;}
+  .v1-sec{
+    margin:44px 0 0; width:800px; border-top:1px solid #e4e4da; padding-top:22px;
+  }
+  .v1-cap-h{display:flex; align-items:baseline; gap:14px;}
+  .v1-cap-h .no{font:500 10.5px/1 var(--sans); letter-spacing:.16em; color:#b3b3a8;}
+  .v1-cap-h .lab{font-size:14px; font-weight:600; letter-spacing:.5px;}
+  .v1-cap-h .tip{margin-left:auto; font-size:11.5px; color:#adada2; letter-spacing:.3px;}
+  .v1-cap-body{
+    margin:16px 0 0; font-size:14.5px; line-height:2.05; color:#b6b6ab;
+    height:96px;
+  }
+  .v1-cap-f{
+    margin-top:14px; display:flex; align-items:center; gap:22px;
+    font-size:12.5px; color:#9a9a90; border-top:1px solid #eeeee5; padding-top:15px;
+  }
+  .v1-cap-f .btn{display:flex; align-items:center; gap:6px;}
+  .v1-cap-f .btn svg{width:13px; height:13px;}
+  .v1-cap-f .save{
+    margin-left:auto; background:#22221f; color:#fdfdfb; font-size:12.5px;
+    padding:9px 18px; border-radius:3px; letter-spacing:.4px;
+  }
+  .v1-margin{
+    position:absolute; right:96px; top:222px; width:164px; text-align:right;
+  }
+  .v1-margin .row{padding:15px 0 13px; border-top:1px solid #e9e9df;}
+  .v1-margin .row:first-child{border-top:0; padding-top:0;}
+  .v1-margin .n{font-family:var(--serif); font-size:22px; line-height:1; color:#3c3c35;}
+  .v1-margin .n i{font-style:normal; font-size:11px; color:#a9a99e; margin-left:3px;}
+  .v1-margin .l{font-size:10.5px; color:#adada2; letter-spacing:.16em; margin-top:7px;}
+  .v1-rule{position:absolute; left:62px; top:0; bottom:0; width:1px; background:#f0f0e7;}
+
+  /* =====================================================
+     B · 命令台  Command Deck (dark)
+     ===================================================== */
+  .v2{
+    background:#141519; color:#e8e9ed;
+    background-image:
+      radial-gradient(900px 460px at 50% -12%, rgba(70,120,255,.20), transparent 68%),
+      radial-gradient(820px 420px at 50% 114%, rgba(70,120,255,.12), transparent 72%),
+      radial-gradient(600px 380px at 88% 108%, rgba(120,70,255,.10), transparent 70%);
+  }
+  .v2-in{position:absolute; inset:0; padding:0 228px; display:flex; flex-direction:column; justify-content:center;}
+  .v2-top{display:flex; align-items:center; gap:12px; margin-bottom:26px; padding-left:6px;}
+  .v2-logo{
+    width:38px; height:38px; border-radius:11px;
+    background:linear-gradient(150deg,#5b8cff,#3b5bdb);
+    display:grid; place-items:center; font:600 20px/1 var(--serif); color:#fff;
+    box-shadow:0 6px 16px -4px rgba(70,110,255,.6), inset 0 1px 0 rgba(255,255,255,.25);
+  }
+  .v2-top .nm{font-size:14.5px; font-weight:600; letter-spacing:.2px;}
+  .v2-top .tg{font-size:11.5px; color:#767c88; margin-top:2px;}
+  .v2-panel{
+    background:#1c1e24; border:1px solid rgba(255,255,255,.075); border-radius:16px;
+    box-shadow:0 28px 70px -20px rgba(0,0,0,.9), inset 0 1px 0 rgba(255,255,255,.045);
+    overflow:hidden;
+  }
+  .v2-row{display:flex; align-items:center; gap:13px; padding:22px 22px;}
+  .v2-row > svg{width:20px; height:20px; color:#6d7480; flex:none;}
+  .v2-row .ph{flex:1; font-size:15.5px; color:#7e848f;}
+  .v2-row .caret{width:1.5px; height:18px; background:#5b8cff; border-radius:2px;}
+  .v2-kbd{display:flex; gap:5px;}
+  .v2-kbd span{
+    min-width:24px; height:24px; padding:0 6px; border-radius:6px;
+    background:rgba(255,255,255,.055); border:1px solid rgba(255,255,255,.075);
+    color:#8b919c; font-size:11.5px; display:grid; place-items:center;
+  }
+  .v2-modes{
+    display:flex; align-items:center; gap:4px; padding:11px 16px;
+    border-top:1px solid rgba(255,255,255,.06); background:rgba(255,255,255,.014);
+  }
+  .v2-modes span{
+    font-size:12.5px; color:#868c98; padding:6px 12px; border-radius:7px;
+  }
+  .v2-modes .on{background:rgba(255,255,255,.085); color:#eceef2; font-weight:500;}
+  .v2-modes .sp{margin-left:auto; font-size:11px; color:#5d636e; padding:0 6px;}
+  .v2-grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px;}
+  .v2-card{
+    background:#1a1c21; border:1px solid rgba(255,255,255,.065); border-radius:14px;
+    padding:17px 18px;
+  }
+  .v2-card h4{
+    margin:0 0 13px; font-size:11px; font-weight:600; letter-spacing:.12em;
+    color:#6f7581;
+  }
+  .v2-item{
+    display:flex; align-items:center; gap:10px; padding:7px 0;
+    font-size:13px; color:#c3c7cf;
+  }
+  .v2-item .d{width:5px; height:5px; border-radius:50%; background:#3d4350; flex:none;}
+  .v2-item .t{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .v2-item .ts{font-size:11px; color:#5f6570;}
+  .v2-act{
+    display:flex; align-items:center; gap:10px; padding:8px 0; font-size:13px; color:#b8bcc5;
+  }
+  .v2-act svg{width:15px; height:15px; color:#6d7480;}
+  .v2-act .k{margin-left:auto; font-size:11px; color:#5d636e; border:1px solid rgba(255,255,255,.07); border-radius:5px; padding:1px 6px;}
+  .v2-hint{
+    margin-top:24px; text-align:center; font-size:11.5px; color:#5a606b; letter-spacing:.3px;
+  }
+
+  /* =====================================================
+     C · Bento
+     ===================================================== */
+  .v3{background:#f2f3f6;}
+  .v3-in{position:absolute; inset:0; padding:34px 80px 32px; display:flex; flex-direction:column;}
+  .v3-bar{display:flex; align-items:center; gap:10px; margin-bottom:26px; flex:none;}
+  .v3-logo{
+    width:30px; height:30px; border-radius:9px; background:#3b82f6; color:#fff;
+    display:grid; place-items:center; font:600 16px/1 var(--serif);
+    box-shadow:0 4px 10px -3px rgba(59,130,246,.6);
+  }
+  .v3-bar .nm{font-size:14px; font-weight:600;}
+  .v3-bar .right{margin-left:auto; display:flex; align-items:center; gap:14px; font-size:12.5px; color:#6c7482;}
+  .v3-new{
+    background:#fff; border:1px solid var(--line); border-radius:9px; padding:7px 13px;
+    font-size:12.5px; font-weight:500; color:#2a2f39; box-shadow:0 1px 2px rgba(16,24,40,.05);
+  }
+  .v3-head{display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:18px; flex:none;}
+  .v3-head h1{margin:0; font-size:29px; font-weight:650; letter-spacing:-.6px; color:#12151b;}
+  .v3-head p{margin:7px 0 0; font-size:13px; color:#77808f;}
+  .v3-grid{
+    display:grid; grid-template-columns:repeat(12,1fr);
+    grid-template-rows:minmax(0,1fr) 168px; gap:16px; flex:1; min-height:0;
+  }
+  .v3-card{
+    background:#fff; border:1px solid #e7e9ee; border-radius:18px;
+    box-shadow:0 1px 2px rgba(16,24,40,.045);
+  }
+  /* 收集大卡 */
+  .v3-collect{
+    grid-column:span 7; grid-row:1; padding:24px 26px 22px; position:relative;
+    overflow:hidden; display:flex; flex-direction:column;
+  }
+  .v3-collect::after{
+    content:""; position:absolute; right:-60px; top:-70px; width:240px; height:240px;
+    background:radial-gradient(circle, rgba(59,130,246,.10), transparent 68%);
+  }
+  .v3-c-top{display:flex; align-items:center; gap:10px; position:relative; flex:none;}
+  .v3-c-top h3{margin:0; font-size:16px; font-weight:600; letter-spacing:-.2px;}
+  .v3-c-top .h{margin-left:auto; font-size:12px; color:#98a0ad;}
+  .v3-textarea{
+    margin-top:16px; flex:1; min-height:120px; border-radius:13px; background:#f7f8fa;
+    border:1px solid #eef0f4; padding:15px 16px 13px; font-size:13.5px; line-height:1.9;
+    color:#a2aab7; position:relative; display:flex; flex-direction:column; justify-content:space-between;
+  }
+  .v3-textarea i{font-style:normal; font-size:11px; color:#bcc2cc; letter-spacing:.02em;}
+  .v3-textarea::after{
+    content:""; position:absolute; right:11px; bottom:9px; width:9px; height:9px;
+    border-right:1.5px solid #c9cfd9; border-bottom:1.5px solid #c9cfd9;
+  }
+  .v3-c-f{display:flex; align-items:center; gap:6px; margin-top:18px; flex:none;}
+  .v3-tool{
+    display:flex; align-items:center; gap:6px; font-size:12.5px; color:#5e6672;
+    padding:7px 10px; border-radius:8px;
+  }
+  .v3-tool svg{width:14px; height:14px; color:#8b93a0;}
+  .v3-save{
+    margin-left:auto; background:#3b82f6; color:#fff; font-size:13px; font-weight:500;
+    padding:10px 20px; border-radius:10px;
+    box-shadow:0 6px 14px -6px rgba(59,130,246,.8);
+  }
+  /* 侧栏 */
+  .v3-side{grid-column:span 5; grid-row:1; display:flex; flex-direction:column; gap:16px; min-height:0;}
+  .v3-search{padding:20px 22px; flex:none;}
+  .v3-search h3{margin:0 0 14px; font-size:14px; font-weight:600;}
+  .v3-pill{
+    height:44px; border-radius:999px; background:#f4f5f8; border:1px solid #eceef2;
+    display:flex; align-items:center; gap:9px; padding:0 16px;
+  }
+  .v3-pill svg{width:16px; height:16px; color:#9aa2ae;}
+  .v3-pill span{font-size:13px; color:#a3abb8;}
+  .v3-segs{display:flex; gap:6px; margin-top:13px;}
+  .v3-segs span{
+    font-size:12px; color:#6d7685; padding:6px 13px; border-radius:8px; border:1px solid #eceef2;
+    background:#fff;
+  }
+  .v3-segs .on{background:#eef4ff; border-color:#d8e6ff; color:#2f6fe0; font-weight:500;}
+  .v3-stat{
+    flex:1; border-radius:18px; padding:20px 22px; color:#fff; position:relative; overflow:hidden;
+    background:linear-gradient(140deg,#2f5bea 0%,#4b7bf5 55%,#6f9bff 100%);
+    display:flex; flex-direction:column; justify-content:space-between;
+  }
+  .v3-stat::after{
+    content:""; position:absolute; right:-50px; bottom:-70px; width:200px; height:200px;
+    border-radius:50%; border:26px solid rgba(255,255,255,.09);
+  }
+  .v3-stat .grp{position:relative;}
+  .v3-stat .lb{font-size:11.5px; opacity:.72; letter-spacing:.06em;}
+  .v3-stat .big{font-size:38px; font-weight:650; letter-spacing:-1.5px; margin-top:6px; line-height:1;}
+  .v3-stat .unit{font-size:12.5px; opacity:.8; margin-left:6px; font-weight:400;}
+  .v3-stat .ft{
+    margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,.2);
+    font-size:11.5px; opacity:.78; display:flex; justify-content:space-between;
+  }
+  /* 底部三条 */
+  .v3-mini{
+    grid-row:2; grid-column:span 4; padding:17px 19px;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .v3-mini .row1{display:flex; align-items:center; gap:8px; margin-bottom:12px;}
+  .v3-dot{width:7px; height:7px; border-radius:2px;}
+  .v3-mini .tag{font-size:10.5px; color:#8d95a2; letter-spacing:.04em;}
+  .v3-mini .ts{margin-left:auto; font-size:10.5px; color:#a8afba;}
+  .v3-mini h4{margin:0; font-size:13.5px; font-weight:550; line-height:1.55; color:#1c2027;}
+  .v3-mini p{
+    margin:8px 0 0; font-size:11.5px; color:#9aa2ae; line-height:1.7;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
+  }
+  .v3-chips{margin-top:auto; display:flex; gap:6px;}
+  .v3-chips span{
+    font-size:10.5px; color:#8d95a2; background:#f3f5f8; border-radius:6px; padding:3px 8px;
+  }
+
+  /* =====================================================
+     D · 手账  Warm Journal
+     ===================================================== */
+  .v4{
+    background:#faf6ee; color:#33302a;
+    background-image:radial-gradient(circle at 18% 12%, rgba(191,160,110,.10), transparent 42%);
+  }
+  .v4-spine{
+    position:absolute; left:0; top:0; bottom:0; width:64px;
+    border-right:1px solid #ece2d1; display:grid; place-items:center;
+  }
+  .v4-spine span{
+    writing-mode:vertical-rl; font-size:10px; letter-spacing:.42em; color:#c0b39c;
+  }
+  .v4-in{position:absolute; inset:0; left:64px; padding:44px 96px 40px; display:flex; flex-direction:column;}
+  .v4-bar{display:flex; align-items:center; gap:12px; flex:none;}
+  .v4-logo{
+    width:40px; height:40px; border-radius:50%; background:#3f5d4b; color:#f7f3e9;
+    display:grid; place-items:center; font:600 19px/1 var(--serif);
+  }
+  .v4-bar .nm{font-family:var(--serif); font-size:17px; font-weight:600; letter-spacing:.5px;}
+  .v4-bar .dt{margin-left:auto; font-size:11.5px; color:#ab9d86; letter-spacing:.08em;}
+  .v4-h1{
+    margin:52px 0 0; font-family:var(--serif); font-size:44px; font-weight:600;
+    letter-spacing:1px; line-height:1.35; color:#2c2823;
+  }
+  .v4-sub{margin:12px 0 0; font-size:13.5px; color:#8d8271; letter-spacing:.5px;}
+  .v4-search{
+    margin-top:34px; height:60px; border-radius:14px; background:#fffaf1;
+    border:1px solid #e9dcc6; display:flex; align-items:center; gap:12px;
+    padding:0 14px 0 18px; box-shadow:0 2px 10px rgba(120,95,55,.05);
+  }
+  .v4-search svg{width:17px; height:17px; color:#b8a888; flex:none;}
+  .v4-search .ph{flex:1; font-size:14px; color:#b5a68d;}
+  .v4-search .go{
+    background:#3f5d4b; color:#f8f5ec; font-size:12.5px; padding:8px 18px; border-radius:9px;
+    letter-spacing:.4px;
+  }
+  .v4-paper{
+    position:relative; margin-top:28px; border-radius:16px; background:#fffdf7;
+    border:1px solid #ede2ce; padding:26px 32px 22px;
+    box-shadow:0 10px 28px -14px rgba(140,105,60,.35);
+    flex:none; height:322px; display:flex; flex-direction:column;
+  }
+  .v4-tape{
+    position:absolute; top:-11px; left:44px; width:96px; height:23px;
+    background:rgba(201,176,133,.38); transform:rotate(-2.5deg);
+    border-left:1px dashed rgba(255,255,255,.6); border-right:1px dashed rgba(255,255,255,.6);
+  }
+  .v4-p-h{display:flex; align-items:center; gap:10px;}
+  .v4-p-h b{font-size:13px; font-weight:600; letter-spacing:.12em; color:#8a7c68;}
+  .v4-p-h .hint{margin-left:auto; font-size:11.5px; color:#b8a991;}
+  .v4-lines{
+    margin-top:14px; flex:1; min-height:120px;
+    background-image:repeating-linear-gradient(to bottom, transparent 0 33px, #f2e8d7 33px 34px);
+    background-position:0 5px;
+    font-size:14px; line-height:34px; color:#bbaa92;
+  }
+  .v4-p-f{display:flex; align-items:center; gap:20px; font-size:12.5px; color:#9d8f79; margin-top:8px; flex:none;}
+  .v4-p-f .btn{display:flex; align-items:center; gap:6px;}
+  .v4-p-f svg{width:13px; height:13px;}
+  .v4-save{
+    margin-left:auto; background:#b4703f; color:#fff8ef; padding:9px 20px;
+    border-radius:999px; font-size:12.5px; letter-spacing:.4px;
+    box-shadow:0 6px 14px -7px rgba(180,112,63,.9);
+  }
+  .v4-foot{
+    margin-top:auto; display:flex; align-items:center; justify-content:space-between;
+    font-size:11.5px; color:#b5a791; letter-spacing:.08em; padding:0 4px;
+  }
+  .v4-seal{display:none;}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-in">
+    <div class="title">Nowen Note · 首页视觉方案<small>4 个方向 · 仅设计稿，未改动任何代码</small></div>
+    <nav class="tabs" id="tabs">
+      <button class="tab on" data-v="v1"><b>A</b>墨纸</button>
+      <button class="tab" data-v="v2"><b>B</b>命令台</button>
+      <button class="tab" data-v="v3"><b>C</b>Bento</button>
+      <button class="tab" data-v="v4"><b>D</b>手账</button>
+    </nav>
+  </div>
+</div>
+
+<div class="stage">
+
+  <!-- ================= A ================= -->
+  <section class="case on" id="v1">
+    <div class="case-head"><span class="k">A</span><h2>墨纸</h2><p>编辑部气质 · 左对齐 · 去卡片化</p></div>
+    <div class="viewport">
+      <div class="screen v1">
+        <div class="v1-rule"></div>
+        <div class="v1-margin">
+          <div class="row"><div class="n">218<i>条</i></div><div class="l">全部笔记</div></div>
+          <div class="row"><div class="n">12<i>天</i></div><div class="l">连续记录</div></div>
+          <div class="row"><div class="n">3<i>条</i></div><div class="l">今天新增</div></div>
+        </div>
+        <div class="v1-in">
+          <div class="v1-bar">
+            <div class="v1-brand"><span class="v1-mark">N</span><span>Nowen Note</span></div>
+            <div class="v1-links"><span>收集箱</span><span>标签</span><span>设置</span></div>
+          </div>
+
+          <p class="v1-eye">NOTE · THOUGHT · MEMORY</p>
+          <h1 class="v1-h1">让想法，<br><em>有迹可循。</em></h1>
+          <p class="v1-lede">记下灵感，也找回每一次思考。</p>
+
+          <div class="v1-tabs"><b>搜索笔记</b><i>知识问答</i></div>
+          <div class="v1-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.8"/><path d="M15.6 15.6 21 21"/></svg>
+            <span class="ph">搜索笔记标题与正文…</span>
+            <span class="ent">Enter</span>
+          </div>
+
+          <div class="v1-sec">
+            <div class="v1-cap-h">
+              <span class="no">01</span><span class="lab">随手收集</span>
+              <span class="tip">文件拖进来，灵感记下来</span>
+            </div>
+            <div class="v1-cap-body">粘贴一段文字，或点击语音输入说点什么…</div>
+            <div class="v1-cap-f">
+              <span class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>添加文件</span>
+              <span class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="8" y="3.5" width="8" height="11" rx="2"/><path d="M5 9v3a7 7 0 0 0 14 0V9"/></svg>粘贴文本</span>
+              <span class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>语音输入</span>
+              <span class="save">保存为笔记 →</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="case-note">
+      <div><b>问题诊断</b>　原版所有元素都压在水平中轴上、层层居中，读起来像"表单模板"，视线没有停靠点。</div>
+      <div><b>做法</b>　整页改为左对齐的文本版式，宋体大字撑起标题，卡片边框全部撤掉，改用细线与留白分区；收集区编成"01"的章节感。</div>
+      <div><b>适合</b>　想突出的气质非常明确：这是一款"文人笔记"，不是工具软件。风险是工具感弱，按钮不够显眼。</div>
+    </div>
+  </section>
+
+  <!-- ================= B ================= -->
+  <section class="case" id="v2">
+    <div class="case-head"><span class="k">B</span><h2>命令台</h2><p>深色 · 搜索与记录合并 · 效率优先</p></div>
+    <div class="viewport">
+      <div class="screen v2">
+        <div class="v2-in">
+          <div class="v2-top">
+            <div class="v2-logo">N</div>
+            <div>
+              <div class="nm">Nowen Note</div>
+              <div class="tg">你的第二大脑</div>
+            </div>
+          </div>
+
+          <div class="v2-panel">
+            <div class="v2-row">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.8"/><path d="M15.6 15.6 21 21"/></svg>
+              <span class="ph">搜索笔记，或直接写下…</span>
+              <span class="caret"></span>
+              <div class="v2-kbd"><span>Cmd</span><span>K</span></div>
+            </div>
+            <div class="v2-modes">
+              <span class="on">搜索笔记</span>
+              <span>知识问答</span>
+              <span>随手记录</span>
+              <span class="sp">Tab 切换 · Enter 执行</span>
+            </div>
+          </div>
+
+          <div class="v2-grid">
+            <div class="v2-card">
+              <h4>最近编辑</h4>
+              <div class="v2-item"><i class="d"></i><span class="t">产品评审会要点整理</span><span class="ts">2 小时前</span></div>
+              <div class="v2-item"><i class="d"></i><span class="t">读书笔记 · 《深度工作》第三章</span><span class="ts">昨天</span></div>
+              <div class="v2-item"><i class="d"></i><span class="t">周末露营装备清单</span><span class="ts">3 天前</span></div>
+            </div>
+            <div class="v2-card">
+              <h4>快速开始</h4>
+              <div class="v2-act">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="8" y="3.5" width="8" height="11" rx="2"/><path d="M5 9v3a7 7 0 0 0 14 0V9"/></svg>
+                粘贴为笔记<span class="k">Cmd V</span>
+              </div>
+              <div class="v2-act">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M20.5 11.5 12 20a5 5 0 0 1-7-7l8.5-8.5a3.4 3.4 0 0 1 4.8 4.8L9.7 17.9a1.8 1.8 0 0 1-2.5-2.5l7.6-7.6"/></svg>
+                上传文件<span class="k">Cmd O</span>
+              </div>
+              <div class="v2-act">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+                按住说话<span class="k">Opt Space</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="v2-hint">输入即搜索 · 无需切换页面 · 所有内容本地存储</div>
+        </div>
+      </div>
+    </div>
+    <div class="case-note">
+      <div><b>做法</b>　砍掉大 logo、大标语、两段式布局，整页浓缩成一块 720px 的命令面板：搜索与记录用同一个输入框，靠 Tab 切换意图。</div>
+      <div><b>为什么可以更暗</b>　首页是"入口"而非"阅读页"，深色反而让它从整站的浅色编辑器里跳出来，像 Spotlight 一样随时召唤。</div>
+      <div><b>适合</b>　重度用户、键盘党。风险是气质偏极客，与笔记产品的温和定位有张力。</div>
+    </div>
+  </section>
+
+  <!-- ================= C ================= -->
+  <section class="case" id="v3">
+    <div class="case-head"><span class="k">C</span><h2>Bento</h2><p>卡片网格 · 保持浅色品牌 · 信息分层</p></div>
+    <div class="viewport">
+      <div class="screen v3">
+        <div class="v3-in">
+          <div class="v3-bar">
+            <div class="v3-logo">N</div>
+            <span class="nm">Nowen Note</span>
+            <div class="right">
+              <span>收集箱</span><span>设置</span>
+              <span class="v3-new">＋ 新建笔记</span>
+            </div>
+          </div>
+
+          <div class="v3-head">
+            <div>
+              <h1>让想法，有迹可循</h1>
+              <p>记下灵感，也找回每一次思考。</p>
+            </div>
+          </div>
+
+          <div class="v3-grid">
+            <div class="v3-card v3-collect">
+              <div class="v3-c-top">
+                <h3>随手收集</h3>
+                <span class="h">文件拖进来，灵感记下来</span>
+              </div>
+              <div class="v3-textarea"><span>粘贴一段文字，或点击语音输入说点什么…</span><i>支持 Markdown · Cmd V 直接粘贴</i></div>
+              <div class="v3-c-f">
+                <span class="v3-tool"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M20.5 11.5 12 20a5 5 0 0 1-7-7l8.5-8.5a3.4 3.4 0 0 1 4.8 4.8L9.7 17.9a1.8 1.8 0 0 1-2.5-2.5l7.6-7.6"/></svg>添加文件</span>
+                <span class="v3-tool"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="8" y="3.5" width="8" height="11" rx="2"/><path d="M5 9v3a7 7 0 0 0 14 0V9"/></svg>粘贴文本</span>
+                <span class="v3-tool"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>语音输入</span>
+                <span class="v3-save">保存为笔记</span>
+              </div>
+            </div>
+
+            <div class="v3-side">
+              <div class="v3-card v3-search">
+                <h3>搜索</h3>
+                <div class="v3-pill">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.8"/><path d="M15.6 15.6 21 21"/></svg>
+                  <span>搜索笔记标题与正文…</span>
+                </div>
+                <div class="v3-segs"><span class="on">搜索笔记</span><span>知识问答</span></div>
+              </div>
+              <div class="v3-stat">
+                <div class="grp">
+                  <div class="lb">本月新增</div>
+                  <div class="big">42<span class="unit">条笔记</span></div>
+                </div>
+                <div class="ft"><span>连续记录 12 天</span><span>上次 09:24</span></div>
+              </div>
+            </div>
+
+            <div class="v3-card v3-mini">
+              <div class="row1"><i class="v3-dot" style="background:#3b82f6"></i><span class="tag">读书笔记</span><span class="ts">2 小时前</span></div>
+              <h4>《深度工作》第三章：注意力残留</h4>
+              <p>频繁切换任务会让注意力残留，效率损失比想象中更大…</p>
+              <div class="v3-chips"><span>专注</span><span>效率</span></div>
+            </div>
+            <div class="v3-card v3-mini">
+              <div class="row1"><i class="v3-dot" style="background:#22c55e"></i><span class="tag">随想</span><span class="ts">昨天</span></div>
+              <h4>关于"灵感为什么总在洗澡时出现"</h4>
+              <p>放松状态下默认模式网络更活跃，联想更容易发生…</p>
+              <div class="v3-chips"><span>灵感</span><span>随想</span></div>
+            </div>
+            <div class="v3-card v3-mini">
+              <div class="row1"><i class="v3-dot" style="background:#f59e0b"></i><span class="tag">清单</span><span class="ts">3 天前</span></div>
+              <h4>周末露营装备清单</h4>
+              <p>帐篷、防潮垫、头灯、驱蚊液、保温壶、折叠椅…</p>
+              <div class="v3-chips"><span>待办</span><span>周末</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="case-note">
+      <div><b>做法</b>　保留现有配色语言，但把"两张大卡竖着叠"改成 12 栅格 bento：收集占 7 列，右侧搜索 + 数据各一张，底部横排最近笔记。</div>
+      <div><b>新增了什么</b>　右下角蓝色渐变卡承担视觉锚点的作用；底部"最近笔记"让首页不再是空白的出发点，而有回来的理由。</div>
+      <div><b>适合</b>　落地成本最低（仍是 Tailwind + 现有 token），不需要改交互模型。风险是卡片多，稍显"仪表盘"。</div>
+    </div>
+  </section>
+
+  <!-- ================= D ================= -->
+  <section class="case" id="v4">
+    <div class="case-head"><span class="k">D</span><h2>手账</h2><p>暖纸色 · 墨绿与赭石 · 有温度的笔记</p></div>
+    <div class="viewport">
+      <div class="screen v4">
+        <div class="v4-spine"><span>NOWEN NOTE · 手记</span></div>
+        <div class="v4-in">
+          <div class="v4-bar">
+            <div class="v4-logo">N</div>
+            <span class="nm">Nowen Note</span>
+            <span class="dt">2026 · 10 · 29　星期四</span>
+          </div>
+
+          <h1 class="v4-h1">今天，想记点什么？</h1>
+          <p class="v4-sub">记下灵感，也找回每一次思考。</p>
+
+          <div class="v4-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.8"/><path d="M15.6 15.6 21 21"/></svg>
+            <span class="ph">搜索笔记标题与正文…</span>
+            <span class="go">搜索</span>
+          </div>
+
+          <div class="v4-paper">
+            <div class="v4-tape"></div>
+            <div class="v4-p-h"><b>随手收集</b><span class="hint">文件拖进来，灵感记下来</span></div>
+            <div class="v4-lines">粘贴一段文字，或点击语音输入说点什么…</div>
+            <div class="v4-p-f">
+              <span class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M20.5 11.5 12 20a5 5 0 0 1-7-7l8.5-8.5a3.4 3.4 0 0 1 4.8 4.8L9.7 17.9a1.8 1.8 0 0 1-2.5-2.5l7.6-7.6"/></svg>添加文件</span>
+              <span class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="8" y="3.5" width="8" height="11" rx="2"/><path d="M5 9v3a7 7 0 0 0 14 0V9"/></svg>粘贴文本</span>
+              <span class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>语音输入</span>
+              <span class="v4-save">保存为笔记</span>
+            </div>
+          </div>
+
+          <div class="v4-foot">
+            <span>共 218 条 · 连续记录 12 天</span>
+            <span>Enter 保存 · Cmd K 搜索</span>
+          </div>
+        </div>
+        <div class="v4-seal">记</div>
+      </div>
+    </div>
+    <div class="case-note">
+      <div><b>做法</b>　换掉科技蓝，改用米白纸底 + 墨绿主色 + 赭石强调色；收集区做成带横线的纸页，顶部一小段胶带，右侧一枚印章。</div>
+      <div><b>为什么标题变了</b>　从"让人看的标语"改成"对人说的话"，更贴近笔记这种私人行为；右侧带上日期，强化"今天"的当下感。</div>
+      <div><b>适合</b>　想强调温度、区别于 Notion 类冷感工具。风险是个性最强，与现有深色主题需要单独配色。</div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var cases = Array.prototype.slice.call(document.querySelectorAll('.case'));
+
+  function fit(){
+    cases.forEach(function(c){
+      var vp = c.querySelector('.viewport');
+      var screen = c.querySelector('.screen');
+      var w = vp.clientWidth;
+      if(!w){ return; }
+      var s = Math.min(1, w / 1280);
+      screen.style.transform = 'scale(' + s + ')';
+      vp.style.height = Math.round(820 * s) + 'px';
+    });
+  }
+
+  function show(id){
+    var t = tabs.filter(function(x){ return x.getAttribute('data-v') === id; })[0] || tabs[0];
+    tabs.forEach(function(x){ x.classList.toggle('on', x === t); });
+    cases.forEach(function(c){ c.classList.toggle('on', c.id === t.getAttribute('data-v')); });
+    fit();
+  }
+
+  tabs.forEach(function(t){
+    t.addEventListener('click', function(){
+      var id = t.getAttribute('data-v');
+      history.replaceState(null, '', '#' + id);
+      show(id);
+    });
+  });
+
+  if (location.hash) { show(location.hash.slice(1)); }
+
+  window.addEventListener('resize', fit);
+  window.addEventListener('load', fit);
+  fit();
+</script>
+</body>
+</html>

@@ -1,0 +1,252 @@
+import { getOfflineQueueStorageKey } from "./offlineScope";
+import { assertConversionNote, isConversionNoteSafe } from "./encryptedNotes/conversionBarrier";
+import { ConversionCleanupError } from "./encryptedNotes/conversionCoordination";
+import {
+  getAllNotebooks,
+  getAllNotes,
+  getAllTags,
+  getNote as localGetNote,
+  getOfflineAttachmentsByNote,
+  isNoteDetailCached,
+  isReady as localStoreReady,
+  markOfflineAttachmentsAccessed,
+} from "@/lib/localStore";
+import type { Note, NoteListItem, Notebook, Tag } from "@/types";
+import {
+  clearOfflineAttachmentObjectUrls,
+  registerOfflineAttachmentBlob,
+} from "@/lib/noteAttachmentAccessBridge";
+import {
+  quarantineOfflineAttachmentRecord,
+  rememberOfflineAttachmentRenderUrl,
+} from "@/lib/offlineAttachmentRecovery";
+
+export interface OfflineNoteSnapshot {
+  noteId: string;
+  version: number;
+  updatedAt?: string;
+  capturedAt: number;
+  contentFingerprint?: string;
+}
+
+export const OFFLINE_NOTE_SNAPSHOT_EVENT = "nowen:offline-note-snapshot";
+
+let offlineHit = false;
+const offlineListeners = new Set<(value: boolean) => void>();
+const offlineNoteSnapshots = new Map<string, OfflineNoteSnapshot>();
+
+export function fingerprintNoteContent(content: unknown): string | undefined {
+  if (typeof content !== "string") return undefined;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < content.length; index += 1) {
+    hash ^= content.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${content.length}:${hash.toString(16).padStart(8, "0")}`;
+}
+
+function setOffline(value: boolean): void {
+  if (offlineHit === value) return;
+  offlineHit = value;
+  offlineListeners.forEach((listener) => {
+    try { listener(value); } catch { /* listener isolation */ }
+  });
+}
+
+export function markOfflineNoteSnapshot(
+  note: Pick<Note, "id" | "version"> & { updatedAt?: string; content?: string },
+): void {
+  const version = Number.isFinite(note.version) ? note.version : 0;
+  const previous = offlineNoteSnapshots.get(note.id);
+  const explicitFingerprint = fingerprintNoteContent(note.content);
+  const snapshot: OfflineNoteSnapshot = {
+    noteId: note.id,
+    version,
+    updatedAt: note.updatedAt ?? previous?.updatedAt,
+    capturedAt: Date.now(),
+    // Queue acknowledgements do not include the base body. Preserve the prior fingerprint
+    // only when they refer to the same revision; never carry it across a revision change.
+    contentFingerprint: explicitFingerprint ?? (
+      previous?.version === version ? previous.contentFingerprint : undefined
+    ),
+  };
+  offlineNoteSnapshots.set(note.id, snapshot);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(OFFLINE_NOTE_SNAPSHOT_EVENT, { detail: snapshot }));
+  }
+}
+
+export function clearOfflineNoteSnapshot(noteId: string): void {
+  offlineNoteSnapshots.delete(noteId);
+}
+
+export function getOfflineNoteSnapshot(noteId: string): OfflineNoteSnapshot | null {
+  return offlineNoteSnapshots.get(noteId) || null;
+}
+
+export function isOfflineNoteSnapshot(noteId: string): boolean {
+  return offlineNoteSnapshots.has(noteId);
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => {
+    setOffline(false);
+    // 离线附件只作为断网兜底。网络恢复后立即退休运行时 blob URL，附件 NodeView
+    // 会通过 access bridge 的订阅重新解析到当前服务器签名 URL。
+    clearOfflineAttachmentObjectUrls();
+  });
+}
+
+export function isCurrentlyOffline(): boolean {
+  return offlineHit || (typeof navigator !== "undefined" && !navigator.onLine);
+}
+
+export function subscribeOfflineState(listener: (value: boolean) => void): () => void {
+  offlineListeners.add(listener);
+  return () => { offlineListeners.delete(listener); };
+}
+
+interface FallbackHooks<T> {
+  onOnline?: (value: T) => void;
+  onFallback?: (value: T) => void;
+}
+
+async function withFallback<T>(
+  online: () => Promise<T>,
+  fallback: () => Promise<T>,
+  hooks: FallbackHooks<T> = {},
+): Promise<T> {
+  if (typeof navigator !== "undefined" && !navigator.onLine && localStoreReady()) {
+    setOffline(true);
+    const value = await fallback();
+    hooks.onFallback?.(value);
+    return value;
+  }
+
+  try {
+    const value = await online();
+    setOffline(false);
+    hooks.onOnline?.(value);
+    return value;
+  } catch (error: any) {
+    if (error instanceof ConversionCleanupError) throw error;
+    const status = error?.status as number | undefined;
+    if (status && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+      throw error;
+    }
+    if (!localStoreReady()) throw error;
+    setOffline(true);
+    const value = await fallback();
+    hooks.onFallback?.(value);
+    return value;
+  }
+}
+
+function activeWorkspaceId(): string | null {
+  try {
+    const workspace = localStorage.getItem("nowen-current-workspace") || "personal";
+    return workspace === "personal" ? null : workspace;
+  } catch {
+    return null;
+  }
+}
+
+function matchesActiveWorkspace(value: { workspaceId?: string | null }): boolean {
+  return (value.workspaceId ?? null) === activeWorkspaceId();
+}
+
+/**
+ * 只把通过基本完整性检查的本地 Blob 注册为渲染源。
+ *
+ * 历史实现保存离线附件时曾使用 `blob.size || attachment.size`。如果某次下载得到
+ * 0 字节 Blob，它会被伪装成 manifest 的正常大小并长期命中。这里用 Blob 自身的
+ * 实际字节数重新校验，发现坏缓存就删除，后续在线渲染回退到服务端资源。
+ */
+async function hydrateValidatedOfflineAttachments(noteId: string): Promise<number> {
+  const records = await getOfflineAttachmentsByNote(noteId);
+  const validIds: string[] = [];
+  let hydrated = 0;
+
+  for (const record of records) {
+    const actualSize = Number(record.blob?.size || 0);
+    const expectedSize = Number(record.size || 0);
+    const invalid = actualSize <= 0 || (expectedSize > 0 && actualSize !== expectedSize);
+
+    if (invalid) {
+      await quarantineOfflineAttachmentRecord(
+        record,
+        `本地离线附件校验失败：记录 ${expectedSize} 字节，实际 ${actualSize} 字节`,
+      ).catch((error) => {
+        console.warn("[offlineRead] quarantine invalid attachment failed", record.id, error);
+      });
+      continue;
+    }
+
+    const url = registerOfflineAttachmentBlob(record.id, record.blob);
+    if (!url) continue;
+    rememberOfflineAttachmentRenderUrl(url, record.id);
+    validIds.push(record.id);
+    hydrated += 1;
+  }
+
+  if (validIds.length > 0) {
+    await markOfflineAttachmentsAccessed(validIds);
+  }
+  return hydrated;
+}
+
+export function readNotebooks(online: () => Promise<Notebook[]>): Promise<Notebook[]> {
+  return withFallback(online, async () => (await getAllNotebooks()).filter(matchesActiveWorkspace));
+}
+
+export function readNotesList(
+  online: () => Promise<NoteListItem[]>,
+  filter?: (note: Note) => boolean,
+): Promise<NoteListItem[]> {
+  const scope = getOfflineQueueStorageKey();
+  return withFallback(online, async () => {
+    const all = await getAllNotes();
+    const matched = filter ? all.filter(filter) : all;
+    matched.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+    return matched.map(({ content, __detailCached, ...rest }) => rest as unknown as NoteListItem);
+  }).then((notes) => {
+    if (scope !== getOfflineQueueStorageKey()) throw new ConversionCleanupError("scope_changed");
+    return notes.filter(isConversionNoteSafe);
+  });
+}
+
+export function readTags(online: () => Promise<Tag[]>): Promise<Tag[]> {
+  return withFallback(online, async () => (await getAllTags()).filter(matchesActiveWorkspace));
+}
+
+export function readNote(id: string, online: () => Promise<Note>): Promise<Note> {
+  const scope = getOfflineQueueStorageKey();
+  return withFallback(
+    online,
+    async () => {
+      const note = await localGetNote(id);
+      if (!note) throw new Error("笔记不在本地缓存中");
+      if (!isNoteDetailCached(note)) {
+        throw new Error("该笔记尚未完成离线下载，恢复网络后会自动继续同步");
+      }
+      return note;
+    },
+    {
+      onOnline: (note) => clearOfflineNoteSnapshot(note.id),
+      onFallback: (note) => markOfflineNoteSnapshot(note),
+    },
+  ).then(async (note) => {
+    // 本地 Blob 只在真正使用离线笔记快照时注册。旧实现无论在线/离线都会 hydrate，
+    // 导致 Mac/Electron 联网时也优先命中 IndexedDB 中的旧/损坏附件，覆盖正常服务器图片。
+    if (isOfflineNoteSnapshot(note.id) || isCurrentlyOffline()) {
+      await hydrateValidatedOfflineAttachments(note.id).catch((error) => {
+        console.warn("[offlineRead] hydrate cached attachments failed", error);
+      });
+    } else {
+      clearOfflineAttachmentObjectUrls();
+    }
+    if (scope !== getOfflineQueueStorageKey()) throw new ConversionCleanupError("scope_changed");
+    assertConversionNote(note);
+    return note;
+  });
+}

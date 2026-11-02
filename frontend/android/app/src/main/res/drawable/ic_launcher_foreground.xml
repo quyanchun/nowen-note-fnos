@@ -1,0 +1,43 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportHeight="108"
+    android:viewportWidth="108">
+
+    <!--
+        Nowen Note 简约图标（foreground）
+        - viewport 108×108，安全区为中心 72×72（x:18~90, y:18~90）
+        - 元素全部收在安全区内：一张带折角的便签 + 一个粗壮的 N
+        - 单色靛蓝 #4F6BED，避免黑色与多余装饰，保证小尺寸下仍清晰
+    -->
+
+    <!-- 便签主体：圆角矩形 + 右上角 10×10 折角
+         外轮廓顺序：
+           起 (28,22) → 右上拐点前 (80,22) → 折角斜切到 (90,32) →
+           右下 (90,82) → 圆角过渡到 (86,86) → 左下 (28,86) → 回到起点
+         其中 rx=6,ry=6 使用 arc 命令实现的圆角；折角采用直线斜切 -->
+    <path
+        android:fillColor="#4F6BED"
+        android:pathData="M34,22 L80,22 L90,32 L90,80 Q90,86 84,86 L30,86 Q24,86 24,80 L24,28 Q24,22 30,22 Z
+                          M80,22 L80,32 L90,32 Z" />
+
+    <!-- 折角内凹形成纸张折叠效果：用背景色盖出一个小三角，模拟 "翻起的一角" -->
+    <path
+        android:fillColor="#F5F3EE"
+        android:pathData="M80,22 L80,32 L90,32 Z" />
+
+    <!-- 折角内缘的细描边（靛蓝），增强纸张层次感 -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M80,22 L80,32 L90,32"
+        android:strokeColor="#4F6BED"
+        android:strokeWidth="1.5" />
+
+    <!-- 居中大写字母 N（便签内部留白挖空实现单色识别）
+         设计思路：在便签内部用背景色再叠一层，形成 "镂空 N" 的视觉
+         N 的包围盒：x:38~78, y:38~74（宽 40、高 36），两竖笔各 7px 宽，斜笔 7px 宽 -->
+    <path
+        android:fillColor="#F5F3EE"
+        android:pathData="M38,38 L45,38 L71,68 L71,38 L78,38 L78,74 L71,74 L45,44 L45,74 L38,74 Z" />
+
+</vector>

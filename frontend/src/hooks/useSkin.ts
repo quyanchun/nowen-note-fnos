@@ -1,0 +1,59 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  APP_APPEARANCE_CHANGED_EVENT,
+  APP_APPEARANCE_IDS,
+  APP_APPEARANCE_STORAGE_KEY,
+  applyAppAppearance,
+  readStoredAppAppearance,
+  type AppAppearanceId,
+} from "@/lib/appAppearance";
+
+/**
+ * App 外观风格与 Light / Dark / System 是正交维度。
+ *
+ * 外观风格负责整个 Nowen Note 的视觉语言；主题模式只决定当前风格使用 light 还是 dark
+ * token。所有风格都由 `appAppearance.ts` 的唯一 Registry 提供，组件不再维护第二份名单。
+ *
+ * Runtime bootstrap 已前移到 runtimeCompatibility（main.tsx 首个 import），这里仅负责
+ * React 状态和用户交互，避免必须打开 Settings/SkinSwitcher 后才恢复全局风格。
+ */
+export type Skin = AppAppearanceId;
+export const SKIN_STORAGE_KEY = APP_APPEARANCE_STORAGE_KEY;
+
+export function useSkin(): {
+  skin: Skin;
+  setSkin: (next: Skin) => void;
+  skins: readonly Skin[];
+} {
+  const [skin, setSkinState] = useState<Skin>(() => readStoredAppAppearance());
+
+  useEffect(() => {
+    applyAppAppearance(skin);
+  }, [skin]);
+
+  useEffect(() => {
+    const sync = () => setSkinState(readStoredAppAppearance());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === APP_APPEARANCE_STORAGE_KEY) sync();
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener(APP_APPEARANCE_CHANGED_EVENT, sync);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener(APP_APPEARANCE_CHANGED_EVENT, sync);
+    };
+  }, []);
+
+  const setSkin = useCallback((next: Skin) => {
+    try {
+      localStorage.setItem(APP_APPEARANCE_STORAGE_KEY, next);
+    } catch {
+      // localStorage 不可用时仍更新当前窗口内存态。
+    }
+    applyAppAppearance(next);
+    setSkinState(next);
+    window.dispatchEvent(new CustomEvent(APP_APPEARANCE_CHANGED_EVENT, { detail: next }));
+  }, []);
+
+  return { skin, setSkin, skins: APP_APPEARANCE_IDS };
+}

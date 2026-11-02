@@ -1,0 +1,35 @@
+name: 💬 使用咨询
+description: 不知道怎么用？把问题直接说出来
+title: "[Question] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        直接描述你想做什么、卡在哪里即可。
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 你遇到了什么问题？
+      placeholder: 例如：我想用 Docker 部署，但不知道域名和 HTTPS 应该在哪里配置。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 你正在使用什么？
+      options:
+        - 电脑客户端
+        - 电脑浏览器
+        - 手机浏览器 / App
+        - Docker / 自建服务
+        - 还没有安装
+        - 不确定
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: 截图或报错（可选）
+      description: 有截图或报错就直接拖进来。请不要上传密码、密钥、Token 等敏感信息。
+      placeholder: 把截图或报错内容粘贴到这里……

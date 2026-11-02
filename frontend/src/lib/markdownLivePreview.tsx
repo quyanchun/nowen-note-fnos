@@ -1,0 +1,329 @@
+import React from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { syntaxTree } from "@codemirror/language";
+import {
+  EditorState,
+  Facet,
+  StateEffect,
+  StateField,
+  type Extension,
+} from "@codemirror/state";
+import {
+  Decoration,
+  EditorView,
+  WidgetType,
+  type DecorationSet,
+} from "@codemirror/view";
+import { MarkdownPreview } from "@/components/MarkdownPreview";
+import { markdownFencedCodeLiveEditingExtension } from "@/lib/markdownFenceAuthoring";
+import { formatMarkdownCodeBlock } from "@/lib/markdownCodeBlockFormatting";
+import {
+  applyMarkdownTaskCheckboxChange,
+  getMarkdownTaskCheckboxChange,
+} from "@/lib/markdownTasks";
+import { projectMarkdownForUser } from "@/lib/markdownUserContent";
+
+const BLOCK_NODE_RE = /^(?:ATXHeading[1-6]|SetextHeading[12]|Paragraph|Blockquote|BulletList|OrderedList|FencedCode|CodeBlock|HorizontalRule|HTMLBlock|Table)$/;
+const STANDALONE_IAL_RE = /^\s*\{:\s*[\s\S]*\}\s*$/;
+const roots = new WeakMap<HTMLElement, Root>();
+const livePreviewFocusChanged = StateEffect.define<boolean>();
+const livePreviewHasFocus = StateField.define<boolean>({
+  create: () => false,
+  update(value, transaction) {
+    for (const effect of transaction.effects) if (effect.is(livePreviewFocusChanged)) value = effect.value;
+    return value;
+  },
+});
+export const markdownLivePreviewNoteId = Facet.define<string | null, string | null>({
+  combine: (values) => values[0] || null,
+});
+
+export interface MarkdownLivePreviewBlock {
+  from: number;
+  to: number;
+  markdown: string;
+}
+
+function getEditorState(source: EditorView | EditorState): EditorState {
+  return source instanceof EditorView ? source.state : source;
+}
+
+function expandToWholeLines(state: EditorState, from: number, to: number): { from: number; to: number } {
+  const startLine = state.doc.lineAt(Math.max(0, Math.min(from, state.doc.length)));
+  const inclusiveEnd = Math.max(from, to - 1);
+  const endLine = state.doc.lineAt(Math.max(0, Math.min(inclusiveEnd, state.doc.length)));
+  return { from: startLine.from, to: endLine.to };
+}
+
+function lineAfter(state: EditorState, position: number) {
+  if (position >= state.doc.length) return null;
+  const current = state.doc.lineAt(position);
+  return current.number < state.doc.lines ? state.doc.line(current.number + 1) : null;
+}
+
+function expandSemanticTail(
+  state: EditorState,
+  range: { from: number; to: number },
+): { from: number; to: number } {
+  let to = range.to;
+  const firstLine = state.doc.lineAt(range.from).text;
+  const quoteBlock = /^\s*>/.test(firstLine);
+
+  while (to < state.doc.length) {
+    const next = lineAfter(state, to);
+    if (!next) break;
+    const text = next.text;
+
+    if (STANDALONE_IAL_RE.test(text)) {
+      to = next.to;
+      continue;
+    }
+
+    if (quoteBlock && /^\s*>/.test(text)) {
+      to = next.to;
+      continue;
+    }
+
+    break;
+  }
+
+  return { from: range.from, to };
+}
+
+function isSameSemanticContainer(left: string, right: string, gap: string): boolean {
+  if (/^\s*>/.test(left) && /^\s*>/.test(right)) return true;
+  if (/^\s*(?:[-+*]|\d+[.)])\s+/.test(left) && /^\s*(?:[-+*]|\d+[.)])\s+/.test(right)) {
+    return /^\s*$/.test(gap);
+  }
+  if (/^\s*\|/.test(left) && /^\s*\|/.test(right)) return /^\s*$/.test(gap);
+  return false;
+}
+
+function mergeSemanticRanges(
+  state: EditorState,
+  ranges: Array<{ from: number; to: number }>,
+): Array<{ from: number; to: number }> {
+  const sorted = [...ranges].sort((a, b) => a.from - b.from || b.to - a.to);
+  const merged: Array<{ from: number; to: number }> = [];
+
+  for (const current of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous) {
+      merged.push({ ...current });
+      continue;
+    }
+    if (current.from <= previous.to) {
+      previous.to = Math.max(previous.to, current.to);
+      continue;
+    }
+
+    const left = state.doc.lineAt(Math.max(previous.from, previous.to - 1)).text;
+    const right = state.doc.lineAt(current.from).text;
+    const gap = state.doc.sliceString(previous.to, current.from);
+    if (isSameSemanticContainer(left, right, gap)) {
+      previous.to = current.to;
+    } else {
+      merged.push({ ...current });
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Collect top-level semantic blocks that do not intersect any current selection.
+ *
+ * Every active cursor must keep its source block visible. Otherwise a secondary cursor in Live
+ * mode can end up inside a Decoration.replace widget owned by another selection, which makes
+ * multi-cursor editing appear to lose a caret.
+ */
+export function collectMarkdownLivePreviewBlocks(
+  source: EditorView | EditorState,
+): MarkdownLivePreviewBlock[] {
+  const state = getEditorState(source);
+  const selections = state.selection.ranges;
+  const cursor = syntaxTree(state).cursor();
+  const candidates: Array<{ from: number; to: number }> = [];
+  const seen = new Set<string>();
+  if (!cursor.firstChild()) return [];
+
+  do {
+    const node = cursor.node;
+    if (!BLOCK_NODE_RE.test(node.name) || node.from >= node.to) continue;
+    const range = expandSemanticTail(state, expandToWholeLines(state, node.from, node.to));
+    const key = `${range.from}:${range.to}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push(range);
+  } while (cursor.nextSibling());
+
+  return mergeSemanticRanges(state, candidates)
+    .filter((range) => !selections.some(
+      (selection) => selection.from <= range.to && selection.to >= range.from,
+    ))
+    .map((range) => ({
+      ...range,
+      markdown: state.doc.sliceString(range.from, range.to),
+    }));
+}
+
+export function markdownLivePreviewEditAnchor(markdown: string, from: number): number {
+  const lineBreak = markdown.indexOf("\n");
+  if (lineBreak < 0) return from;
+  const firstLine = markdown.slice(0, lineBreak);
+  if (!/^\s{0,3}(?:(?:>\s*)*)(?:`{3,}|~{3,})/.test(firstLine)) return from;
+  return from + lineBreak + 1;
+}
+
+class MarkdownLivePreviewWidget extends WidgetType {
+  constructor(
+    readonly markdown: string,
+    readonly from: number,
+    readonly to: number,
+    readonly formattingEnabled: boolean,
+    readonly noteId: string | null,
+  ) {
+    super();
+  }
+
+  eq(other: MarkdownLivePreviewWidget): boolean {
+    return this.markdown === other.markdown && this.from === other.from && this.to === other.to && this.formattingEnabled === other.formattingEnabled && this.noteId === other.noteId;
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const host = document.createElement("div");
+    host.className = "cm-live-preview-block";
+    host.dataset.mdFrom = String(this.from);
+    host.dataset.mdTo = String(this.to);
+
+    host.addEventListener("mousedown", (event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, button, a, img, video, audio, iframe")) return;
+      event.preventDefault();
+      const anchor = markdownLivePreviewEditAnchor(this.markdown, this.from);
+      view.dispatch({
+        selection: { anchor },
+        effects: EditorView.scrollIntoView(anchor, { y: "center" }),
+      });
+      view.focus();
+    });
+
+    const root = createRoot(host);
+    roots.set(host, root);
+    root.render(
+      <MarkdownPreview
+        markdown={this.markdown}
+        noteId={this.noteId || undefined}
+        compact
+        className="cm-live-preview-render !h-auto !overflow-visible !p-0"
+        onFormatCodeBlock={this.formattingEnabled ? (source, offset) => formatMarkdownCodeBlock(view, source, offset, this.from) : undefined}
+        onInsertVoiceTranscript={this.formattingEnabled ? (text) => {
+          if (!view.state.facet(EditorView.editable) || view.state.facet(EditorState.readOnly)) return;
+          const selection = view.state.selection.main;
+          view.dispatch({ changes: { from: selection.from, to: selection.to, insert: text }, selection: { anchor: selection.from + text.length } });
+          view.focus();
+        } : undefined}
+        onTaskCheckboxChange={(taskIndex, checked) => {
+          const change = getMarkdownTaskCheckboxChange(this.markdown, taskIndex, checked);
+          if (!change) return;
+          const nextBlock = applyMarkdownTaskCheckboxChange(this.markdown, change);
+          view.dispatch({
+            changes: { from: this.from, to: this.to, insert: nextBlock },
+          });
+        }}
+      />,
+    );
+    return host;
+  }
+
+  destroy(dom: HTMLElement): void {
+    const root = roots.get(dom);
+    roots.delete(dom);
+    queueMicrotask(() => root?.unmount());
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+function buildDecorations(state: EditorState): DecorationSet {
+  if (state.doc.length > 350_000) return Decoration.none;
+
+  const blocks = collectMarkdownLivePreviewBlocks(state);
+  const ranges = blocks.map((block) =>
+      Decoration.replace({
+        widget: new MarkdownLivePreviewWidget(block.markdown, block.from, block.to, state.facet(EditorView.editable) && !state.facet(EditorState.readOnly), state.facet(markdownLivePreviewNoteId)),
+        block: true,
+      }).range(block.from, block.to),
+  );
+  // Keep active image syntax editable, but also render its image. An image-only
+  // note otherwise never previews: its default cursor always selects that block.
+  const activeImages = new Map<number, { from: number; to: number; sources: string[] }>();
+  syntaxTree(state).iterate({ enter(node) {
+    if (node.name !== "Image" || blocks.some(block => block.from <= node.from && block.to >= node.to)) return;
+    const position = state.doc.lineAt(node.to).to;
+    const entry = activeImages.get(position) || { from: node.from, to: node.to, sources: [] };
+    entry.sources.push(state.doc.sliceString(node.from, node.to));
+    entry.to = node.to;
+    activeImages.set(position, entry);
+  } });
+  for (const [position, image] of activeImages) {
+    const lineStart = state.doc.lineAt(image.from).from;
+    if (!state.field(livePreviewHasFocus) && image.sources.length === 1
+      && projectMarkdownForUser(state.doc.sliceString(lineStart, position)).trim() === image.sources[0]) {
+      ranges.push(Decoration.replace({
+        widget: new MarkdownLivePreviewWidget(image.sources[0], image.from, image.to, false, state.facet(markdownLivePreviewNoteId)),
+        block: true,
+      }).range(lineStart, position));
+      continue;
+    }
+    ranges.push(Decoration.widget({
+      widget: new MarkdownLivePreviewWidget(image.sources.join("\n\n"), image.from, image.to, false, state.facet(markdownLivePreviewNoteId)),
+      block: true,
+      side: 1,
+    }).range(position));
+  }
+  return Decoration.set(ranges, true);
+}
+
+const livePreviewDecorations = StateField.define<DecorationSet>({
+  create(state) {
+    return buildDecorations(state);
+  },
+  update(value, transaction) {
+    const selectionChanged = !transaction.startState.selection.eq(transaction.state.selection);
+    return transaction.docChanged || transaction.reconfigured || selectionChanged
+      || transaction.effects.some(effect => effect.is(livePreviewFocusChanged)) ? buildDecorations(transaction.state) : value;
+  },
+  provide(field) {
+    return EditorView.decorations.from(field);
+  },
+});
+
+const livePreviewTheme = EditorView.theme({
+  ".cm-live-preview-block": {
+    boxSizing: "border-box",
+    cursor: "text",
+    padding: "2px 12px",
+    width: "100%",
+  },
+  ".cm-live-preview-block:hover": {
+    backgroundColor: "color-mix(in srgb, var(--color-app-hover, #f1f5f9) 55%, transparent)",
+    borderRadius: "8px",
+  },
+  ".cm-live-preview-block .nowen-md-preview": {
+    maxWidth: "none",
+    margin: "0",
+  },
+  ".cm-live-preview-block .cm-live-preview-render > :first-child": { marginTop: "0" },
+  ".cm-live-preview-block .cm-live-preview-render > :last-child": { marginBottom: "0" },
+});
+
+export const markdownLivePreviewExtension: Extension = [
+  livePreviewHasFocus,
+  EditorView.focusChangeEffect.of((_state, focused) => livePreviewFocusChanged.of(focused)),
+  livePreviewDecorations,
+  livePreviewTheme,
+  markdownFencedCodeLiveEditingExtension,
+];

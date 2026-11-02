@@ -1,0 +1,11 @@
+#!/bin/sh
+# App Center manages the declared Docker project; this script needs no Docker socket.
+case "${1:-}" in
+  start|stop) exit 0 ;;
+  status)
+    if curl -fsS --max-time 3 "http://127.0.0.1:${TRIM_SERVICE_PORT:-{{PORT}}}/api/health" >/dev/null 2>&1; then
+      exit 0
+    fi
+    exit 3 ;;
+  *) exit 1 ;;
+esac

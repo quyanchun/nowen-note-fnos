@@ -1,0 +1,181 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { api } from "@/lib/api";
+import {
+  clearQueue,
+  enqueue,
+  getQueue,
+  updateItem,
+} from "@/lib/offlineQueue";
+
+function seedConflict(noteId: string): void {
+  enqueue({
+    type: "updateNote",
+    noteId,
+    url: `/notes/${noteId}`,
+    method: "PUT",
+    body: {
+      title: `冲突笔记 ${noteId}`,
+      content: "本地内容",
+      contentText: "本地内容",
+      contentFormat: "markdown",
+      version: 1,
+    },
+  });
+  const item = getQueue().find((queued) => queued.noteId === noteId)!;
+  updateItem(item.id, {
+    conflict: true,
+    blocked: true,
+    retryable: false,
+    errorCode: "VERSION_CONFLICT",
+    localPayload: item.body,
+  });
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function noteResponse(noteId: string) {
+  return {
+    id: noteId,
+    userId: "user-1",
+    notebookId: "book-1",
+    workspaceId: null,
+    title: "已删除笔记",
+    content: "",
+    contentText: "",
+    contentFormat: "markdown",
+    isPinned: 0,
+    isFavorite: 0,
+    isLocked: 0,
+    isArchived: 0,
+    isTrashed: 1,
+    trashedAt: "2026-07-13T03:00:00.000Z",
+    version: 2,
+    sortOrder: 0,
+    createdAt: "2026-07-13T02:00:00.000Z",
+    updatedAt: "2026-07-13T03:00:00.000Z",
+  };
+}
+
+describe("API deletion queue reconciliation", () => {
+  it.each(["batch", "empty"])("reconciles only confirmed note deletions from unified trash %s", async (action) => {
+    seedConflict("deleted-a");
+    seedConflict("protected-b");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      succeededIds: ["note:deleted-a"], noteIds: ["deleted-a"],
+      failures: [{ id: "note:protected-b", code: "NOTE_LOCKED", error: "locked" }],
+    })));
+    if (action === "batch") await api.trash.mutate("personal", "permanent", ["note:deleted-a", "note:protected-b"]);
+    else await api.trash.empty("personal");
+    expect(getQueue().map((item) => item.noteId)).toEqual(["protected-b"]);
+  });
+  beforeEach(() => {
+    Object.assign(window, { nowenDesktop: { isDesktop: true } });
+    localStorage.clear();
+    localStorage.setItem("nowen-server-url", "http://sync-test.local");
+    localStorage.setItem("nowen-token", "test.token.value");
+    Object.defineProperty(navigator, "onLine", { configurable: true, value: true });
+    clearQueue();
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(window, "nowenDesktop");
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("removes a conflicted update after the server acknowledges moving that note to trash", async () => {
+    seedConflict("note-trash");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(noteResponse("note-trash"))));
+
+    await api.updateNote("note-trash", { isTrashed: 1 } as any);
+
+    expect(getQueue()).toEqual([]);
+  });
+
+  it("removes a conflicted update after the server acknowledges permanent deletion", async () => {
+    seedConflict("note-delete");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ success: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.deleteNote("note-delete");
+
+    expect(getQueue()).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("http://sync-test.local/api/notes/note-delete/permanent");
+  });
+
+  it.each([409, 503])("preserves a conflicted edit when permanent deletion returns %s", async (status) => {
+    seedConflict("note-refused");
+    const before = getQueue();
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ success: false, code: "NOTE_NOT_TRASHED" }, status));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.deleteNote("note-refused")).rejects.toMatchObject({ status });
+
+    expect(getQueue()).toEqual(before);
+    expect(fetchMock.mock.calls.every((call) => call[1]?.method === "DELETE")).toBe(true);
+  });
+
+  it.each([{ success: false }, {}])("retains edits without an explicit successful deletion ACK %j", async (body) => {
+    seedConflict("note-unconfirmed");
+    const before = getQueue();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(body)));
+
+    await api.deleteNote("note-unconfirmed");
+
+    expect(getQueue()).toEqual(before);
+  });
+
+  it("retains edits when the permanent deletion request cannot reach the server", async () => {
+    seedConflict("note-offline");
+    const before = getQueue();
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.deleteNote("note-offline")).rejects.toThrow("Failed to fetch");
+
+    expect(getQueue()).toEqual(before);
+    expect(fetchMock.mock.calls.every((call) => call[1]?.method === "DELETE")).toBe(true);
+  });
+
+  it("uses one workspace-scoped request and removes only conflicts returned by empty trash", async () => {
+    seedConflict("deleted-a");
+    seedConflict("kept-b");
+    localStorage.setItem("nowen-current-workspace", "team-workspace");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      success: true,
+      count: 1,
+      skipped: 0,
+      noteIds: ["deleted-a"],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.emptyTrash();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://sync-test.local/api/notes/trash/empty?workspaceId=team-workspace",
+    );
+    expect(getQueue().map((item) => item.noteId)).toEqual(["kept-b"]);
+  });
+
+  it("removes conflicts for notes trashed by deleting a notebook", async () => {
+    seedConflict("deleted-a");
+    seedConflict("kept-b");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      success: true,
+      softDeletedNotebookCount: 1,
+      trashedNoteCount: 1,
+      trashedNoteIds: ["deleted-a"],
+    })));
+
+    await api.deleteNotebook("book-1");
+
+    expect(getQueue().map((item) => item.noteId)).toEqual(["kept-b"]);
+  });
+});

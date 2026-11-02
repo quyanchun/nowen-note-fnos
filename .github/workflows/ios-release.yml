@@ -1,0 +1,233 @@
+# iOS 构建 + 上传 TestFlight
+#
+# Tag 发版时把 Git Tag 映射为 iOS Marketing Version，并使用 GITHUB_RUN_NUMBER
+# 作为递增 Build Number，确保 App Store Connect/TestFlight 可以按版本精确追踪。
+
+name: iOS Build & TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "上传到 TestFlight（true/false）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      version:
+        description: "iOS 版本号（普通分支手动运行时可填，如 1.4.11；Tag ref 会自动解析）"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    env:
+      IOS_BUNDLE_ID: com.nowen.note
+      IOS_SCHEME: App
+      IOS_WORKSPACE: frontend/ios/App/App.xcworkspace
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve iOS version
+        shell: bash
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${VERSION%-ios}"
+          elif [[ -n "${MANUAL_VERSION:-}" ]]; then
+            VERSION="${MANUAL_VERSION#v}"
+          else
+            VERSION=$(plutil -extract version raw package.json)
+          fi
+
+          # CFBundleShortVersionString 使用三段数字；预发布后缀由 Build Number 区分。
+          VERSION="${VERSION%%-*}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid iOS marketing version: $VERSION" >&2
+            exit 1
+          fi
+
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          echo "IOS_MARKETING_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "IOS_BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "Resolved iOS version: $VERSION ($BUILD_NUMBER)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Capacitor sync iOS
+        working-directory: frontend
+        run: npx cap sync ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: frontend/ios/App
+        run: pod install --repo-update
+
+      - name: Import signing assets
+        env:
+          CERT_B64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERT_PWD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PWD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+          PROFILE_PATH=$RUNNER_TEMP/profile.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain-db
+
+          echo -n "$CERT_B64" | base64 --decode -o "$CERT_PATH"
+          echo -n "$PROFILE_B64" | base64 --decode -o "$PROFILE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CERT_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Generate ExportOptions.plist
+        run: |
+          set -euo pipefail
+          PROFILE_PATH=$RUNNER_TEMP/profile.mobileprovision
+          PROFILE_PLIST=$(security cms -D -i "$PROFILE_PATH")
+          UUID=$(echo "$PROFILE_PLIST" | plutil -extract UUID raw -)
+          TEAM=$(echo "$PROFILE_PLIST" | plutil -extract TeamIdentifier.0 raw -)
+          PROFILE_NAME=$(echo "$PROFILE_PLIST" | plutil -extract Name raw -)
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>$TEAM</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${{ env.IOS_BUNDLE_ID }}</key>
+              <string>$PROFILE_NAME</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>compileBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          echo "PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
+          echo "TEAM_ID=$TEAM" >> "$GITHUB_ENV"
+
+      - name: Build & Archive
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace "$IOS_WORKSPACE" \
+            -scheme "$IOS_SCHEME" \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            MARKETING_VERSION="$IOS_MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
+            archive | xcpretty || exit ${PIPESTATUS[0]}
+
+      - name: Export IPA
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/ipa" \
+            -allowProvisioningUpdates | xcpretty || exit ${PIPESTATUS[0]}
+          ls -lh "$RUNNER_TEMP/ipa/"
+
+      - name: Verify IPA version
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA=$(ls "$RUNNER_TEMP"/ipa/*.ipa | head -n 1)
+          TMP=$(mktemp -d)
+          unzip -q "$IPA" -d "$TMP"
+          PLIST=$(find "$TMP/Payload" -maxdepth 2 -name Info.plist | head -n 1)
+          ACTUAL_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          ACTUAL_BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+          echo "IPA version: $ACTUAL_VERSION ($ACTUAL_BUILD)"
+          [[ "$ACTUAL_VERSION" == "$IOS_MARKETING_VERSION" ]]
+          [[ "$ACTUAL_BUILD" == "$IOS_BUILD_NUMBER" ]]
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nowen-note-ios
+          path: ${{ runner.temp }}/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload to TestFlight
+        if: github.event_name == 'push' || github.event.inputs.upload == 'true'
+        env:
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$API_PRIVATE_KEY" > ~/.appstoreconnect/private_keys/AuthKey_${API_KEY_ID}.p8
+
+          IPA=$(ls "$RUNNER_TEMP"/ipa/*.ipa | head -n 1)
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA" \
+            --apiKey "$API_KEY_ID" \
+            --apiIssuer "$ISSUER_ID"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## iOS Release" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Bundle ID: $IOS_BUNDLE_ID" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: $IOS_MARKETING_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Build: $IOS_BUILD_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Ref: $GITHUB_REF" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true

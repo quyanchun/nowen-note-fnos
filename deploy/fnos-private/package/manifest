@@ -1,0 +1,13 @@
+appname = nowen-note-private
+version = {{VERSION}}
+display_name = Nowen Note fnOS
+desc = 基于 Nowen Note 的飞牛 NAS 改造版，支持飞牛登录、AI 整理与智能收集。
+platform = all
+source = thirdparty
+maintainer = Nowen Note fnOS contributors
+distributor = Nowen Note fnOS contributors
+desktop_uidir = ui
+desktop_applaunchname = nowen-note-private.Application
+service_port = {{PORT}}
+checkport = true
+ctl_stop = true

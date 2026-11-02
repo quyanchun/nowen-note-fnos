@@ -1,0 +1,38 @@
+{
+    "docker-project":
+    {
+        "projects":
+        [
+            {
+                "name": "nowen-note",
+                "path": "docker"
+            }
+        ]
+    },
+    "data-share":
+    {
+        "shares":
+        [
+            {
+                "name": "nowen-note",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "docker-nowen-note"
+                    ]
+                }
+            },
+            {
+                "name": "nowen-note/data",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "docker-nowen-note"
+                    ]
+                }
+            }
+        ]
+    }
+}

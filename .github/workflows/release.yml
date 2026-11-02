@@ -1,0 +1,305 @@
+# 三平台构建；GitHub EXE 直发与 Microsoft Store 独立分发。
+#
+# 发布职责约束：
+#   - push tag v*.*.* 构建全部平台；Windows Full/Lite 均由同一 tag CI 生成并校验；
+#   - workflow_dispatch 默认仅调试；release-assets 模式在 GitHub 内汇总同 Tag 产物并校验；
+#   - scripts/release.sh 创建 Draft，校对 CI 回执后决定是否转正式；CI 不发布正式版本；
+#   - electron-builder 始终 --publish never，避免多发布者并发写 Release。
+
+name: Build & Release
+run-name: ${{ inputs.mode == 'release-assets' && format('Release assets {0}', inputs.request_id) || github.event.head_commit.message || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Debug build or collect existing tag artifacts into Draft
+        type: choice
+        options: [debug, release-assets]
+        default: debug
+      source_run_id:
+        description: Existing release.yml tag-push build run ID (release-assets only)
+        type: string
+      request_id:
+        description: Unique local release request UUID (release-assets only)
+        type: string
+      desktop:
+        description: Collect both macOS architectures
+        type: boolean
+        default: true
+      windows:
+        description: Replace Windows Full/Lite candidates with same-tag CI assets
+        type: boolean
+        default: true
+      linux:
+        description: Collect Linux x64 AppImage and Debian packages
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    if: github.event_name == 'push' || inputs.mode == 'debug'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: win
+          - os: macos-latest
+            name: mac
+          - os: ubuntu-latest
+            name: linux
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Compile Official Registry trust roots
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          NOWEN_OFFICIAL_REGISTRY_TRUST_ROOTS_JSON: ${{ vars.NOWEN_OFFICIAL_REGISTRY_TRUST_ROOTS_JSON }}
+        run: |
+          if [ -z "$NOWEN_OFFICIAL_REGISTRY_TRUST_ROOTS_JSON" ]; then
+            echo "NOWEN_OFFICIAL_REGISTRY_TRUST_ROOTS_JSON is required for release tags" >&2
+            exit 1
+          fi
+          trust_root_input="$RUNNER_TEMP/nowen-official-registry-trust-roots.json"
+          printf '%s' "$NOWEN_OFFICIAL_REGISTRY_TRUST_ROOTS_JSON" > "$trust_root_input"
+          node scripts/generate-official-registry-trust-roots.mjs --input "$trust_root_input"
+          node scripts/verify-extension-ecosystem-rc1.mjs
+
+      - name: Resolve package version
+        id: package_version
+        shell: bash
+        run: node -e "console.log('version=' + require('./package.json').version)" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 依赖安装
+      # ---------------------------------------------------------------
+      - name: Install root deps
+        run: npm ci
+        shell: bash
+
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+        shell: bash
+
+      - name: Validate desktop image runtime packaging
+        run: npm run test:desktop-native
+        shell: bash
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+        shell: bash
+
+      - name: Fetch embedded Node binary
+        run: npm run fetch:node
+        shell: bash
+
+      - name: Build backend & frontend
+        run: npm run build:all
+        shell: bash
+
+      - name: Rebuild native modules for Electron ABI
+        if: matrix.os != 'macos-latest'
+        run: npm run rebuild:native
+        shell: bash
+
+      # ========= macOS 代码签名 + 公证环境变量（可选） =========
+      - name: Export macOS signing env
+        if: matrix.os == 'macos-latest'
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK || secrets.CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD || secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [ -n "$MAC_CSC_LINK" ]; then echo "CSC_LINK=$MAC_CSC_LINK" >> "$GITHUB_ENV"; fi
+          if [ -n "$MAC_CSC_KEY_PASSWORD" ]; then echo "CSC_KEY_PASSWORD=$MAC_CSC_KEY_PASSWORD" >> "$GITHUB_ENV"; fi
+          echo "APPLE_ID=$APPLE_ID" >> "$GITHUB_ENV"
+          echo "APPLE_APP_SPECIFIC_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD" >> "$GITHUB_ENV"
+          echo "APPLE_TEAM_ID=$APPLE_TEAM_ID" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY=$APPLE_API_KEY" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID" >> "$GITHUB_ENV"
+          echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
+        shell: bash
+
+      # ========= Windows Direct EXE (no third-party signing) =========
+      - name: Build Electron Full (Windows)
+        if: matrix.os == 'windows-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --config electron/builder.config.js --win --publish never
+        shell: bash
+
+      - name: Build Electron Lite (Windows)
+        if: matrix.os == 'windows-latest' && github.event_name == 'push'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --config electron/builder.lite.config.js --win --publish never
+        shell: bash
+
+      - name: Stage exact Windows Full and Lite assets
+        if: matrix.os == 'windows-latest' && github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (node -p "require('./package.json').version").Trim()
+          $expected = @(
+            @("dist-electron", "Nowen-Note-$version-setup.exe"),
+            @("dist-electron", "Nowen-Note-$version-portable.exe"),
+            @("dist-electron", "Nowen-Note-$version-setup.exe.blockmap"),
+            @("dist-electron", "latest.yml"),
+            @("dist-electron-lite", "Nowen-Note-Lite-$version-setup.exe"),
+            @("dist-electron-lite", "Nowen-Note-Lite-$version-portable.exe"),
+            @("dist-electron-lite", "Nowen-Note-Lite-$version-setup.exe.blockmap"),
+            @("dist-electron-lite", "latest-lite.yml")
+          )
+          New-Item -ItemType Directory -Path windows-release -Force | Out-Null
+          foreach ($entry in $expected) {
+            $src = Join-Path $entry[0] $entry[1]
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "Missing Windows asset: $src" }
+            Copy-Item -LiteralPath $src -Destination windows-release -Force
+          }
+          if (@(Get-ChildItem windows-release -File).Count -ne $expected.Count) { throw 'Unexpected Windows asset count' }
+
+      - name: Verify direct Windows SHA-512 metadata and assets
+        if: matrix.os == 'windows-latest' && github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $version = (node -p "require('./package.json').version").Trim()
+          node scripts/verify-release-update-assets.mjs local --dir windows-release --version $version
+
+      - name: Upload validated Windows CI release assets
+        if: matrix.os == 'windows-latest' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nowen-note-win-direct
+          path: windows-release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # ========= macOS =========
+      - name: Test macOS native dependency packaging
+        if: matrix.os == 'macos-latest'
+        run: node --test scripts/tests/macos-sharp.test.cjs scripts/tests/rebuild-native.test.cjs
+        shell: bash
+
+      - name: Build Electron (macOS x64 / Intel)
+        if: matrix.os == 'macos-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.CSC_LINK == '' && 'false' || 'true' }}
+          NOWEN_MAC_ARCH: x64
+          TARGET_ARCH: x64
+          npm_config_target_arch: x64
+        run: |
+          npm run rebuild:native -- --target-platform=darwin --target-arch=x64
+          npx electron-builder --config electron/builder.config.js --mac --publish never
+        shell: bash
+
+      - name: Build Electron (macOS arm64 / Apple Silicon)
+        if: matrix.os == 'macos-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.CSC_LINK == '' && 'false' || 'true' }}
+          NOWEN_MAC_ARCH: arm64
+          TARGET_ARCH: arm64
+          npm_config_target_arch: arm64
+        run: |
+          npm run rebuild:native -- --target-platform=darwin --target-arch=arm64
+          npx electron-builder --config electron/builder.config.js --mac --publish never
+        shell: bash
+
+      # ========= Linux =========
+      - name: Linux desktop packaging regression tests
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run test:linux-desktop
+        shell: bash
+
+      - name: Install desktop entry validator
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
+        shell: bash
+
+      - name: Build Electron (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: npx electron-builder --config electron/builder.config.js --linux --publish never
+        shell: bash
+
+      - name: Verify Linux Debian desktop integration
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run verify:linux-desktop
+        shell: bash
+
+      # ========= 普通构建产物 =========
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nowen-note-${{ matrix.name }}
+          path: |
+            dist-electron/*.exe
+            dist-electron/*.dmg
+            dist-electron/*.zip
+            dist-electron/*.AppImage
+            dist-electron/*.deb
+            dist-electron/*.blockmap
+            dist-electron/latest*.yml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release-assets:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'release-assets' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: release-assets-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Collect same-tag assets and verify Draft in GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          RELEASE_REQUEST_ID: ${{ inputs.request_id }}
+          COLLECT_DESKTOP: ${{ inputs.desktop }}
+          COLLECT_WINDOWS: ${{ inputs.windows }}
+          COLLECT_LINUX: ${{ inputs.linux }}
+        run: node scripts/release-ci-assets.mjs collect
+      - name: Upload CI verification receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-verification-${{ inputs.request_id }}
+          path: ${{ runner.temp }}/nowen-release-verification.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14

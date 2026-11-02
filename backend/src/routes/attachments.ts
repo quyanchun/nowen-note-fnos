@@ -1,0 +1,437 @@
+import type { Context } from "hono";
+import { Hono } from "hono";
+import attachmentsCoreRouter, {
+  handleDownloadAttachment as handleFullAttachmentDownload,
+} from "./attachments-core";
+import remoteImageImportRouter from "./remote-image-import";
+import { handleAttachmentMediaRange } from "./attachment-media-range";
+import { getDb } from "../db/schema";
+import { inferVideoMime } from "../lib/media-mime";
+import { imageAttachmentPath, imageAttachmentUrl } from "../lib/attachment-image-url";
+import { resolvePublicOrigin } from "../lib/shareUrlRewrite";
+import { hasPermission, resolveNotePermission } from "../middleware/acl";
+import { resolveEffectiveNoteCapabilities } from "../services/share-capabilities";
+import { authorizeSingleShareRequest, findSingleShareByToken } from "../services/single-share-access";
+import { verifyLoginToken, verifyShareAccessToken } from "../lib/auth-security";
+import { hasScope, looksLikeApiToken, resolveApiToken } from "../lib/api-tokens";
+import { userSessionsRepository } from "../repositories";
+import { canApiTokenReadAttachment } from "../middleware/api-token-resource-scope";
+import {
+  ensureStableFileShare,
+  FileShareError,
+  resolveStableFileShare,
+  revokeStableFileShare,
+  type FileShareAccess,
+} from "../services/file-shares";
+import {
+  createAttachmentSignedUrl,
+  createShareAttachmentScope,
+  createUserAttachmentScope,
+  verifyAttachmentSignature,
+} from "../lib/attachment-signed-url";
+
+export * from "./attachments-core";
+export { inferVideoMime } from "../lib/media-mime";
+
+interface ShareAccessRow {
+  id: string;
+  noteId: string;
+  password: string | null;
+  isActive: number;
+  expiresAt: string | null;
+  maxViews: number | null;
+  viewCount: number;
+}
+
+const ACCESS_REVOKED_REASONS = new Set([
+  "attachment_not_found",
+  "note_mismatch",
+  "user_access_revoked",
+  "file_access_revoked",
+  "share_access_revoked",
+  "share_expired",
+]);
+
+function isExpiredDate(value: unknown): boolean {
+  if (!value) return false;
+  const time = new Date(String(value)).getTime();
+  return Number.isFinite(time) && time <= Date.now();
+}
+
+function requestPublicOrigin(c: Context): string {
+  return resolvePublicOrigin((name) => c.req.header(name)) || "";
+}
+
+function buildSignedAttachmentUrls(noteId: string, scope: string, origin: string): Record<string, string> {
+  const rows = getDb()
+    .prepare("SELECT id FROM attachments WHERE noteId = ? ORDER BY id ASC")
+    .all(noteId) as Array<{ id: string }>;
+  const normalizedOrigin = origin.replace(/\/+$/, "");
+  const urls: Record<string, string> = {};
+  for (const row of rows) {
+    const path = `/api/attachments/${row.id}`;
+    const baseUrl = normalizedOrigin ? `${normalizedOrigin}${path}` : path;
+    urls[row.id] = createAttachmentSignedUrl(baseUrl, row.id, scope);
+  }
+  return urls;
+}
+
+function buildStableFileShareUrl(c: Context, attachmentId: string, token: string): string {
+  const row = getDb().prepare("SELECT mimeType FROM attachments WHERE id = ?").get(attachmentId) as { mimeType: string } | undefined;
+  const imageUrl = row && imageAttachmentUrl(c, attachmentId, row.mimeType);
+  if (imageUrl) return `${imageUrl}?share=${encodeURIComponent(token)}`;
+  const path = `/api/attachments/${encodeURIComponent(attachmentId)}?share=${encodeURIComponent(token)}`;
+  const origin = requestPublicOrigin(c).replace(/\/+$/, "");
+  return origin ? `${origin}${path}` : path;
+}
+
+function noStoreJson(c: Context, payload: unknown, status: 200 | 400 | 401 | 403 | 404 | 410 = 200): Response {
+  c.header("Cache-Control", "private, no-store");
+  c.header("Pragma", "no-cache");
+  return c.json(payload, status);
+}
+
+function fileShareErrorResponse(c: Context, error: unknown): Response {
+  if (error instanceof FileShareError) {
+    return noStoreJson(c, { error: error.message, code: error.code }, error.status);
+  }
+  console.error("[attachment.file-share.failed]", error);
+  return noStoreJson(c, { error: "文件分享处理失败", code: "FILE_SHARE_FAILED" }, 400);
+}
+
+function readClientIp(c: Context): string {
+  return c.req.header("x-forwarded-for")?.split(",")[0]?.trim()
+    || c.req.header("x-real-ip")
+    || "";
+}
+
+/**
+ * The download route is registered before the global JWT middleware so native <img>/<video>
+ * requests can use signed URLs. Never trust a caller-provided X-User-Id at this boundary.
+ * For API clients that do send Authorization, independently verify the Bearer credential and
+ * only then inject X-User-Id for the mature ACL handler below.
+ */
+function resolveVerifiedAttachmentUser(c: Context): string {
+  const authHeader = c.req.header("Authorization") || "";
+  if (!authHeader.startsWith("Bearer ")) return "";
+  const token = authHeader.slice(7).trim();
+  if (!token) return "";
+
+  const db = getDb();
+  if (looksLikeApiToken(token)) {
+    const resolved = resolveApiToken(db, token, readClientIp(c));
+    if (!resolved || !hasScope(resolved, "notes:read") || !canApiTokenReadAttachment(resolved, c.req.param("id"))) return "";
+    const user = db
+      .prepare("SELECT isDisabled FROM users WHERE id = ?")
+      .get(resolved.userId) as { isDisabled: number } | undefined;
+    return user && !user.isDisabled ? resolved.userId : "";
+  }
+
+  const payload = verifyLoginToken(token);
+  if (!payload?.userId) return "";
+  const user = db
+    .prepare("SELECT tokenVersion, isDisabled FROM users WHERE id = ?")
+    .get(payload.userId) as { tokenVersion: number; isDisabled: number } | undefined;
+  if (!user || user.isDisabled || (payload.tver ?? 0) !== (user.tokenVersion ?? 0)) return "";
+  if (payload.jti) {
+    const session = userSessionsRepository.getByIdAndUser(payload.jti, payload.userId);
+    if (!session || session.revokedAt) return "";
+  }
+  return payload.userId;
+}
+
+/**
+ * Public bridge endpoint used by /share/:token.
+ *
+ * It intentionally lives at the single-segment path `/api/attachments/share-access`,
+ * which is handled by the pre-JWT attachment route. Password protected shares must
+ * forward the temporary share access token in Authorization.
+ */
+function handleSharedAttachmentAccess(c: Context): Response {
+  const token = (c.req.query("token") || "").trim();
+  if (!token || token.length > 256) {
+    return noStoreJson(c, { error: "缺少有效分享令牌", code: "SHARE_TOKEN_REQUIRED" }, 400);
+  }
+
+  const share = findSingleShareByToken(token);
+  const access = authorizeSingleShareRequest(c, share, { requireCredential: true });
+  if (!access.ok) return noStoreJson(c, access.payload, access.status);
+  const scope = createShareAttachmentScope(share!.id, share!.noteId, true);
+  return noStoreJson(c, {
+    noteId: share!.noteId,
+    urls: buildSignedAttachmentUrls(share!.noteId, scope, requestPublicOrigin(c)),
+  });
+}
+
+/**
+ * Some Android document providers return an empty MIME even for an MP4. The core upload route is
+ * intentionally format-agnostic and stores application/octet-stream in that case. Normalize only
+ * known video extensions after a successful upload so playback and Range handling receive the
+ * correct Content-Type without weakening executable-file checks.
+ */
+const attachmentsRouter = new Hono();
+attachmentsRouter.use("*", async (c, next) => {
+  await next();
+  if (c.req.method !== "POST" || c.res.status !== 201) return;
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = await c.res.clone().json() as Record<string, unknown>;
+  } catch {
+    return;
+  }
+
+  const currentMime = String(payload.mimeType || "").toLowerCase();
+  if (currentMime && currentMime !== "application/octet-stream") return;
+  const inferred = inferVideoMime(String(payload.filename || ""));
+  const id = String(payload.id || "");
+  if (!inferred || !id) return;
+
+  try {
+    getDb()
+      .prepare(
+        "UPDATE attachments SET mimeType = ? WHERE id = ? AND (mimeType IS NULL OR mimeType = '' OR mimeType = 'application/octet-stream')",
+      )
+      .run(inferred, id);
+  } catch {
+    return;
+  }
+
+  const headers = new Headers(c.res.headers);
+  headers.set("Content-Type", "application/json; charset=UTF-8");
+  c.res = new Response(JSON.stringify({ ...payload, mimeType: inferred }), {
+    status: c.res.status,
+    statusText: c.res.statusText,
+    headers,
+  });
+});
+
+/**
+ * Authenticated users exchange their current note read permission for short-lived,
+ * re-checkable attachment URLs. This route is mounted after the global JWT middleware.
+ */
+attachmentsRouter.get("/access/urls", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = (c.req.query("noteId") || "").trim();
+  if (!noteId) return noStoreJson(c, { error: "缺少 noteId", code: "NOTE_ID_REQUIRED" }, 400);
+
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  if (!capabilities.read) {
+    console.warn("[attachment.access.denied]", { noteId, userId, reason: "note_read_forbidden" });
+    return noStoreJson(c, { error: "无权访问该笔记的附件", code: "ATTACHMENT_ACCESS_DENIED" }, 403);
+  }
+
+  const scope = createUserAttachmentScope(userId, noteId, capabilities.download);
+  return noStoreJson(c, {
+    noteId,
+    urls: buildSignedAttachmentUrls(noteId, scope, requestPublicOrigin(c)),
+  });
+});
+
+/**
+ * 把运行时附件 URL 升级为稳定文件分享 capability。
+ * 临时签名继续只负责页面运行时读取，用户复制/转发使用这里返回的稳定地址。
+ */
+attachmentsRouter.post("/file-share", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const body = await c.req.json().catch(() => ({})) as {
+    attachmentId?: unknown;
+    allowDownload?: unknown;
+    expiresAt?: unknown;
+  };
+  const attachmentId = typeof body.attachmentId === "string" ? body.attachmentId.trim() : "";
+  if (!attachmentId) {
+    return noStoreJson(c, { error: "缺少 attachmentId", code: "FILE_SHARE_ATTACHMENT_REQUIRED" }, 400);
+  }
+
+  try {
+    const share = ensureStableFileShare(attachmentId, userId, {
+      ...(typeof body.allowDownload === "boolean" ? { allowDownload: body.allowDownload } : {}),
+      ...(body.expiresAt !== undefined
+        ? { expiresAt: body.expiresAt === null ? null : String(body.expiresAt) }
+        : {}),
+    });
+    return noStoreJson(c, {
+      id: share.id,
+      attachmentId: share.attachmentId,
+      isActive: share.isActive !== 0,
+      expiresAt: share.expiresAt,
+      allowDownload: share.allowDownload !== 0,
+      url: buildStableFileShareUrl(c, share.attachmentId, share.token),
+    });
+  } catch (error) {
+    return fileShareErrorResponse(c, error);
+  }
+});
+
+attachmentsRouter.delete("/file-share/:attachmentId", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const attachmentId = c.req.param("attachmentId").trim();
+  if (!attachmentId) {
+    return noStoreJson(c, { error: "缺少 attachmentId", code: "FILE_SHARE_ATTACHMENT_REQUIRED" }, 400);
+  }
+  const revoked = revokeStableFileShare(attachmentId, userId);
+  return noStoreJson(c, { success: true, revoked });
+});
+
+attachmentsRouter.route("/", remoteImageImportRouter);
+attachmentsRouter.route("/", attachmentsCoreRouter);
+
+export default attachmentsRouter;
+
+/** Filename aliases share the exact same ACL, signatures, revocation and storage handler. */
+export async function handleNamedImageAttachment(c: Context): Promise<Response> {
+  const id = c.req.param("id");
+  const row = getDb().prepare("SELECT mimeType FROM attachments WHERE id = ?").get(id) as { mimeType: string } | undefined;
+  const expected = row && imageAttachmentPath(id, row.mimeType);
+  if (!expected || expected.split("/").pop() !== c.req.param("filename")) {
+    return c.json({ error: "图片不存在" }, 404);
+  }
+  return handleDownloadAttachment(c);
+}
+
+function hardenScopedResponse(response: Response, _attachmentId: string, _requestHeaders: Headers): Response {
+  const headers = new Headers(response.headers);
+  // 授权可随时撤销，因此浏览器/CDN 不得在未经服务端复核的情况下直接使用副本。
+  //
+  //   这里用 no-cache 而不是 no-store：两者都要求每次请求回源，服务端仍会执行
+  //   完整授权复核（verifyAttachmentSignature 每次都查 shares/publications 的
+  //   isActive 与 note capabilities），区别只在于 no-cache 允许浏览器保留副本，
+  //   在服务端回 304 时复用它。
+  //
+  //   no-store 会强制每次重新下载并解码整份图片/视频 —— 图片密集的笔记每次切换
+  //   都要重下全部原图，这是"图片多的笔记切换慢"的主因。而它并未换来额外安全：
+  //   签名 URL 本身的 TTL 就是 12 小时（attachment-signed-url.ts DEFAULT_TTL_MS），
+  //   期间同一 URL 可反复取用，因此禁止本地副本并不缩小暴露窗口。
+  //
+  //   must-revalidate 与 no-cache 语义重叠，这里显式写出以兼容只识别其中一个的
+  //   老代理。移除 Pragma: no-cache —— 它是 HTTP/1.0 请求头，作为响应头无标准
+  //   含义，且部分实现会把它当作 no-store 处理，反而抵消上面的意图。
+  headers.set("Cache-Control", "private, no-cache, must-revalidate, no-transform");
+  headers.set("Vary", "Authorization");
+
+  // ETag 与 304 短路已经在核心 handler（attachments-core.ts::handleDownloadAttachment）
+  // 里按 (attachmentId, variant) 计算完成——原图和每个缩略图宽度各自独立的验证器，
+  // 短路发生在权限校验之后、读取文件字节之前，这样才能同时保住"撤销后重放必须
+  // 403 而非 304"和"避免不必要的磁盘/对象存储读取"。这里不再重新合成 ETag
+  // 或做二次 304 判断，避免用一个不区分 variant 的 "att-<id>" 覆盖掉正确的值，
+  // 只原样保留核心 handler 已经设置好的 ETag（若有）。
+  //
+  // 206（Range 分片）没有 ETag 是预期行为：Content-Range 语义下不该带实体头。
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
+ * Preserve the canonical attachment handler while allowing seekable media to answer byte-range
+ * requests first. Keeping this wrapper at the original module path means index.ts, tests and every
+ * existing importer automatically receive Range support without duplicating route registration.
+ */
+export async function handleDownloadAttachment(c: Context): Promise<Response> {
+  const id = c.req.param("id");
+  if (id === "share-access") return handleSharedAttachmentAccess(c);
+
+  // Strip the untrusted pre-JWT identity header before resolving either bearer access or
+  // a server-validated stable file-share capability.
+  c.req.raw.headers.delete("X-User-Id");
+
+  let fileShareAccess: FileShareAccess | null = null;
+  const fileShareToken = (c.req.query("share") || "").trim();
+  if (fileShareToken) {
+    try {
+      fileShareAccess = resolveStableFileShare(fileShareToken, id);
+      // attachments-core already owns mature note/file ACL handling. Only inject the owner
+      // identity after the opaque share token, attachment binding and current reshare permission
+      // were all revalidated above; caller-supplied X-User-Id has already been removed.
+      c.req.raw.headers.set("X-User-Id", fileShareAccess.ownerId);
+    } catch (error) {
+      return fileShareErrorResponse(c, error);
+    }
+  }
+
+  const verifiedUserId = fileShareAccess?.ownerId || resolveVerifiedAttachmentUser(c);
+  if (verifiedUserId && !fileShareAccess) c.req.raw.headers.set("X-User-Id", verifiedUserId);
+
+  const exp = c.req.query("exp");
+  const sig = c.req.query("sig");
+  const scope = c.req.query("scope");
+  const hasAnySignaturePart = Boolean(exp || sig || scope);
+  const hasCompleteSignature = Boolean(exp && sig && scope);
+
+  if (hasAnySignaturePart && !hasCompleteSignature) {
+    console.warn("[attachment.access.denied]", { id, reason: "incomplete_signature" });
+    return c.json({ error: "附件访问签名不完整", code: "INVALID_SIGNATURE" }, 403);
+  }
+
+  let signatureVerification: ReturnType<typeof verifyAttachmentSignature> | null = null;
+  if (hasCompleteSignature) {
+    const verification = verifyAttachmentSignature(id, exp!, sig!, scope!);
+    signatureVerification = verification;
+    if (!verification.valid) {
+      const revoked = ACCESS_REVOKED_REASONS.has(verification.reason || "");
+      console.warn("[attachment.access.denied]", {
+        id,
+        reason: verification.reason,
+        accessKind: verification.accessKind,
+      });
+      return c.json(
+        revoked
+          ? {
+              error: "您已无权访问该附件，分享可能已撤销或成员权限已移除",
+              code: "ATTACHMENT_ACCESS_REVOKED",
+              reason: verification.reason,
+            }
+          : {
+              error: "签名无效或已过期",
+              code: "INVALID_SIGNATURE",
+              reason: verification.reason,
+            },
+        403,
+      );
+    }
+  }
+
+  // The attachment UUID is no longer an authorization capability. Native image/video requests
+  // must use a short-lived signed URL, a verified bearer credential, or a stable file-share token.
+  if (!hasCompleteSignature && !verifiedUserId) {
+    console.warn("[attachment.access.denied]", { id, reason: "missing_verified_access" });
+    return c.json({ error: "附件不存在", code: "ATTACHMENT_NOT_FOUND" }, 404);
+  }
+
+  const downloadRequested = /^(?:1|true|yes)$/i.test(c.req.query("download") || "");
+  if (
+    downloadRequested
+    && (signatureVerification?.allowDownload === false || fileShareAccess?.allowDownload === false)
+  ) {
+    console.warn("[attachment.access.denied]", { id, reason: "download_forbidden" });
+    return c.json({ error: "当前分享不允许下载附件", code: "ATTACHMENT_DOWNLOAD_FORBIDDEN" }, 403);
+  }
+
+  const metadataExists = Boolean(
+    getDb().prepare("SELECT 1 AS ok FROM attachments WHERE id = ?").get(id),
+  );
+  c.set("attachmentAllowDownload", signatureVerification?.allowDownload !== false && fileShareAccess?.allowDownload !== false);
+
+  let delegated = false;
+  const rangeResponse = await handleAttachmentMediaRange(c, async () => {
+    delegated = true;
+  });
+  const response = !delegated && rangeResponse instanceof Response
+    ? rangeResponse
+    : await handleFullAttachmentDownload(c);
+
+  if (response.status === 404) {
+    console.warn(
+      metadataExists ? "[attachment.file.missing]" : "[attachment.metadata.missing]",
+      { id },
+    );
+  } else if (response.status === 401 || response.status === 403) {
+    console.warn("[attachment.access.denied]", { id, status: response.status });
+  }
+
+  return hardenScopedResponse(response, id, new Headers(c.req.raw.headers));
+}

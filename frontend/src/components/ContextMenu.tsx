@@ -1,0 +1,829 @@
+import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { useVisibleViewport } from "@/hooks/useVisibleViewport";
+import {
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  FileType2,
+  FolderInput,
+  Image as ImageIcon,
+  Pencil,
+  Printer,
+  X,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useApp, useAppActions } from "@/store/AppContext";
+import { getLatestContextMenuState } from "@/hooks/useContextMenu";
+import { api } from "@/lib/api";
+import { exportSingleNote, exportSingleNoteAsImage, exportSingleNoteAsPDF } from "@/lib/exportService";
+import { toast } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { Notebook } from "@/types";
+import { useTranslation } from "react-i18next";
+import RenameContextNoteModal from "@/components/RenameContextNoteModal";
+
+export interface ContextMenuItem {
+  id: string;
+  label: string;
+  icon?: React.ReactNode;
+  danger?: boolean;
+  disabled?: boolean;
+  separator?: boolean;
+  /** 子菜单项，hover/click 后展开二级菜单 */
+  children?: ContextMenuItem[];
+}
+
+interface ContextMenuProps {
+  isOpen: boolean;
+  x: number;
+  y: number;
+  items: ContextMenuItem[];
+  menuRef: React.RefObject<HTMLDivElement | null>;
+  onAction: (actionId: string) => void;
+  header?: string;
+}
+
+const contextMenuRowClassName =
+  "w-full h-9 flex items-center gap-2 px-3 text-sm transition-colors duration-150 ease-out";
+const contextMenuIconClassName = "w-4 h-4 flex items-center justify-center shrink-0";
+
+function DesktopContextMenuItems({
+  items,
+  onAction,
+  menuId,
+}: {
+  items: ContextMenuItem[];
+  onAction: (actionId: string) => void;
+  menuId: string;
+}) {
+  const [activeItemId, setActiveItemId] = useState<string | null>(null);
+  const [placement, setPlacement] = useState({ left: 0, top: 0 });
+  const viewport = useVisibleViewport(!!activeItemId);
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  const submenuRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useLayoutEffect(() => {
+    if (!activeItemId) return;
+    const anchor = anchorRef.current;
+    const submenu = submenuRef.current;
+    if (!anchor || !submenu) return;
+
+    const updatePlacement = () => {
+      const anchorRect = anchor.getBoundingClientRect();
+      const submenuRect = submenu.getBoundingClientRect();
+      const viewportGap = 8;
+      const menuGap = 4;
+      const minLeft = viewport.left + viewportGap;
+      const rightEdge = viewport.left + viewport.width - viewportGap;
+      const rightSpace = rightEdge - anchorRect.right - menuGap;
+      const leftSpace = anchorRect.left - minLeft - menuGap;
+      const preferredLeft = rightSpace >= submenuRect.width || rightSpace >= leftSpace
+        ? anchorRect.right + menuGap : anchorRect.left - submenuRect.width - menuGap;
+      const left = Math.min(Math.max(preferredLeft, minLeft), Math.max(minLeft, rightEdge - submenuRect.width));
+      const minTop = viewport.top + viewportGap;
+      const maxTop = Math.max(minTop, viewport.top + viewport.height - viewportGap - submenuRect.height);
+      const top = Math.min(Math.max(anchorRect.top, minTop), maxTop);
+      setPlacement({ left, top });
+    };
+
+    updatePlacement();
+    // 根菜单滚动时同步子菜单位置；子菜单通过 portal 保持完整可见。
+    window.addEventListener("scroll", updatePlacement, true);
+    return () => window.removeEventListener("scroll", updatePlacement, true);
+  }, [activeItemId, viewport]);
+
+  useEffect(() => () => {
+    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+  }, []);
+
+  return (
+    <>
+      {items.map((item) => {
+        if (item.separator) {
+          return <div key={item.id} className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1 mx-2" />;
+        }
+
+        if (item.children?.length) {
+          const active = activeItemId === item.id;
+          return (
+            <div
+              key={item.id}
+              ref={active ? anchorRef : undefined}
+              className="relative"
+              onMouseEnter={() => {
+                if (!window.matchMedia("(min-width: 640px) and (hover: hover)").matches) return;
+                if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+                setActiveItemId(item.id);
+              }}
+              onMouseLeave={() => {
+                if (!window.matchMedia("(min-width: 640px) and (hover: hover)").matches) return;
+                closeTimerRef.current = setTimeout(() => setActiveItemId(null), 150);
+              }}
+            >
+              <button
+                type="button"
+                disabled={item.disabled}
+                aria-haspopup="menu"
+                aria-expanded={active}
+                onClick={() => {
+                  if (!item.disabled) setActiveItemId(active ? null : item.id);
+                }}
+                className={cn(
+                  contextMenuRowClassName,
+                  "justify-between",
+                  item.disabled && "opacity-40 cursor-not-allowed",
+                  active && "bg-black/[0.04] dark:bg-white/[0.06]",
+                  "text-zinc-700 dark:text-zinc-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] hover:text-tx-primary",
+                )}
+              >
+                <span className="flex items-center gap-2 min-w-0">
+                  {item.icon && <span className={contextMenuIconClassName}>{item.icon}</span>}
+                  <span className="truncate whitespace-nowrap">{item.label}</span>
+                </span>
+                <ChevronRight size={12} className="text-tx-tertiary shrink-0" />
+              </button>
+              {active && createPortal(
+                <div
+                  ref={submenuRef}
+                  data-context-menu-id={menuId}
+                  data-context-menu-submenu=""
+                  style={{ ...placement, maxHeight: Math.max(0, viewport.height - 16), maxWidth: Math.max(0, viewport.width - 16) }}
+                  className="fixed w-max min-w-[13.5rem] max-w-[calc(100vw-16px)] overflow-y-auto overscroll-contain bg-app-elevated rounded-[12px] shadow-lg shadow-black/[0.08] dark:shadow-black/30 border border-black/[0.06] dark:border-white/[0.08] py-1 z-[101]"
+                  onMouseEnter={() => {
+                    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+                  }}
+                  onMouseLeave={() => {
+                    closeTimerRef.current = setTimeout(() => setActiveItemId(null), 150);
+                  }}
+                >
+                  <DesktopContextMenuItems items={item.children} onAction={onAction} menuId={menuId} />
+                </div>,
+                document.body,
+              )}
+            </div>
+          );
+        }
+
+        return (
+          <button
+            key={item.id}
+            type="button"
+            disabled={item.disabled}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!item.disabled) onAction(item.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault(); event.stopPropagation();
+              if (!item.disabled) onAction(item.id);
+            }}
+            className={cn(
+              contextMenuRowClassName,
+              item.disabled && "opacity-40 cursor-not-allowed",
+              item.danger
+                ? "text-red-600 dark:text-red-400 hover:bg-red-50/60 dark:hover:bg-red-900/20"
+                : "text-zinc-700 dark:text-zinc-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] hover:text-tx-primary",
+            )}
+          >
+            {item.icon && <span className={contextMenuIconClassName}>{item.icon}</span>}
+            <span className="truncate whitespace-nowrap">{item.label}</span>
+          </button>
+        );
+      })}
+    </>
+  );
+}
+
+function resolveMobileMenu(
+  rootItems: ContextMenuItem[],
+  path: string[],
+): { parent: ContextMenuItem | null; items: ContextMenuItem[] } {
+  let items = rootItems;
+  let parent: ContextMenuItem | null = null;
+  for (const id of path) {
+    const next = items.find((item) => item.id === id && item.children?.length);
+    if (!next?.children) break;
+    parent = next;
+    items = next.children;
+  }
+  return { parent, items };
+}
+
+function buildNotebookTree(notebooks: Notebook[]): Notebook[] {
+  const map = new Map<string, Notebook>();
+  const roots: Notebook[] = [];
+  notebooks.forEach((nb) => map.set(nb.id, { ...nb, children: [] }));
+  notebooks.forEach((nb) => {
+    const node = map.get(nb.id)!;
+    if (nb.parentId && map.has(nb.parentId)) {
+      map.get(nb.parentId)!.children!.push(node);
+    } else {
+      roots.push(node);
+    }
+  });
+  const sortRecursive = (list: Notebook[]) => {
+    list.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+    list.forEach((nb) => {
+      if (nb.children?.length) sortRecursive(nb.children);
+    });
+  };
+  sortRecursive(roots);
+  return roots;
+}
+
+function NotebookTargetItem({
+  notebook,
+  depth,
+  selectedId,
+  currentNotebookId,
+  onSelect,
+}: {
+  notebook: Notebook;
+  depth: number;
+  selectedId: string | null;
+  currentNotebookId: string;
+  onSelect: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(true);
+  const hasChildren = !!notebook.children?.length;
+  const isCurrent = notebook.id === currentNotebookId;
+  const isSelected = notebook.id === selectedId;
+
+  return (
+    <div>
+      <button
+        type="button"
+        disabled={isCurrent}
+        onClick={() => !isCurrent && onSelect(notebook.id)}
+        className={cn(
+          "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition-colors",
+          isCurrent
+            ? "opacity-40 cursor-not-allowed text-tx-tertiary"
+            : isSelected
+            ? "bg-accent-primary/10 text-accent-primary"
+            : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+        )}
+        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+      >
+        {hasChildren ? (
+          <span
+            onClick={(e) => {
+              e.stopPropagation();
+              setExpanded((v) => !v);
+            }}
+            className="w-4 h-4 flex items-center justify-center shrink-0 cursor-pointer"
+          >
+            {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          </span>
+        ) : (
+          <span className="w-4 h-4 shrink-0" />
+        )}
+        <span className="text-base shrink-0">{notebook.icon || "📒"}</span>
+        <span className="truncate flex-1 text-left">{notebook.name}</span>
+        {isCurrent && <span className="text-[10px] text-tx-tertiary shrink-0">{t("common.current")}</span>}
+        {isSelected && <Check size={14} className="text-accent-primary shrink-0" />}
+      </button>
+      {hasChildren && expanded && notebook.children!.map((child) => (
+        <NotebookTargetItem
+          key={child.id}
+          notebook={child}
+          depth={depth + 1}
+          selectedId={selectedId}
+          currentNotebookId={currentNotebookId}
+          onSelect={onSelect}
+        />
+      ))}
+    </div>
+  );
+}
+
+function MoveContextNoteModal({
+  noteId,
+  onClose,
+}: {
+  noteId: string | null;
+  onClose: () => void;
+}) {
+  const { state } = useApp();
+  const actions = useAppActions();
+  const { t } = useTranslation();
+  const [note, setNote] = useState<any | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [moving, setMoving] = useState(false);
+
+  useEffect(() => {
+    if (!noteId) {
+      setNote(null);
+      setSelectedId(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setSelectedId(null);
+    api.getNote(noteId)
+      .then((fresh) => {
+        if (!cancelled) setNote(fresh);
+      })
+      .catch((err: any) => {
+        if (!cancelled) {
+          console.error("Failed to load note before move:", err);
+          toast.error(err?.message || t("noteList.loadFailed") || "加载笔记失败");
+          onClose();
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [noteId, onClose, t]);
+
+  useEffect(() => {
+    if (!noteId) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [noteId, onClose]);
+
+  if (!noteId) return null;
+
+  const sourceWorkspaceId = note?.workspaceId || null;
+  const notebooks = note
+    ? state.notebooks.filter((nb) => (nb.workspaceId || null) === sourceWorkspaceId)
+    : [];
+  const tree = buildNotebookTree(notebooks);
+  const canMove = !!note && !!selectedId && selectedId !== note.notebookId && !moving;
+
+  const handleMove = async () => {
+    if (!note || !selectedId || selectedId === note.notebookId || moving) return;
+    if (note.isLocked === 1) {
+      toast.warning(t("common.noteLockedCannotEdit") || t("editor.lockedBanner") || "笔记已锁定");
+      return;
+    }
+    setMoving(true);
+    try {
+      await api.updateNote(note.id, { notebookId: selectedId } as any);
+      actions.updateNoteInList({ id: note.id, notebookId: selectedId });
+      if (state.activeNote?.id === note.id) {
+        actions.setActiveNote({ ...state.activeNote, notebookId: selectedId } as any);
+        actions.setSelectedNotebook(selectedId);
+      }
+      actions.refreshNotebooks();
+      actions.refreshNotes();
+      onClose();
+    } catch (err: any) {
+      console.error("Failed to move note:", err);
+      toast.error(err?.message || t("noteList.bulkMoveFailed", { error: "" }) || "移动笔记失败");
+      actions.refreshNotebooks();
+      actions.refreshNotes();
+    } finally {
+      setMoving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[110] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={moving ? undefined : onClose} />
+      <div
+        className="relative w-full max-w-[360px] mx-4 max-h-[80vh] bg-app-elevated border border-app-border rounded-xl shadow-2xl flex flex-col overflow-hidden"
+        style={{ animation: "contextMenuIn 0.15s ease-out" }}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-app-border">
+          <div className="flex items-center gap-2 min-w-0">
+            <FolderInput size={16} className="text-accent-primary shrink-0" />
+            <span className="text-sm font-medium text-tx-primary truncate">{t("noteList.moveNote")}</span>
+          </div>
+          <button
+            type="button"
+            disabled={moving}
+            onClick={onClose}
+            className="p-1 rounded-md hover:bg-app-hover text-tx-tertiary disabled:opacity-40"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="px-4 py-2 text-xs text-tx-tertiary truncate border-b border-app-border">
+          {loading ? t("common.loading") : (note?.title || t("common.untitledNote") || "无标题笔记")}
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+          <div className="p-2">
+            {tree.map((nb) => (
+              <NotebookTargetItem
+                key={nb.id}
+                notebook={nb}
+                depth={0}
+                selectedId={selectedId}
+                currentNotebookId={note?.notebookId || ""}
+                onSelect={setSelectedId}
+              />
+            ))}
+            {!loading && tree.length === 0 && (
+              <p className="text-xs text-tx-tertiary text-center py-4">{t("noteList.noNotebooks")}</p>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-app-border">
+          <Button variant="ghost" size="sm" onClick={onClose} disabled={moving}>{t("common.cancel")}</Button>
+          <Button
+            size="sm"
+            disabled={!canMove}
+            onClick={handleMove}
+            className="bg-accent-primary text-white hover:bg-accent-primary/90 disabled:opacity-40"
+          >
+            {moving ? t("common.loading") : t("noteList.moveButton")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function ContextMenu({
+  isOpen, x, y, items, menuRef, onAction, header,
+}: ContextMenuProps) {
+  const internalRef = useRef<HTMLDivElement | null>(null);
+  const menuId = useId();
+  const viewport = useVisibleViewport(isOpen);
+  const [adjustedPos, setAdjustedPos] = useState({ x, y });
+  const [moveNoteId, setMoveNoteId] = useState<string | null>(null);
+  const [renameNoteId, setRenameNoteId] = useState<string | null>(null);
+  const [mobileMenuPath, setMobileMenuPath] = useState<string[]>([]);
+  const { t, i18n } = useTranslation();
+
+  const latestMenu = getLatestContextMenuState();
+  const targetId = latestMenu.targetId;
+  const isNoteMenu = isOpen && latestMenu.targetType === "note" && !!targetId;
+  const isTrashNoteMenu = items.some((item) => item.id === "restore" || item.id === "delete_permanent");
+  // 批量菜单没有“打开”这一单篇操作。树形笔记菜单虽然同样包含 toggle_pin，
+  // 但它有 open；不能再仅凭 toggle_pin + 缺少 export_submenu 将其误判为批量菜单。
+  const isBulkNoteMenu =
+    !items.some((item) => item.id === "open") &&
+    items.some((item) => item.id === "toggle_pin") &&
+    !items.some((item) => item.id === "export_submenu");
+  const isInlineNotebookTreeNoteMenu =
+    isNoteMenu &&
+    items.some((item) => item.id === "open") &&
+    items.some((item) => item.id === "trash") &&
+    !items.some((item) => item.id === "move") &&
+    !items.some((item) => item.id === "export_md");
+
+  const isZh = (i18n.resolvedLanguage || i18n.language || "").toLowerCase().startsWith("zh");
+  const renameLabel = isZh ? "重命名" : "Rename";
+
+  const displayItems = useMemo(() => {
+    let nextItems = items;
+
+    if (isInlineNotebookTreeNoteMenu) {
+      const beforeTrash = items.filter((item) => item.id !== "trash");
+      const trash = items.find((item) => item.id === "trash");
+      const isLocked = !!trash?.disabled;
+      nextItems = [
+        ...beforeTrash,
+        {
+          id: "move",
+          label: t("noteList.moveTo") || "移动到...",
+          icon: <FolderInput size={14} />,
+          disabled: isLocked,
+        },
+        {
+          id: "export_submenu",
+          label: t("noteList.export") || "导出...",
+          icon: <Download size={14} />,
+          children: [
+            { id: "export_md", label: t("noteList.exportAsMarkdown") || "Markdown", icon: <Download size={14} /> },
+            { id: "export_md_zip", label: t("noteList.exportAsMarkdownZip") || "Markdown + 附件（ZIP）", icon: <Download size={14} /> },
+            { id: "export_pdf", label: t("noteList.exportAsPDF") || "PDF", icon: <Printer size={14} /> },
+            { id: "export_png", label: t("note.exportAsPng") || "PNG", icon: <ImageIcon size={14} /> },
+            { id: "export_jpg", label: t("note.exportAsJpg") || "JPG", icon: <ImageIcon size={14} /> },
+            { id: "export_word", label: t("noteList.exportAsWord") || "Word", icon: <FileType2 size={14} /> },
+          ],
+        },
+        { id: "sep_context_note_exports", label: "", separator: true },
+        ...(trash ? [trash] : []),
+      ] as ContextMenuItem[];
+    }
+
+    const shouldOfferRename =
+      isNoteMenu &&
+      !isTrashNoteMenu &&
+      !isBulkNoteMenu &&
+      !nextItems.some((item) => item.id === "rename_note" || item.id === "rename");
+
+    if (!shouldOfferRename) return nextItems;
+
+    const lockSource = nextItems.find((item) => item.id === "trash" || item.id === "move");
+    const renameItem: ContextMenuItem = {
+      id: "rename_note",
+      label: renameLabel,
+      icon: <Pencil size={14} />,
+      disabled: !!lockSource?.disabled,
+    };
+
+    const openIndex = nextItems.findIndex((item) => item.id === "open");
+    if (openIndex >= 0) {
+      return [
+        ...nextItems.slice(0, openIndex + 1),
+        renameItem,
+        ...nextItems.slice(openIndex + 1),
+      ];
+    }
+
+    return [
+      renameItem,
+      { id: "sep_context_note_rename", label: "", separator: true },
+      ...nextItems,
+    ];
+  }, [
+    isBulkNoteMenu,
+    isInlineNotebookTreeNoteMenu,
+    isNoteMenu,
+    isTrashNoteMenu,
+    items,
+    renameLabel,
+    t,
+  ]);
+  const mobileMenu = resolveMobileMenu(displayItems, mobileMenuPath);
+
+  useEffect(() => {
+    if (!isOpen || !menuRef || !("current" in menuRef)) return;
+    const externalRef = menuRef as React.MutableRefObject<HTMLDivElement | null>;
+    externalRef.current = internalRef.current;
+    return () => {
+      if (externalRef.current === internalRef.current) {
+        externalRef.current = null;
+      }
+    };
+  }, [isOpen, menuRef]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const frame = requestAnimationFrame(() => {
+      const el = internalRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const { left: viewportLeft, top: viewportTop, width: viewportWidth, height: viewportHeight } = viewport;
+      const gap = 8;
+      const minX = viewportLeft + gap;
+      const minY = viewportTop + gap;
+      const maxX = Math.max(minX, viewportLeft + viewportWidth - rect.width - gap);
+      const maxY = Math.max(minY, viewportTop + viewportHeight - rect.height - gap);
+      const newX = Math.min(Math.max(x, minX), maxX);
+      const newY = Math.min(Math.max(y, minY), maxY);
+      setAdjustedPos((current) => (
+        current.x === newX && current.y === newY
+          ? current
+          : { x: newX, y: newY }
+      ));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isOpen, x, y, displayItems, mobileMenuPath, viewport]);
+
+  useEffect(() => {
+    setAdjustedPos({ x, y });
+  }, [x, y]);
+
+  useEffect(() => {
+    if (!isOpen) setMobileMenuPath([]);
+  }, [isOpen]);
+
+  const closeOwnerMenu = () => onAction("__context_menu_internal_close");
+
+  const handleSpecialInlineNoteAction = async (actionId: string) => {
+    const currentTargetId = getLatestContextMenuState().targetId || targetId;
+
+    if (actionId === "rename_note" && isNoteMenu && currentTargetId) {
+      setRenameNoteId(currentTargetId);
+      closeOwnerMenu();
+      return;
+    }
+
+    if (!isInlineNotebookTreeNoteMenu || !currentTargetId) {
+      onAction(actionId);
+      return;
+    }
+
+    if (actionId === "move") {
+      setMoveNoteId(currentTargetId);
+      closeOwnerMenu();
+      return;
+    }
+
+    if (!actionId.startsWith("export_")) {
+      onAction(actionId);
+      return;
+    }
+
+    closeOwnerMenu();
+
+    if (actionId === "export_md" || actionId === "export_md_zip") {
+      const toastId = toast.info(t("export.exportingNote", { name: header || t("common.untitledNote") }), 0);
+      try {
+        const ok = await exportSingleNote(currentTargetId, {
+          forceZip: actionId === "export_md_zip",
+        });
+        toast.dismiss(toastId);
+        ok ? toast.success(t("export.exportComplete")) : toast.error(t("export.exportFailed", { error: "" }));
+      } catch (err: any) {
+        toast.dismiss(toastId);
+        toast.error(err?.message || t("export.exportFailed", { error: String(err) }));
+      }
+      return;
+    }
+
+    if (actionId === "export_pdf") {
+      const toastId = toast.info(t("export.exportingNote", { name: header || t("common.untitledNote") }), 0);
+      try {
+        const res = await exportSingleNoteAsPDF(currentTargetId);
+        toast.dismiss(toastId);
+        if (res.ok && (res.mode === "desktop" || res.mode === "web")) {
+          toast.success(t("export.exportComplete"));
+        } else if (!res.ok && res.mode !== "canceled") {
+          toast.error(t("export.exportFailed", { error: (res as { error?: string }).error || "" }));
+        }
+      } catch (err: any) {
+        toast.dismiss(toastId);
+        toast.error(err?.message || t("export.exportFailed", { error: String(err) }));
+      }
+      return;
+    }
+
+    if (actionId === "export_image") {
+      const toastId = toast.info(t("export.exportingNote", { name: header || t("common.untitledNote") }), 0);
+      try {
+        const ok = await exportSingleNoteAsImage(currentTargetId);
+        toast.dismiss(toastId);
+        ok ? toast.success(t("export.exportComplete")) : toast.error(t("export.exportFailed", { error: "" }));
+      } catch (err: any) {
+        toast.dismiss(toastId);
+        toast.error(err?.message || t("export.exportFailed", { error: String(err) }));
+      }
+      return;
+    }
+
+    if (actionId === "export_word") {
+      const toastId = toast.info(t("export.exportingNote", { name: header || t("common.untitledNote") }), 0);
+      try {
+        const fresh = await api.getNote(currentTargetId);
+        const { exportNoteAsDocx, downloadDocxBlob } = await import("@/lib/wordNoteService");
+        const title = fresh.title || t("common.untitledNote") || "未命名笔记";
+        const blob = await exportNoteAsDocx(fresh.content || "", title);
+        await downloadDocxBlob(blob, title);
+        toast.dismiss(toastId);
+        toast.success(t("export.exportComplete"));
+      } catch (err: any) {
+        toast.dismiss(toastId);
+        toast.error(err?.message || t("export.exportFailed", { error: String(err) }));
+      }
+      return;
+    }
+
+    if (actionId === "export_png" || actionId === "export_jpg") {
+      const format: "png" | "jpg" = actionId === "export_png" ? "png" : "jpg";
+      const toastId = toast.info(t("note.exportImageExporting") || "导出中...", 0);
+      try {
+        const fullNote = await api.getNote(currentTargetId);
+        const { exportNoteAsImage } = await import("@/lib/exportService");
+        const ok = await exportNoteAsImage(
+          {
+            id: fullNote.id,
+            title: fullNote.title,
+            content: fullNote.content,
+            contentText: fullNote.contentText,
+            contentFormat: fullNote.contentFormat,
+            updatedAt: fullNote.updatedAt,
+          },
+          { format },
+        );
+        toast.dismiss(toastId);
+        ok
+          ? toast.success(t("note.exportImageSuccess") || "导出成功")
+          : toast.error(t("note.exportImageFailed") || "导出失败");
+      } catch (err: any) {
+        toast.dismiss(toastId);
+        toast.error(err?.message || t("note.exportImageFailed") || "导出失败");
+      }
+      return;
+    }
+
+    onAction(actionId);
+  };
+
+  return (
+    <>
+      {isOpen && (
+        <div
+          ref={internalRef}
+          data-context-menu-id={menuId}
+          style={{
+            position: "fixed",
+            top: adjustedPos.y,
+            left: adjustedPos.x,
+            zIndex: 100,
+            maxHeight: Math.max(0, viewport.height - 16),
+            animation: "contextMenuIn 0.12s ease-out",
+          }}
+          className={cn(
+            "w-48 overflow-x-hidden overflow-y-auto overscroll-contain bg-app-elevated rounded-[12px] shadow-lg shadow-black/[0.08] dark:shadow-black/30 border border-black/[0.06] dark:border-white/[0.08] py-1 select-none",
+            mobileMenuPath.length > 0 && "max-sm:w-max max-sm:min-w-[13.5rem] max-sm:max-w-[calc(100vw-16px)]",
+          )}
+        >
+          {header && (
+            <div className="px-3 py-1.5 text-[11px] font-medium text-tx-tertiary border-b border-black/[0.06] dark:border-white/[0.08] mb-0.5 truncate">
+              {header}
+            </div>
+          )}
+          <div className="sm:hidden">
+            {mobileMenu.parent && (
+              <>
+              <button
+                type="button"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMobileMenuPath((current) => current.slice(0, -1));
+                }}
+                className={cn(
+                  contextMenuRowClassName,
+                  "font-medium text-zinc-700 dark:text-zinc-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]",
+                )}
+              >
+                <ChevronLeft size={14} className="text-tx-tertiary shrink-0" />
+                <span className="truncate whitespace-nowrap">{mobileMenu.parent.label}</span>
+              </button>
+              <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] mx-2 mb-1" />
+              </>
+            )}
+            {mobileMenu.items.map((item) => (
+              item.separator ? (
+                <div key={item.id} className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1 mx-2" />
+              ) : (
+                <button
+                  key={item.id}
+                  type="button"
+                  disabled={item.disabled}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (item.disabled) return;
+                    if (item.children?.length) {
+                      setMobileMenuPath((current) => [...current, item.id]);
+                    } else {
+                      setMobileMenuPath([]);
+                      void handleSpecialInlineNoteAction(item.id);
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault(); event.stopPropagation();
+                    if (item.disabled) return;
+                    if (item.children?.length) setMobileMenuPath(current => [...current, item.id]);
+                    else { setMobileMenuPath([]); void handleSpecialInlineNoteAction(item.id); }
+                  }}
+                  className={cn(
+                    contextMenuRowClassName,
+                    item.children?.length && "justify-between",
+                    item.disabled && "opacity-40 cursor-not-allowed",
+                    item.danger
+                      ? "text-red-600 dark:text-red-400 hover:bg-red-50/60 dark:hover:bg-red-900/20"
+                      : "text-zinc-700 dark:text-zinc-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] hover:text-tx-primary",
+                  )}
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    {item.icon && <span className={contextMenuIconClassName}>{item.icon}</span>}
+                    <span className="truncate whitespace-nowrap">{item.label}</span>
+                  </span>
+                  {item.children?.length ? <ChevronRight size={12} className="text-tx-tertiary shrink-0" /> : null}
+                </button>
+              )
+            ))}
+          </div>
+          <div className="hidden sm:block">
+            <DesktopContextMenuItems
+              items={displayItems}
+              menuId={menuId}
+              onAction={(actionId) => void handleSpecialInlineNoteAction(actionId)}
+            />
+          </div>
+        </div>
+      )}
+
+      <MoveContextNoteModal noteId={moveNoteId} onClose={() => setMoveNoteId(null)} />
+      <RenameContextNoteModal
+        noteId={renameNoteId}
+        initialTitle={header}
+        onClose={() => setRenameNoteId(null)}
+      />
+    </>
+  );
+}

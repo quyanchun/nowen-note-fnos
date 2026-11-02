@@ -1,0 +1,126 @@
+// AttachmentPreview.tsx —— 附件预览统一分发入口
+//
+// 职责：
+//   1. 根据 mime/扩展名 决定走哪种预览（图片 / 视频 / 音频 / 文本 / 代码 / SVG / docx / 不支持）
+//   2. 把"懒加载"集中在这里——大解析器（docx）只在真正命中时拉
+//
+// 不做的事：
+//   - 不在这里做 fetch / blob 管理：每个子组件自管
+//   - 不做"全屏 / 工具栏"——交给详情抽屉或子组件
+//
+// 如果将来要加 PDF / xlsx 等新格式，只需新增一个分支 + 懒加载子组件，FileManager 不动。
+import React, { lazy, Suspense } from "react";
+import { useTranslation } from "react-i18next";
+import { Loader2, FileText } from "lucide-react";
+import { cn } from "@/lib/utils";
+import AttachmentTextPreview from "./AttachmentTextPreview";
+import AttachmentMediaPreview from "./AttachmentMediaPreview";
+import AttachmentPdfPreview from "./AttachmentPdfPreview";
+import { detectAttachmentPreviewKind } from "@/lib/attachmentOpenStrategy";
+import { MotionPhotoOverlay } from "../MotionPhotoOverlay";
+import { useAttachmentImageRenderSource } from "@/hooks/useAttachmentImageRenderSource";
+import { downloadAttachment } from "@/lib/downloadFile";
+
+// docx 解析器有 ~80KB 的运行时（fflate + 自研 OOXML 解析），与图片/视频路径无关
+// → 懒加载，避免首屏体积。
+const AttachmentXlsxPreview = lazy(() => import("./AttachmentXlsxPreview"));
+const DocxAttachmentPreview = lazy(() => import("@/office/word/DocxAttachmentPreview"));
+
+interface Props {
+  url: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  /** 容器最小高度类，沿用 docx 那套 API */
+  heightClass?: string;
+  /** 图片预览的 max-height 类（小窗与放大态可调） */
+  imgMaxHeightClass?: string;
+}
+
+export function AttachmentPhotoPreview({ url, filename, imgMaxHeightClass }: Pick<Props, "url" | "filename" | "imgMaxHeightClass">) {
+  const image = useAttachmentImageRenderSource(url);
+  return <span className="relative block">
+    {image.error ? <span className="flex flex-col items-center gap-2 py-10 text-sm text-tx-tertiary">照片暂时无法预览<button type="button" className="underline" onClick={() => { void downloadAttachment(url, filename); }}>下载原件</button></span>
+      : <><img src={image.renderSrc} alt={filename} onLoad={image.onLoad} onError={image.onError}
+          className={cn("w-full object-contain bg-zinc-950/5", imgMaxHeightClass ?? "max-h-[360px]")} />
+        <MotionPhotoOverlay source={url} /></>}
+  </span>;
+}
+
+export default function AttachmentPreview({
+  url,
+  filename,
+  mimeType,
+  size,
+  heightClass,
+  imgMaxHeightClass,
+}: Props) {
+  const { t } = useTranslation();
+  const kind = detectAttachmentPreviewKind(mimeType, filename);
+
+  if (kind === "image") {
+    return (
+      <AttachmentPhotoPreview url={url} filename={filename} imgMaxHeightClass={imgMaxHeightClass} />
+    );
+  }
+
+  if (kind === "video" || kind === "audio") {
+    return (
+      <AttachmentMediaPreview
+        url={url}
+        filename={filename}
+        mimeType={mimeType}
+        kind={kind}
+        heightClass={heightClass}
+      />
+    );
+  }
+
+  if (kind === "pdf") {
+    return <AttachmentPdfPreview url={url} filename={filename} heightClass={heightClass} />;
+  }
+
+  if (kind === "docx") {
+    return (
+      <Suspense
+        fallback={
+          <div className={cn("flex items-center justify-center text-tx-tertiary py-10", heightClass)}>
+            <Loader2 size={14} className="animate-spin mr-2" />
+            正在加载 docx 预览…
+          </div>
+        }
+      >
+        <DocxAttachmentPreview url={url} filename={filename} heightClass={heightClass} />
+      </Suspense>
+    );
+  }
+
+  if (kind === "xlsx") {
+    return (
+      <Suspense fallback={<div className={cn("flex items-center justify-center py-10 text-tx-tertiary", heightClass)}><Loader2 size={14} className="mr-2 animate-spin" />{t("xlsxPreview.loading")}</div>}>
+        <AttachmentXlsxPreview key={url} url={url} filename={filename} size={size} heightClass={heightClass} />
+      </Suspense>
+    );
+  }
+
+  if (kind === "text" || kind === "svg") {
+    return (
+      <AttachmentTextPreview
+        url={url}
+        filename={filename}
+        mimeType={mimeType}
+        size={size}
+        heightClass={heightClass}
+      />
+    );
+  }
+
+  // 不支持：保留原 FileManager 的占位样式（图标 + MIME）
+  return (
+    <div className="flex flex-col items-center justify-center py-10 text-tx-tertiary">
+      <div className="text-accent-primary mb-2"><FileText size={20} /></div>
+      <span className="text-xs">{mimeType || "未知类型"}</span>
+      <span className="text-[10px] text-tx-tertiary/70 mt-1">该格式不支持内联预览</span>
+    </div>
+  );
+}

@@ -1,0 +1,248 @@
+// @vitest-environment jsdom
+
+import React, { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const state = vi.hoisted(() => ({
+  activeNote: { id: "note-1" },
+  noteListCollapsed: false,
+  editorFullscreen: false,
+  editorSplit: null as null | { noteId: string; direction: "right" | "down" },
+  viewMode: "all",
+}));
+
+const actions = vi.hoisted(() => ({
+  toggleNoteListCollapsed: vi.fn(() => {
+    state.noteListCollapsed = !state.noteListCollapsed;
+  }),
+  setEditorFullscreen: vi.fn((value: boolean) => {
+    state.editorFullscreen = value;
+  }),
+}));
+
+vi.mock("@/store/AppContext", () => ({
+  useApp: () => ({ state }),
+  useAppActions: () => actions,
+}));
+
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (_key: string, options?: { defaultValue?: string }) => options?.defaultValue || _key,
+  }),
+}));
+
+import NoteWorkspaceLayoutController from "@/components/NoteWorkspaceLayoutController";
+import { NOTE_WORKSPACE_LAYOUT_STORAGE_KEY } from "@/lib/noteWorkspaceLayout";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+  .IS_REACT_ACT_ENVIRONMENT = true;
+
+function click(element: Element | null) {
+  expect(element).not.toBeNull();
+  element?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+}
+
+function findMenuChoice(text: string): HTMLButtonElement | null {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]'))
+    .find((element) => element.textContent?.includes(text)) || null;
+}
+
+describe("NoteWorkspaceLayoutController", () => {
+  let container: HTMLDivElement;
+  let root: ReturnType<typeof createRoot>;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    localStorage.clear();
+    state.noteListCollapsed = false;
+    state.editorFullscreen = false;
+    state.editorSplit = null;
+    state.viewMode = "notebook";
+    actions.toggleNoteListCollapsed.mockClear();
+    actions.setEditorFullscreen.mockClear();
+    delete (window as any).nowenDesktop;
+    delete (window as any).Capacitor;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1600 });
+
+    class StaticMutationObserver {
+      observe() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    }
+    vi.stubGlobal("MutationObserver", StaticMutationObserver);
+
+    const aside = document.createElement("aside");
+    aside.dataset.unifiedSidebar = "";
+    aside.dataset.sidebarVariant = "desktop";
+    aside.appendChild(document.createElement("header"));
+    document.body.appendChild(aside);
+
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    document.body.innerHTML = "";
+    vi.unstubAllGlobals();
+  });
+
+  it("unified navigation only exposes menu display settings and ignores old column preferences", () => {
+    localStorage.setItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY, "standard");
+    act(() => root.render(<NoteWorkspaceLayoutController navigationOnly />));
+    expect(actions.toggleNoteListCollapsed).not.toHaveBeenCalled();
+    act(() => click(document.querySelector('[data-testid="note-workspace-layout-trigger"]')));
+    expect(findMenuChoice("标准模式")).toBeNull();
+    expect(findMenuChoice("三栏模式")).toBeNull();
+    expect(document.querySelectorAll('[role="radio"]')).toHaveLength(3);
+  });
+
+  it("only hides the menu display options on Mac, preserving shared focus exit", () => {
+    (window as any).nowenDesktop = { isDesktop: true, platform: "darwin" };
+    act(() => root.render(<NoteWorkspaceLayoutController navigationOnly />));
+    expect(document.querySelector('[data-testid="note-workspace-layout-trigger"]')).toBeNull();
+    state.editorFullscreen = true;
+    act(() => root.render(<NoteWorkspaceLayoutController navigationOnly />));
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(actions.setEditorFullscreen).toHaveBeenLastCalledWith(false);
+  });
+
+  it("exposes standard, three-column and focus modes in the Web browser", () => {
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    const trigger = document.querySelector('[data-testid="note-workspace-layout-trigger"]');
+    expect(trigger?.getAttribute("data-note-workspace-surface")).toBe("web");
+
+    act(() => click(trigger));
+    act(() => click(findMenuChoice("标准模式")));
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(1);
+    expect(state.noteListCollapsed).toBe(true);
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("standard");
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    act(() => click(document.querySelector('[data-testid="note-workspace-layout-trigger"]')));
+    act(() => click(findMenuChoice("三栏模式")));
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(2);
+    expect(state.noteListCollapsed).toBe(false);
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("three-column");
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    act(() => click(document.querySelector('[data-testid="note-workspace-layout-trigger"]')));
+    act(() => click(findMenuChoice("专注模式")));
+    expect(actions.setEditorFullscreen).toHaveBeenLastCalledWith(true);
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("three-column");
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    const focusTrigger = document.querySelector('[data-testid="note-workspace-layout-trigger"]');
+    expect(focusTrigger).toBeNull();
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(actions.setEditorFullscreen).toHaveBeenLastCalledWith(false);
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(document.querySelector('[data-testid="note-workspace-layout-trigger"]')).not.toBeNull();
+  });
+
+  it("keeps the same layout entry in Electron", () => {
+    (window as any).nowenDesktop = { isDesktop: true };
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    const trigger = document.querySelector('[data-testid="note-workspace-layout-trigger"]');
+    expect(trigger?.getAttribute("data-note-workspace-surface")).toBe("desktop");
+  });
+
+  it("does not replace native mobile progressive navigation with a wide layout", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 680 });
+    (window as any).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => "android",
+    };
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    expect(document.querySelector('[data-testid="note-workspace-layout-trigger"]')).toBeNull();
+    expect(actions.toggleNoteListCollapsed).not.toHaveBeenCalled();
+  });
+
+  it("allows the wide workspace controls on an expanded native window", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 840 });
+    Object.assign(window, { Capacitor: {
+      isNativePlatform: () => true,
+      getPlatform: () => "android",
+    } });
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    const trigger = document.querySelector('[data-testid="note-workspace-layout-trigger"]');
+    expect(trigger?.getAttribute("data-note-workspace-surface")).toBe("native-mobile");
+  });
+
+  it("restores three-column mode after right split and still accepts a manual collapse", () => {
+    localStorage.setItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY, "three-column");
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    state.editorSplit = { noteId: "n2", direction: "right" };
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(1);
+    expect(state.noteListCollapsed).toBe(true);
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    state.editorSplit = null;
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(2);
+    expect(state.noteListCollapsed).toBe(false);
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    state.noteListCollapsed = true;
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("standard");
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["all", "favorites", "tag", "search"])("keeps %s results visible in a narrow window and restores the saved base mode afterwards", (viewMode) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
+    localStorage.setItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY, "standard");
+    state.noteListCollapsed = true;
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+
+    state.viewMode = viewMode;
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(1);
+    expect(state.noteListCollapsed).toBe(false);
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("standard");
+
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    state.viewMode = "notebook";
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(actions.toggleNoteListCollapsed).toHaveBeenCalledTimes(2);
+    expect(state.noteListCollapsed).toBe(true);
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("standard");
+  });
+
+  it.each(["tasks", "mindmaps", "ai-chat", "diary", "files", "shares", "issues", "trash"])("does not expose note layout controls in %s", (viewMode) => {
+    state.viewMode = viewMode;
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(document.querySelector('[data-testid="note-workspace-layout-trigger"]')).toBeNull();
+    expect(actions.toggleNoteListCollapsed).not.toHaveBeenCalled();
+  });
+
+  it("closes note layout controls on entering issues and preserves the layout when returning", () => {
+    localStorage.setItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY, "three-column");
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    act(() => click(document.querySelector('[data-testid="note-workspace-layout-trigger"]')));
+    expect(document.querySelector('[data-testid="note-workspace-layout-menu"]')).not.toBeNull();
+
+    state.viewMode = "issues";
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(document.querySelector('[data-testid="note-workspace-layout-trigger"]')).toBeNull();
+    expect(document.querySelector('[data-testid="note-workspace-layout-menu"]')).toBeNull();
+    expect(actions.toggleNoteListCollapsed).not.toHaveBeenCalled();
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("three-column");
+
+    state.viewMode = "notebook";
+    act(() => root.render(<NoteWorkspaceLayoutController />));
+    expect(document.querySelector('[data-testid="note-workspace-layout-trigger"]')).not.toBeNull();
+    expect(document.querySelector('[data-testid="note-workspace-layout-menu"]')).toBeNull();
+    expect(actions.toggleNoteListCollapsed).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,111 @@
+import { Prec, RangeSetBuilder, StateField, Transaction, type Extension } from "@codemirror/state";
+import { Decoration, EditorView, type DecorationSet } from "@codemirror/view";
+import { copyText } from "@/lib/clipboard";
+import { toast } from "@/lib/toast";
+import {
+  findInternalMarkdownMarkerRanges,
+  projectMarkdownForUser,
+  resolveInternalMarkdownTypingPosition,
+  sanitizeMarkdownClipboardText,
+} from "@/lib/markdownUserContent";
+import { markdownSelectionWrapExtension } from "@/lib/markdownSelectionWrap";
+
+function buildMarkerDecorations(markdown: string): DecorationSet {
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const range of findInternalMarkdownMarkerRanges(markdown)) {
+    if (range.kind === "line") {
+      builder.add(
+        range.from,
+        range.from,
+        Decoration.line({ attributes: { class: "cm-nowen-internal-block-marker-line" } }),
+      );
+    } else {
+      builder.add(range.from, range.to, Decoration.replace({}));
+    }
+  }
+  return builder.finish();
+}
+
+const markerField = StateField.define<DecorationSet>({
+  create(state) {
+    return buildMarkerDecorations(state.doc.toString());
+  },
+  update(value, transaction) {
+    return transaction.docChanged
+      ? buildMarkerDecorations(transaction.state.doc.toString())
+      : value;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+const markerTheme = EditorView.baseTheme({
+  ".cm-nowen-internal-block-marker-line": {
+    display: "none",
+  },
+});
+
+const cleanClipboard = EditorView.domEventHandlers({
+  copy(event, view) {
+    if (!event.clipboardData || view.state.selection.ranges.every((range) => range.empty)) {
+      return false;
+    }
+    const selected = view.state.selection.ranges
+      .map((range) => view.state.doc.sliceString(range.from, range.to))
+      .join("\n");
+    const text = sanitizeMarkdownClipboardText(projectMarkdownForUser(selected));
+    if (/\/api\/attachments\/[^/\s]+\/image\./i.test(text)) {
+      event.preventDefault();
+      void copyText(text).then((ok) => {
+        if (!ok) toast.error("复制图片外链失败，请检查网络和图片外链权限");
+      });
+      return true;
+    }
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    return true;
+  },
+  paste(event, view) {
+    if (!event.clipboardData) return false;
+    const pasted = event.clipboardData.getData("text/plain");
+    const sanitized = sanitizeMarkdownClipboardText(pasted);
+    if (sanitized === pasted) return false;
+    event.preventDefault();
+    view.dispatch(view.state.replaceSelection(sanitized));
+    return true;
+  },
+});
+
+const keepTypingBeforeHiddenMarker = Prec.highest(
+  EditorView.inputHandler.of((view, from, to, text) => {
+    if (!view.state.facet(EditorView.editable)) return false;
+    const insertionPoint = resolveInternalMarkdownTypingPosition(
+      view.state.doc.toString(),
+      from,
+      to,
+      text,
+    );
+    if (insertionPoint == null) return false;
+
+    view.dispatch({
+      changes: { from: insertionPoint, to: insertionPoint, insert: text },
+      selection: { anchor: insertionPoint + text.length },
+    }, {
+      annotations: Transaction.userEvent.of("input.type"),
+      scrollIntoView: true,
+    });
+    return true;
+  }),
+);
+
+/**
+ * Shared CodeMirror extensions used by both the normal Markdown editor and the
+ * large-document safe editor. Keeping selection wrapping here guarantees the same
+ * typing behavior when a note crosses the large-document runtime threshold.
+ */
+export const internalMarkdownMarkerExtensions: Extension[] = [
+  markerField,
+  markerTheme,
+  cleanClipboard,
+  keepTypingBeforeHiddenMarker,
+  markdownSelectionWrapExtension,
+];

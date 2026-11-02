@@ -1,0 +1,343 @@
+import React, {
+  Suspense,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
+import { Search, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
+
+import LazyWorkspaceFallback from "./LazyWorkspaceFallback";
+import {
+  KNOWLEDGE_TREE_CLEAR_SEARCH_EVENT,
+} from "@/lib/knowledgeTreeCreateVisibility";
+import { useApp, useAppActions } from "@/store/AppContext";
+import type { NoteListItem } from "@/types";
+
+const LazyNoteList = React.lazy(() => import("./NoteList"));
+
+function normalizeDirectorySearchQuery(query: string): string[] {
+  return query
+    .trim()
+    .toLocaleLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * 列表搜索只过滤 NoteList 已经加载的结果集，不切换全局 search view。
+ * 因此它天然继承收藏 / 当前笔记本 / 知识树目录 / 子文件夹 / 日期筛选范围。
+ */
+export function filterCurrentDirectoryNotes(
+  notes: NoteListItem[],
+  query: string,
+): NoteListItem[] {
+  const terms = normalizeDirectorySearchQuery(query);
+  if (terms.length === 0) return notes;
+
+  return notes.filter((note) => {
+    const searchable = `${note.title || ""}\n${note.contentText || ""}`.toLocaleLowerCase();
+    return terms.every((term) => searchable.includes(term));
+  });
+}
+
+function noteListSignature(notes: NoteListItem[]): string {
+  return notes.map((note) => [
+    note.id,
+    note.version || 0,
+    note.updatedAt || "",
+    note.title || "",
+    note.contentText?.length || 0,
+    note.notebookId || "",
+    note.isTrashed || 0,
+  ].join(":"))
+    .join("|");
+}
+
+type AppliedFilterSnapshot = {
+  signature: string;
+  ids: Set<string>;
+};
+
+type VirtualScrollSnapshot = {
+  viewport: HTMLElement;
+  scrollTop: number;
+};
+
+function findDesktopNoteListHeader(shell: HTMLElement): HTMLElement | null {
+  return shell.querySelector<HTMLElement>("[data-note-list-desktop-header]");
+}
+
+export default function LazyNoteListRuntime() {
+  const { state } = useApp();
+  const actions = useAppActions();
+  const { t } = useTranslation();
+  const shellRef = useRef<HTMLDivElement>(null);
+  const [directoryQuery, setDirectoryQuery] = useState("");
+  const deferredDirectoryQuery = useDeferredValue(directoryQuery);
+  const [desktopHeaderTarget, setDesktopHeaderTarget] = useState<HTMLElement | null>(null);
+  const [matchCount, setMatchCount] = useState<number | null>(null);
+
+  // 保存“未做本目录搜索”时的完整列表。搜索期间只把筛选结果临时写回 notes，
+  // 清空搜索即可即时恢复；NoteList 的网络刷新仍然是最终权威来源。
+  const sourceNotesRef = useRef<NoteListItem[]>(state.notes);
+  const lastAppliedFilterRef = useRef<AppliedFilterSnapshot | null>(null);
+  const sourceRefreshPendingRef = useRef(false);
+  const preserveCurrentNotesOnCreateRef = useRef(false);
+
+  // #781：NoteList 的 >100 条虚拟列表历史上把 [notes] 引用变化直接当成“切换列表”，
+  // 导致 autosave/realtime/后台刷新后把 scrollTop 写回 0。真正切换目录/筛选时
+  // NoteList 会先清空 notes，虚拟 viewport 会被卸载；因此这里仅在“同一个 viewport
+  // 节点仍然存活”的刷新中保存并恢复滚动位置，既不会带着旧目录的位置进入新目录，
+  // 也不会因为同 scope 的数据更新把用户拉回顶部。
+  const previousNotesRef = useRef(state.notes);
+  const virtualScrollSnapshotRef = useRef<VirtualScrollSnapshot | null>(null);
+
+  const searchContextKey = `${state.viewMode}:${state.selectedNotebookId || ""}:${
+    state.selectedKnowledgeTreeParentId === undefined
+      ? "legacy"
+      : state.selectedKnowledgeTreeParentId ?? "root"
+  }`;
+  const searchContextKeyRef = useRef(searchContextKey);
+  const isFavorites = state.viewMode === "favorites";
+  const showDirectorySearch = isFavorites || (state.viewMode === "notebook" && !!state.selectedNotebookId);
+  const searchActive = showDirectorySearch && deferredDirectoryQuery.trim().length > 0;
+  const searchLabel = isFavorites ? t("noteList.searchFavorites") : "搜索本目录文档";
+  const clearSearchLabel = isFavorites ? t("noteList.clearFavoritesSearch") : "清空本目录搜索";
+
+  // 在子组件 passive effect 执行前抓取旧 scrollTop。这里只接受当前仍挂载的虚拟 viewport；
+  // scope 变化时 NoteList 会 setNotes([]) 并卸载它，因此不会错误恢复上一目录的位置。
+  useLayoutEffect(() => {
+    const notesChanged = previousNotesRef.current !== state.notes;
+    previousNotesRef.current = state.notes;
+    if (!notesChanged) return;
+
+    const viewport = shellRef.current?.querySelector<HTMLElement>(
+      '[data-note-list-scroll-viewport="virtual"]',
+    ) || null;
+    if (!viewport || viewport.scrollTop <= 0) {
+      virtualScrollSnapshotRef.current = null;
+      return;
+    }
+    virtualScrollSnapshotRef.current = {
+      viewport,
+      scrollTop: viewport.scrollTop,
+    };
+  }, [state.notes]);
+
+  // React 的子组件 passive effect 会先把旧 VirtualNoteList 的 scrollTop 复位；父层随后
+  // 把同一 DOM viewport 恢复到快照位置。若节点已卸载/替换则直接放弃，保证真正切换
+  // notebook/search/tag/date/sort/folder scope 时仍从顶部开始。
+  useEffect(() => {
+    const snapshot = virtualScrollSnapshotRef.current;
+    virtualScrollSnapshotRef.current = null;
+    if (!snapshot) return;
+
+    const { viewport } = snapshot;
+    const shell = shellRef.current;
+    if (!viewport.isConnected || !shell?.contains(viewport)) return;
+
+    const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    const nextScrollTop = Math.min(snapshot.scrollTop, maxScrollTop);
+    if (nextScrollTop > 0 && Math.abs(viewport.scrollTop - nextScrollTop) > 1) {
+      viewport.scrollTop = nextScrollTop;
+    }
+  }, [state.notes]);
+
+  // NoteList 是 lazy chunk。等它真实挂载后，把目录搜索挂到桌面 header 的独立一行。
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+
+    let annotatedHeader: HTMLElement | null = null;
+    const locateHeader = () => {
+      const header = findDesktopNoteListHeader(shell);
+      if (!header || header === annotatedHeader) return;
+
+      annotatedHeader = header;
+      setDesktopHeaderTarget(header);
+    };
+
+    locateHeader();
+    const observer = new MutationObserver(locateHeader);
+    observer.observe(shell, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+      setDesktopHeaderTarget(null);
+    };
+  }, []);
+
+  // 切换目录/笔记本/视图时，本目录搜索必须自动清空，避免把上一个目录的关键词
+  // 带到新目录后造成“文档消失”的错觉。此时不恢复旧 source，交给 NoteList 的新请求接管。
+  useEffect(() => {
+    if (searchContextKeyRef.current === searchContextKey) return;
+    searchContextKeyRef.current = searchContextKey;
+    sourceNotesRef.current = state.notes;
+    lastAppliedFilterRef.current = null;
+    sourceRefreshPendingRef.current = false;
+    setMatchCount(null);
+    setDirectoryQuery("");
+  }, [searchContextKey, state.notes]);
+
+  useEffect(() => {
+    const clearAfterCreate = () => {
+      if (!directoryQuery.trim()) return;
+      preserveCurrentNotesOnCreateRef.current = true;
+      setDirectoryQuery("");
+    };
+    window.addEventListener(KNOWLEDGE_TREE_CLEAR_SEARCH_EVENT, clearAfterCreate);
+    return () => window.removeEventListener(KNOWLEDGE_TREE_CLEAR_SEARCH_EVENT, clearAfterCreate);
+  }, [directoryQuery]);
+
+  // 搜索结果仍复用 NoteList 自己的虚拟列表、右键菜单、多选和打开笔记逻辑。
+  // 这里只维护一个可恢复的“源列表 -> 本地筛选结果”视图层，不触发全局 FTS 搜索。
+  useEffect(() => {
+    const normalizedQuery = deferredDirectoryQuery.trim();
+
+    if (!showDirectorySearch || !normalizedQuery) {
+      setMatchCount(null);
+      if (lastAppliedFilterRef.current) {
+        let source = sourceNotesRef.current;
+        if (preserveCurrentNotesOnCreateRef.current) {
+          const merged = new Map(source.map((note) => [note.id, note]));
+          for (const note of state.notes) merged.set(note.id, note);
+          source = Array.from(merged.values());
+          sourceNotesRef.current = source;
+        }
+        preserveCurrentNotesOnCreateRef.current = false;
+        lastAppliedFilterRef.current = null;
+        sourceRefreshPendingRef.current = false;
+        if (noteListSignature(state.notes) !== noteListSignature(source)) {
+          actions.setNotes(source);
+        }
+        // 立即恢复本地快照后再请求一次权威列表，吸收搜索期间其它端的更新。
+        actions.refreshNotes();
+      } else {
+        sourceNotesRef.current = state.notes;
+      }
+      return;
+    }
+
+    // NoteList 每次切换当前层级/递归范围、日期、排序或主动刷新时都会进入 loading。
+    // 等请求结束后把服务端返回结果整体替换为新的 source，避免把旧目录/旧范围混进来。
+    if (state.isLoading) {
+      sourceRefreshPendingRef.current = true;
+      return;
+    }
+
+    const currentSignature = noteListSignature(state.notes);
+    const previousFilter = lastAppliedFilterRef.current;
+
+    if (sourceRefreshPendingRef.current) {
+      sourceRefreshPendingRef.current = false;
+      sourceNotesRef.current = state.notes;
+    } else if (!previousFilter) {
+      sourceNotesRef.current = state.notes;
+    } else if (currentSignature !== previousFilter.signature) {
+      // 搜索期间的新增、删除、标题/摘要更新先合并回 source，再重新过滤。
+      // 这样保存笔记或 WebSocket 列表更新不会把搜索结果卡在旧数据上。
+      const currentIds = new Set(state.notes.map((note) => note.id));
+      const removedVisibleIds = new Set(
+        Array.from(previousFilter.ids).filter((id) => !currentIds.has(id)),
+      );
+      const merged = new Map<string, NoteListItem>();
+      for (const note of sourceNotesRef.current) {
+        if (!removedVisibleIds.has(note.id)) merged.set(note.id, note);
+      }
+      for (const note of state.notes) merged.set(note.id, note);
+      sourceNotesRef.current = Array.from(merged.values());
+    }
+
+    const filtered = filterCurrentDirectoryNotes(sourceNotesRef.current, normalizedQuery);
+    const filteredSignature = noteListSignature(filtered);
+    setMatchCount(filtered.length);
+    lastAppliedFilterRef.current = {
+      signature: filteredSignature,
+      ids: new Set(filtered.map((note) => note.id)),
+    };
+
+    if (filteredSignature !== currentSignature) {
+      actions.setNotes(filtered);
+    }
+  }, [
+    actions,
+    deferredDirectoryQuery,
+    showDirectorySearch,
+    state.isLoading,
+    state.notes,
+  ]);
+
+  // 搜索结果只是一个子集，不能在子集里做手动拖拽排序，否则会把未命中的文档
+  // 从 reorder payload 中漏掉。搜索期间仅拦截“从列表内部发起”的 dragstart；
+  // 从操作系统拖文件进来没有经过这个事件，因此文件导入不受影响。
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell || !searchActive) return;
+    const preventInternalReorder = (event: DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    shell.addEventListener("dragstart", preventInternalReorder, true);
+    return () => shell.removeEventListener("dragstart", preventInternalReorder, true);
+  }, [searchActive]);
+
+  const directorySearch = desktopHeaderTarget && showDirectorySearch
+    ? createPortal(
+        <div
+          data-note-directory-search=""
+          className="hidden min-w-0 w-full basis-full shrink-0 md:flex"
+          title={directoryQuery.trim() && matchCount !== null
+            ? (isFavorites ? t("noteList.favoritesSearchMatchCount", { count: matchCount }) : `当前目录匹配 ${matchCount} 篇文档`)
+            : searchLabel}
+        >
+          <div className="relative w-full min-w-0">
+            <Search
+              size={13}
+              className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-tx-tertiary"
+            />
+            <input
+              value={directoryQuery}
+              onChange={(event) => setDirectoryQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && directoryQuery) {
+                  event.preventDefault();
+                  setDirectoryQuery("");
+                }
+              }}
+              placeholder={isFavorites ? t("noteList.searchFavoritesPlaceholder") : "搜索本目录…"}
+              aria-label={searchLabel}
+              className="h-7 w-full rounded-md border border-app-border bg-app-elevated/70 pl-7 pr-7 text-xs text-tx-primary outline-none transition-colors placeholder:text-tx-tertiary focus:border-accent-primary/50 focus:ring-1 focus:ring-accent-primary/20"
+            />
+            {directoryQuery && (
+              <button
+                type="button"
+                onClick={() => setDirectoryQuery("")}
+                className="absolute right-1 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-tx-tertiary transition-colors hover:bg-app-hover hover:text-tx-secondary"
+                title={clearSearchLabel}
+                aria-label={clearSearchLabel}
+              >
+                <X size={12} />
+              </button>
+            )}
+          </div>
+        </div>,
+        desktopHeaderTarget,
+      )
+    : null;
+
+  return (
+    <div
+      ref={shellRef}
+      className="h-full w-full min-h-0 max-md:select-none max-md:[-webkit-touch-callout:none]"
+    >
+      <Suspense fallback={<LazyWorkspaceFallback label="正在加载笔记列表…" />}>
+        <LazyNoteList directorySearchActive={searchActive} />
+      </Suspense>
+      {directorySearch}
+    </div>
+  );
+}

@@ -1,0 +1,98 @@
+import "./setup-db-isolation.js";
+import assert from "node:assert/strict";
+import test from "node:test";
+import {getDb,closeDb} from "../src/db/schema";
+import {createProfile,switchActiveProfile} from "../src/sync/profile";
+import {projectMarkdownForUser} from "../src/lib/markdownUserContent";
+import {ensureNoteIndexed} from "../src/lib/noteBlocks";
+import {recordConflict,getConflict} from "../src/sync/conflict";
+import {planNote,applyNotePlan,undoReview,reviewHistory,reviewVersions,recoverReviewCopy,smartReview,reviewSync,type ReviewContext} from "../src/sync/conflictReview";
+const db=getDb();db.prepare("INSERT INTO users(id,username,passwordHash) VALUES ('local','local','hash')").run();
+db.prepare("INSERT INTO notebooks(id,userId,name) VALUES('folder','local','工作资料')").run();
+const profile=createProfile(db,{name:"server",serverUrl:"https://notes.test",remoteUserId:"remote"});switchActiveProfile(db,profile.id);
+let sequence=10;const remoteItems=new Map<string,any>();
+const client={snapshot:async()=>({scopeKey:"personal",snapshotSequence:sequence,nextCursor:null,items:[...remoteItems.values()]}),plan:async()=>({scopeKey:"personal",serverSequence:sequence})} as any;
+const ctx:ReviewContext={db,profileId:profile.id,userId:"local",remoteUserId:"remote",deviceId:"device",client,assertCurrent:()=>{}};
+const local=(id:string)=>db.prepare("SELECT * FROM notes WHERE id=?").get(id) as any;
+function fixture(id:string,a="本机新增：周五备份，保留 https://example.com/a",b="服务端新增：周六验证，保留 https://example.com/b") {
+ db.prepare("INSERT INTO notes(id,userId,notebookId,title,content,contentText,contentFormat,version) VALUES(?,'local','folder',?,?,?,'markdown',1)").run(id,"备份计划 "+id,a,a);
+ const before=local(id),remote={...before,userId:"remote",content:b,contentText:b,version:2};remoteItems.set(`note:${id}`,{entityType:"note",entityId:id,payload:remote});
+ const conflictId=recordConflict(db,{profileId:profile.id,entityType:"note",entityId:id,localPayload:before,remotePayload:remote,localVersion:1,remoteVersion:2});
+ return {id,before,remote,conflictId};
+}
+test.after(()=>closeDb());
+test("AI recommendation preserves snapshots, queues the chosen result and restores original user text on undo (DCC-001 DCC-004)",async()=>{
+ const f=fixture("undo"),merged=f.before.content+"\n"+f.remote.content;
+ const plan=await planNote(ctx,f.conflictId,async()=>JSON.stringify({content:merged,reason:"保留周五备份和周六验证"}));
+ assert.equal(plan.kind,"ai-merge");assert.equal(projectMarkdownForUser(local(f.id).content),f.before.content);
+ await applyNotePlan(ctx,plan.id);assert.equal(projectMarkdownForUser(local(f.id).content),merged);
+ const sent=(db.prepare("SELECT payload FROM sync_outbox WHERE entityId=? ORDER BY rowid DESC LIMIT 1").get(f.id) as any).payload;ensureNoteIndexed(db,f.id);assert.equal(JSON.parse(sent).content,local(f.id).content,"GET indexing cannot change an applied review payload");
+ assert.ok(db.prepare("SELECT 1 FROM sync_outbox WHERE entityId=? AND baseVersion=2").get(f.id));
+ assert.equal(getConflict(db,f.conflictId)?.status,"resolved");
+ const versions=reviewVersions(ctx,plan.id);assert.equal(versions.before,f.before.content);assert.equal(versions.remote,f.remote.content);
+ await undoReview(ctx,plan.id);assert.equal(projectMarkdownForUser(local(f.id).content),f.before.content);
+ assert.equal((reviewHistory(ctx).find((r:any)=>r.id===plan.id) as any).state,"undone");
+ await undoReview(ctx,plan.id);assert.equal(projectMarkdownForUser(local(f.id).content),f.before.content);
+});
+test("undo after ACK is a new compensated mutation, while later edits are protected and originals can be recovered (DCC-003 DCC-004 DCC-006)",async()=>{
+ const f=fixture("edited","本机原文 10","云端原文 20"),p=await planNote(ctx,f.conflictId,async()=>{throw new Error("offline");});
+ await applyNotePlan(ctx,p.id);const after=local(f.id);
+ remoteItems.set(`note:${f.id}`,{entityType:"note",entityId:f.id,payload:{...after,userId:"remote",version:3}});
+ db.prepare("DELETE FROM sync_outbox WHERE entityId=?").run(f.id);db.prepare("UPDATE notes SET version=3 WHERE id=?").run(f.id);
+ await undoReview(ctx,p.id);assert.equal(projectMarkdownForUser(local(f.id).content),f.before.content);
+ assert.ok(db.prepare("SELECT 1 FROM sync_outbox WHERE entityId=? AND baseVersion=3").get(f.id));
+ const g=fixture("new-edit","最初原文","服务端原文"),q=await planNote(ctx,g.conflictId,async()=>{throw new Error("offline");});await applyNotePlan(ctx,q.id);
+ db.prepare("UPDATE notes SET content='后续用户编辑' WHERE id=?").run(g.id);
+ await assert.rejects(undoReview(ctx,q.id),/新编辑/);assert.equal(projectMarkdownForUser(local(g.id).content),"后续用户编辑");
+ const recovered=recoverReviewCopy(ctx,q.id);assert.equal(local(recovered.noteId).content,g.before.content);
+ assert.equal(recoverReviewCopy(ctx,q.id).noteId,recovered.noteId,"recovery is idempotent");
+});
+test("stale AI results, unsafe outputs and Profile changes cannot overwrite new content (DCC-004 DCC-006)",async()=>{
+ const f=fixture("stale","A 100 https://a.test","B 200 https://b.test");
+ const p=await planNote(ctx,f.conflictId,async()=>JSON.stringify({content:"遗漏链接",reason:"bad"}));assert.notEqual(p.kind,"ai-merge");assert.ok(p.content.includes(f.before.content)&&p.content.includes(f.remote.content));
+ db.prepare("UPDATE notes SET content='newer' WHERE id=?").run(f.id);await assert.rejects(applyNotePlan(ctx,p.id));assert.equal(local(f.id).content,"newer");
+ const other={...ctx,profileId:"other"};await assert.rejects(undoReview(other,p.id));
+});
+test("review cards have names and human locations; directory recommendation is reversible (DCC-004)",async()=>{
+ db.prepare("INSERT INTO notebooks(id,userId,name) VALUES ('left','local','工作'),('right','local','生活'),('child','local','项目资料')").run();
+ const tree=(id:string)=>db.prepare("SELECT * FROM knowledge_tree_nodes WHERE id=?").get(`notebook:${id}`) as any;
+ const before=tree("child"),remote={...before,userId:"remote",parentId:"notebook:right"};
+ remoteItems.set("tree:right",{entityType:"knowledge_tree_node",entityId:"notebook:right",payload:{...tree("right"),userId:"remote"}});
+ remoteItems.set("folder:right",{entityType:"notebook",entityId:"right",payload:{id:"right",userId:"remote",name:"生活"}});
+ remoteItems.set("tree:child",{entityType:"knowledge_tree_node",entityId:"notebook:child",payload:remote});
+ const conflictId=recordConflict(db,{profileId:profile.id,entityType:"knowledge_tree_node",entityId:before.id,localPayload:before,remotePayload:remote});
+ const cards=await reviewSync(ctx),card=cards.items.find(i=>i.id===conflictId);assert.ok(card.title.includes("项目资料"));assert.equal(card.remote.location,"生活");
+ const result:any=await smartReview(ctx,{conflictId,side:"remote"});assert.ok(result.actionId);
+ assert.equal(tree("child").parentId,"notebook:right");
+ await undoReview(ctx,result.actionId);assert.equal(tree("child").parentId,before.parentId);
+});
+test("attachment positions show filenames and folder paths, preserve both positions and undo (DCC-004 DCC-006)",async()=>{
+ const {applyAssetMetadataLocal}=await import("../src/sync/assetOrganization");
+ const folders=[{id:"folder:asset-a",kind:"folder",resourceId:"asset-a",name:"项目图片",parentId:null,deleted:0,version:1,userId:"local"},{id:"folder:asset-b",kind:"folder",resourceId:"asset-b",name:"参考资料",parentId:null,deleted:0,version:1,userId:"local"}];
+ applyAssetMetadataLocal(db,folders,"local");
+ db.prepare("INSERT INTO attachments(id,noteId,userId,filename,mimeType,size,path) VALUES('image','undo','local','设计截图.png','image/png',10,'/test.png')").run();
+ const before={id:"file:image",kind:"file",resourceId:"image",folderId:"asset-a",trashedAt:null,originalFolderId:null,deleted:0,version:1,userId:"local"};
+ applyAssetMetadataLocal(db,[before],"local");
+ const remote={...before,folderId:"asset-b",version:2,userId:"remote"};
+ for(const folder of folders)remoteItems.set(folder.id,{entityType:"attachment_organization",entityId:folder.id,payload:{...folder,userId:"remote"}});
+ remoteItems.set(before.id,{entityType:"attachment_organization",entityId:before.id,payload:remote});
+ const conflictId=recordConflict(db,{profileId:profile.id,entityType:"attachment_organization",entityId:before.id,localPayload:before,remotePayload:remote});
+ const card=(await reviewSync(ctx)).items.find(i=>i.id===conflictId);assert.equal(card.title,"设计截图.png");assert.ok(card.remote.location.includes("参考资料"));
+ const action:any=await smartReview(ctx,{conflictId,side:"remote"});assert.equal((db.prepare("SELECT folderId FROM attachments WHERE id='image'").get() as any).folderId,"asset-b");
+ await undoReview(ctx,action.actionId);assert.equal((db.prepare("SELECT folderId FROM attachments WHERE id='image'").get() as any).folderId,"asset-a");
+});
+test("review routes deny foreign users and API tokens, and remote login expiry does not expire the local session (DCC-006)",async()=>{
+ const {default:router}=await import("../src/routes/sync-review");
+ const {Hono}=await import("hono");const app=new Hono().route("/",router);
+ const mounted=new Hono().route("/api/sync/local/review",router);
+ assert.equal((await mounted.request("http://local/api/sync/local/review",{headers:{"X-User-Id":"local"}})).status,200,"mounted path has no trailing slash");
+ const {saveRemoteCredential}=await import("../src/sync/credentials");
+ let response=await app.request("http://local/",{headers:{"X-User-Id":"local"}});assert.equal(response.status,200);assert.equal((await response.json() as any).connected,false);
+ response=await app.request("http://local/smart",{method:"POST",headers:{"X-User-Id":"local"}});assert.equal(response.status,409);
+ saveRemoteCredential({profileId:profile.id,serverUrl:"https://notes.test",token:"held",localUserId:"different",remoteUserId:"remote",transport:"direct"});
+ response=await app.request("http://local/smart",{method:"POST",headers:{"X-User-Id":"local"}});assert.equal(response.status,409);
+ response=await app.request("http://local/",{headers:{"X-User-Id":"local","X-Auth-Mode":"api-token"}});assert.equal(response.status,403);
+ db.prepare("UPDATE users SET isDisabled=1 WHERE id='local'").run();
+ response=await app.request("http://local/",{headers:{"X-User-Id":"local"}});assert.equal(response.status,403);
+ db.prepare("UPDATE users SET isDisabled=0 WHERE id='local'").run();
+});

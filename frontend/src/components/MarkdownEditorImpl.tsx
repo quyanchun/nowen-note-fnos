@@ -1,0 +1,2799 @@
+import { commitMarkdownEncryptedRegion, prepareMarkdownEncryptedRegionEdit, prepareMarkdownSelectionEncryption } from "@/lib/encryptedNotes/blockAuthoring";
+/**
+ * MarkdownEditor —— 基于 CodeMirror 6 的 Markdown 笔记编辑器
+ * ---
+ * 设计目标：
+ *   - 与 TiptapEditor 共享 EditorPane 上层能力（标题、标签、保存、只读、AI 等）
+ *   - 原生 Markdown 笔记直接以 Markdown 纯文本保存到 notes.content
+ *   - 保存时通过 markdownToPlainText 生成 contentText，保证搜索可用
+ *   - 大纲 (onHeadingsChange) 通过 @lezer/markdown 的 syntax tree 提取
+ *   - 500ms debounce + Ctrl/Cmd+S 手动 flushSave
+ *   - 切换笔记 (note.id) 时重建 doc；同一笔记的 note.content 变化（版本恢复）也会重建
+ *   - 暗色/亮色主题跟随 `<html class="dark">` 切换
+ *
+ * 当前能力：
+ *   - Markdown 源码编辑 + 工具栏
+ *   - CM6 编辑器 + MD 语法高亮 + 嵌入代码块高亮
+ *   - 基础快捷键 / Tab 缩进 / 撤销 / 自动补全
+ *   - 字数统计
+ *   - extractHeadings + scrollTo
+ *
+ * 后续可扩展：
+ *   - Markdown 预览 / 分屏预览
+ *   - 图片粘贴上传
+ *   - 更完整的表格编辑
+ *   - Mermaid / KaTeX 预览增强
+ */
+
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import CollapsibleEditorToolbar, { MobileEditorToolbarSlot } from "@/components/CollapsibleEditorToolbar";
+import { EditorState, Compartment, StateEffect } from "@codemirror/state";
+import {
+  EditorView,
+  keymap,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  drawSelection,
+  dropCursor,
+  rectangularSelection,
+  crosshairCursor,
+  lineNumbers,
+  placeholder,
+} from "@codemirror/view";
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentWithTab,
+} from "@codemirror/commands";
+import {
+  closeSearchPanel,
+  search,
+  searchKeymap,
+  openSearchPanel,
+  highlightSelectionMatches,
+} from "@codemirror/search";
+import {
+  bracketMatching,
+  foldKeymap,
+  indentOnInput,
+  syntaxHighlighting,
+  HighlightStyle,
+  syntaxTree,
+} from "@codemirror/language";
+import {
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  completionKeymap,
+} from "@codemirror/autocomplete";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { languages } from "@codemirror/language-data";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { tags as t } from "@lezer/highlight";
+import { yCollab } from "y-codemirror.next";
+import * as Y from "yjs";
+
+import { useTranslation } from "react-i18next";
+import { useKeyboardVisible } from "@/hooks/useKeyboardVisible";
+import {
+  Bold,
+  CheckSquare,
+  FileCode,
+  Heading1,
+  Heading2,
+  Heading3,
+  Heading4,
+  Heading5,
+  Heading6,
+  Italic,
+  Link as LinkIcon,
+  List,
+  ListOrdered,
+  Minus,
+  Quote,
+  Redo,
+  Search,
+  Sparkles,
+  Strikethrough,
+  Table2,
+  Image as ImagePlus,
+  Undo,
+  Code as CodeIcon,
+  Copy, ArrowUp,
+  Phone,
+  ExternalLink,
+  Eye,
+  Columns2,
+  ChevronDown,
+  Film,
+  FolderSearch,
+  ClipboardPlus,
+  BrainCircuit,
+} from "lucide-react";
+import { MarkdownPreview } from "./MarkdownPreview";
+import { markdownLivePreviewNoteId } from "@/lib/markdownLivePreview";
+import EncryptedBlockDialog from "./EncryptedBlockDialog";
+import { markdownEncryptedBlocks } from "@/lib/encryptedNotes/blockDocument";
+import AttachmentLibraryPicker from "@/components/AttachmentLibraryPicker";
+import VoiceInsertMenu from "@/components/VoiceInsertMenu";
+import { requestVoiceMemo, voiceMemoHtml } from "@/lib/voiceMemo";
+import { useUserPreferences, type MarkdownViewMode } from "@/hooks/useUserPreferences";
+import {
+  extractRemoteImageUrlsFromMarkdown,
+  localizeRemoteImages,
+  replaceRemoteUrlsInMarkdown,
+} from "@/lib/remoteImageLocalizer";
+import { choose } from "@/components/ui/confirm";
+
+import { Note, Tag, type FileItem } from "@/types";
+import TagInput from "@/components/TagInput";
+import AIWritingAssistant from "@/components/AIWritingAssistant";
+import { toast } from "@/lib/toast";
+import { copyText } from "@/lib/clipboard";
+import { openTaskQuickCapture } from "@/lib/taskInboxApi";
+import { findTextAction, type TextAction } from "@/lib/textActions";
+import { resolveEditorBubblePosition } from "@/lib/editorBubbleSelection";
+import { cn } from "@/lib/utils";
+import { normalizeToMarkdown, markdownToPlainText } from "@/lib/contentFormat";
+import { internalMarkdownMarkerExtensions } from "@/lib/markdownInternalMarkers";
+import {
+  resolveInternalMarkerSyncSelection,
+  sanitizeMarkdownClipboardText,
+} from "@/lib/markdownUserContent";
+import { shouldEmitTitleUpdate, shouldSkipTitleChange, shouldSyncTitleValue } from "@/lib/titleIme";
+import { resolveEditorLifecycleSave } from "@/lib/editorLifecycleSafety";
+import { scrollMarkdownPreviewToPosition } from "@/lib/markdownPreviewOutline";
+import {
+  applyMarkdownTaskCheckboxChange,
+  getMarkdownTaskCheckboxChange,
+  getMarkdownTaskCheckboxChangeAtOffset,
+} from "@/lib/markdownTasks";
+import { clampMarkdownSplitPercent } from "@/lib/markdownSplitPane";
+import { api } from "@/lib/api";
+import { uploadAndInsertImage, uploadPhotoSelection } from "@/lib/imageUploadService";
+import { buildExistingAttachmentMarkdownSnippet } from "@/lib/existingAttachmentInsert";
+import { isVideoFile, uploadMediaAttachment, type MediaUploadResult } from "@/lib/mediaUploadService";
+import { listenMediaUploadLifecycle } from "@/lib/mediaUploadLifecycle";
+import type { NoteEditorHandle, NoteEditorHeading, NoteEditorProps } from "@/components/editors/types";
+import type { FormatMenuPayload } from "@/lib/desktopBridge";
+import { NoteLinkMenu, type NoteSearchResult, type NoteLinkBlockItem, type NoteLinkSelectionOptions } from "@/components/NoteLinkExtension";
+import { buildWikiNoteLink, detectActiveWikiNoteQuery } from "@/lib/noteLinkSyntax";
+import { getMarkdownDailyRecordSlashCommands } from "@/components/daily-records/markdownDailyRecordSlashCommands";
+import { consumeBlockNavigation, subscribeBlockNavigation } from "@/lib/blockNavigation";
+import {
+  toggleWrap,
+  toggleHeading,
+  toggleBulletList,
+  toggleOrderedList,
+  toggleTaskList,
+  toggleBlockquote,
+  toggleCodeBlock,
+  toggleInlineCode,
+  toggleLinePrefix,
+  insertHorizontalRule,
+  insertTable,
+  insertLink,
+  insertImage,
+  replaceSelection,
+  applyMarkdownCjkTypography,
+} from "@/lib/markdownCommands";
+import {
+  MarkdownSlashMenu,
+  MdSlashItem,
+  SlashState,
+  createSlashPlugin,
+  emptySlashState,
+  getDefaultMdSlashItems,
+} from "@/components/MarkdownSlashMenu";
+
+export function normalizeFormatHeadingLevel(level: number): 1 | 2 | 3 | 4 | 5 | 6 {
+  const normalized = Number.isFinite(level) ? Math.trunc(level) : 1;
+  return Math.min(6, Math.max(1, normalized)) as 1 | 2 | 3 | 4 | 5 | 6;
+}
+
+
+import { redo, undo } from "@codemirror/commands";
+
+// ---------------------------------------------------------------------------
+// �������ͣ����� editors/types.ts �� NoteEditorProps����֤�� TiptapEditor ����
+// ---------------------------------------------------------------------------
+
+/** Ϊ���ݾɵ� `import { HeadingItem } from "@/components/MarkdownEditor"` ���ñ������� */
+export type HeadingItem = NoteEditorHeading;
+
+interface MarkdownEditorProps extends NoteEditorProps {
+  /** AI ������ڣ��ⲿ�ɸ��ǣ���������ʹ�����õ� AIWritingAssistant ���ڸ��� */
+  onAIAssistant?: () => void;
+}
+
+export function normalizeMarkdownViewModeForMobile(
+  viewMode: MarkdownViewMode,
+  isMobile: boolean,
+): MarkdownViewMode {
+  return isMobile && viewMode === "split" ? "source" : viewMode;
+}
+
+function isMobileMarkdownViewport(): boolean {
+  return typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(max-width: 639px)").matches;
+}
+
+function markdownSearchPhrases(language?: string) {
+  const isChinese = (language || "").toLowerCase().startsWith("zh");
+  return EditorState.phrases.of(isChinese ? {
+    Find: "查找",
+    Replace: "替换",
+    next: "下一个",
+    previous: "上一个",
+    all: "全部",
+    "match case": "区分大小写",
+    regexp: "正则",
+    "by word": "全词匹配",
+    replace: "替换",
+    "replace all": "全部替换",
+    close: "关闭",
+  } : {});
+}
+
+// ---------------------------------------------------------------------------
+// ��������С��ť + �ָ���
+// ---------------------------------------------------------------------------
+
+interface ToolbarButtonProps {
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+  title?: string;
+  className?: string;
+}
+
+function ToolbarButton({ onClick, disabled, children, title, className }: ToolbarButtonProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseDown={(event) => event.preventDefault()}
+      disabled={disabled}
+      title={title}
+      className={cn(
+        "p-1.5 rounded-md transition-colors",
+        "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+        disabled && "opacity-30 cursor-not-allowed",
+        className,
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ToolbarDivider({ className }: { className?: string }) {
+  return <div className={cn("w-px h-5 bg-app-border mx-1", className)} />;
+}
+
+// ---------------------------------------------------------------------------
+// ���ⶨ��
+// ---------------------------------------------------------------------------
+
+/**
+ * �Զ��������ʽ��
+ *   - ����Ŵ�Ӵ�
+ *   - ǿ��
+ *   - �����»���
+ *   - �����ȿ�����
+ *
+ * ��ɫ���ⲻд�����̳е�ǰ���� CSS ������--tx-primary / accent-primary �ȣ���
+ * ������� EditorView.theme �ӹ��Ӿ�ϸ�ڣ����ֺ���Ŀ������һ�¡�
+ */
+const nowenMdHighlight = HighlightStyle.define([
+  { tag: t.heading1, fontSize: "1.6em", fontWeight: "700", lineHeight: "1.4" },
+  { tag: t.heading2, fontSize: "1.35em", fontWeight: "700", lineHeight: "1.4" },
+  { tag: t.heading3, fontSize: "1.15em", fontWeight: "600", lineHeight: "1.4" },
+  { tag: t.heading4, fontSize: "1.05em", fontWeight: "600" },
+  { tag: t.heading5, fontWeight: "600" },
+  { tag: t.heading6, fontWeight: "600" },
+  { tag: t.strong, fontWeight: "700" },
+  { tag: t.emphasis, fontStyle: "italic" },
+  { tag: t.strikethrough, textDecoration: "line-through" },
+  { tag: t.link, color: "var(--color-accent-primary, #3b82f6)", textDecoration: "underline" },
+  { tag: t.url, color: "var(--color-accent-primary, #3b82f6)" },
+  { tag: t.monospace, fontFamily: "ui-monospace, 'JetBrains Mono', Menlo, Monaco, Consolas, monospace" },
+  { tag: t.quote, fontStyle: "italic", color: "var(--color-text-secondary, #64748b)" },
+  { tag: t.processingInstruction, color: "var(--color-text-tertiary, #94a3b8)" },
+  { tag: t.list, color: "var(--color-accent-primary, #3b82f6)" },
+]);
+
+/** �༭�� DOM �������⣨���� / �ߴ� / ��ɫ�� */
+const searchPanelTheme = EditorView.theme({
+  ".cm-panels": {
+    color: "var(--color-text-primary, #111827)",
+    backgroundColor: "transparent",
+  },
+  ".cm-panels-top": {
+    borderBottom: "1px solid var(--color-border, #e5e7eb)",
+  },
+  ".cm-panel.cm-search": {
+    position: "relative",
+    display: "flex",
+    alignItems: "center",
+    flexWrap: "wrap",
+    columnGap: "8px",
+    rowGap: "10px",
+    padding: "12px 54px 12px 16px",
+    backgroundColor: "var(--color-elevated, #ffffff)",
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    fontSize: "13px",
+    lineHeight: "1",
+  },
+  ".cm-panel.cm-search label": {
+    position: "relative",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: "34px",
+    margin: "0",
+    padding: "0 11px",
+    border: "1px solid var(--color-border, #e5e7eb)",
+    borderRadius: "999px",
+    color: "var(--color-text-secondary, #6b7280)",
+    backgroundColor: "var(--color-bg, #ffffff)",
+    whiteSpace: "nowrap",
+    cursor: "pointer",
+    userSelect: "none",
+    transition: "border-color 140ms ease, background-color 140ms ease, color 140ms ease, box-shadow 140ms ease",
+  },
+  ".cm-panel.cm-search label:hover": {
+    color: "var(--color-text-primary, #111827)",
+    borderColor: "var(--color-accent-primary, #3b82f6)",
+    backgroundColor: "var(--color-hover, #f3f4f6)",
+  },
+  ".cm-panel.cm-search label:has(input:checked)": {
+    color: "var(--color-accent-primary, #3b82f6)",
+    borderColor: "var(--color-accent-primary, #3b82f6)",
+    backgroundColor: "var(--color-active, #e0e7ff)",
+    boxShadow: "inset 0 0 0 1px rgba(59, 130, 246, 0.08)",
+  },
+  ".cm-panel.cm-search label:has(input:focus-visible)": {
+    boxShadow: "0 0 0 3px rgba(59, 130, 246, 0.18)",
+  },
+  ".cm-panel.cm-search input[type=text]": {
+    boxSizing: "border-box",
+    flex: "0 1 260px",
+    width: "clamp(190px, 24vw, 260px)",
+    height: "36px",
+    margin: "0",
+    padding: "0 12px",
+    border: "1px solid var(--color-border, #e5e7eb)",
+    borderRadius: "10px",
+    outline: "none",
+    appearance: "none",
+    color: "var(--color-text-primary, #111827)",
+    backgroundColor: "var(--color-bg, #ffffff)",
+    font: "inherit",
+    lineHeight: "normal",
+    transition: "border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease",
+  },
+  ".cm-panel.cm-search input[type=text]::placeholder": {
+    color: "var(--color-text-tertiary, #9ca3af)",
+  },
+  ".cm-panel.cm-search input[type=text]:focus": {
+    borderColor: "var(--color-accent-primary, #3b82f6)",
+    backgroundColor: "var(--color-elevated, #ffffff)",
+    boxShadow: "0 0 0 3px rgba(59, 130, 246, 0.16)",
+  },
+  ".cm-panel.cm-search button": {
+    boxSizing: "border-box",
+    minHeight: "34px",
+    margin: "0",
+    padding: "0 12px",
+    border: "1px solid var(--color-border, #e5e7eb)",
+    borderRadius: "9px",
+    appearance: "none",
+    color: "var(--color-text-secondary, #6b7280)",
+    backgroundColor: "var(--color-bg, #ffffff)",
+    backgroundImage: "none",
+    font: "inherit",
+    fontWeight: "500",
+    lineHeight: "1",
+    cursor: "pointer",
+    boxShadow: "0 1px 2px rgba(15, 23, 42, 0.04)",
+    transition: "transform 120ms ease, background-color 140ms ease, color 140ms ease, border-color 140ms ease, box-shadow 140ms ease",
+  },
+  ".cm-panel.cm-search button:hover": {
+    color: "var(--color-text-primary, #111827)",
+    borderColor: "var(--color-accent-primary, #3b82f6)",
+    backgroundColor: "var(--color-hover, #f3f4f6)",
+    boxShadow: "0 3px 8px rgba(15, 23, 42, 0.08)",
+  },
+  ".cm-panel.cm-search button:active": {
+    transform: "translateY(1px)",
+    boxShadow: "none",
+  },
+  ".cm-panel.cm-search button:focus-visible": {
+    outline: "none",
+    borderColor: "var(--color-accent-primary, #3b82f6)",
+    boxShadow: "0 0 0 3px rgba(59, 130, 246, 0.16)",
+  },
+  ".cm-panel.cm-search input[name=search]": {
+    order: "1",
+  },
+  ".cm-panel.cm-search button[name=prev]": {
+    order: "2",
+  },
+  ".cm-panel.cm-search button[name=next]": {
+    order: "3",
+  },
+  ".cm-panel.cm-search button[name=select]": {
+    order: "4",
+    color: "var(--color-accent-primary, #3b82f6)",
+    backgroundColor: "var(--color-active, #e0e7ff)",
+    borderColor: "transparent",
+  },
+  ".cm-panel.cm-search label:has(input[name=case])": {
+    order: "5",
+  },
+  ".cm-panel.cm-search label:has(input[name=re])": {
+    order: "6",
+  },
+  ".cm-panel.cm-search label:has(input[name=word])": {
+    order: "7",
+  },
+  ".cm-panel.cm-search input[name=replace]": {
+    order: "9",
+  },
+  ".cm-panel.cm-search button[name=replace]": {
+    order: "10",
+    color: "var(--color-accent-primary, #3b82f6)",
+  },
+  ".cm-panel.cm-search button[name=replaceAll]": {
+    order: "11",
+    color: "#ffffff",
+    borderColor: "var(--color-accent-primary, #3b82f6)",
+    backgroundColor: "var(--color-accent-primary, #3b82f6)",
+    boxShadow: "0 3px 8px rgba(59, 130, 246, 0.2)",
+  },
+  ".cm-panel.cm-search button[name=replaceAll]:hover": {
+    color: "#ffffff",
+    backgroundColor: "var(--color-accent-primary, #3b82f6)",
+    boxShadow: "0 5px 12px rgba(59, 130, 246, 0.28)",
+  },
+  ".cm-panel.cm-search button[name=close]": {
+    position: "absolute",
+    top: "12px",
+    right: "14px",
+    width: "34px",
+    minWidth: "34px",
+    height: "34px",
+    padding: "0",
+    borderColor: "transparent",
+    borderRadius: "50%",
+    color: "var(--color-text-tertiary, #9ca3af)",
+    backgroundColor: "transparent",
+    boxShadow: "none",
+    fontSize: "20px",
+    fontWeight: "400",
+    lineHeight: "1",
+  },
+  ".cm-panel.cm-search button[name=close]:hover": {
+    color: "var(--color-text-primary, #111827)",
+    borderColor: "transparent",
+    backgroundColor: "var(--color-hover, #f3f4f6)",
+    boxShadow: "none",
+  },
+  ".cm-panel.cm-search input[type=checkbox]": {
+    position: "absolute",
+    width: "1px",
+    height: "1px",
+    margin: "0",
+    opacity: "0",
+    pointerEvents: "none",
+  },
+  ".cm-panel.cm-search br": {
+    order: "8",
+    display: "flex",
+    flexBasis: "100%",
+    width: "100%",
+    height: "1px",
+    margin: "0",
+    border: "0",
+    backgroundColor: "var(--color-border, #e5e7eb)",
+  },
+  ".cm-searchMatch": {
+    borderRadius: "3px",
+    backgroundColor: "rgba(59, 130, 246, 0.16)",
+    boxShadow: "inset 0 -1px 0 rgba(59, 130, 246, 0.55)",
+  },
+  ".cm-searchMatch.cm-searchMatch-selected": {
+    backgroundColor: "rgba(245, 158, 11, 0.26)",
+    boxShadow: "inset 0 -2px 0 rgba(245, 158, 11, 0.78)",
+  },
+  "@media (max-width: 760px)": {
+    ".cm-panel.cm-search": {
+      columnGap: "6px",
+      rowGap: "8px",
+      padding: "10px 46px 10px 10px",
+    },
+    ".cm-panel.cm-search input[type=text]": {
+      flexBasis: "100%",
+      width: "100%",
+      maxWidth: "none",
+    },
+    ".cm-panel.cm-search button[name=prev], .cm-panel.cm-search button[name=next], .cm-panel.cm-search button[name=select]": {
+      flex: "1 1 auto",
+    },
+    ".cm-panel.cm-search label": {
+      flex: "1 1 auto",
+      padding: "0 9px",
+    },
+    ".cm-panel.cm-search button[name=close]": {
+      top: "11px",
+      right: "8px",
+    },
+  },
+});
+
+const baseTheme = EditorView.theme({
+  "&": {
+    height: "100%",
+    fontSize: "var(--editor-font-size, 15px)",
+    backgroundColor: "transparent",
+  },
+  ".cm-scroller": {
+    fontFamily:
+      "-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif",
+    lineHeight: "1.7",
+    padding: "8px 0",
+  },
+  ".cm-content": {
+    padding: "12px 0",
+    caretColor: "var(--color-accent-primary, #3b82f6)",
+    color: "var(--color-text-primary, #0f172a)",
+  },
+  ".cm-line": {
+    padding: "0 12px",
+  },
+  "&.cm-focused": {
+    outline: "none",
+  },
+  "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection":
+  {
+    backgroundColor: "rgba(59, 130, 246, 0.2)",
+  },
+  ".cm-activeLine": {
+    backgroundColor: "transparent",
+  },
+  ".cm-activeLineGutter": {
+    backgroundColor: "transparent",
+  },
+  ".cm-gutters": {
+    backgroundColor: "transparent",
+    border: "none",
+    color: "var(--color-text-tertiary, #94a3b8)",
+  },
+  ".cm-cursor": {
+    borderLeftWidth: "2px",
+  },
+  ".cm-placeholder": {
+    color: "var(--color-text-tertiary, #94a3b8)",
+    fontStyle: "italic",
+  },
+});
+
+// ---------------------------------------------------------------------------
+// �����л������� <html class="dark"> �仯���� oneDark �Ϳ����⣨��ɫ��֮���л�
+// ---------------------------------------------------------------------------
+
+function isDarkMode(): boolean {
+  if (typeof document === "undefined") return false;
+  return document.documentElement.classList.contains("dark");
+}
+
+// ---------------------------------------------------------------------------
+// �����ȡ������ lezer-markdown �� syntax tree��ȡ�� ATXHeading1..6
+// ---------------------------------------------------------------------------
+
+function extractHeadings(view: EditorView): NoteEditorHeading[] {
+  const headings: NoteEditorHeading[] = [];
+  const tree = syntaxTree(view.state);
+  const doc = view.state.doc;
+
+  tree.iterate({
+    enter(node) {
+      // ATXHeading1..ATXHeading6 / SetextHeading1 / SetextHeading2
+      const m = node.name.match(/^ATXHeading(\d)$/);
+      const setext = node.name.match(/^SetextHeading(\d)$/);
+      if (!m && !setext) return;
+      const level = parseInt((m ? m[1] : setext![1]) as string, 10);
+      if (level < 1 || level > 3) return; // �� Tiptap ����һ�£�ֻȡ h1..h3
+      const rawLine = doc.lineAt(node.from).text;
+      // ȥ������ "### " ���� setext �»���
+      const text = rawLine
+        .replace(/^\s{0,3}#{1,6}\s+/, "")
+        .replace(/\s+#{1,6}\s*$/, "")
+        .trim();
+      if (!text) return;
+      headings.push({
+        id: `h-${node.from}`,
+        level,
+        text,
+        pos: node.from,
+      });
+    },
+  });
+
+  return headings;
+}
+
+// ---------------------------------------------------------------------------
+// ����ͳ�ƣ��� TiptapEditor һ�£�chars / charsNoSpace / words��
+// ---------------------------------------------------------------------------
+
+function computeStats(text: string) {
+  const plain = markdownToPlainText(text);
+  const chars = plain.length;
+  const charsNoSpace = plain.replace(/\s+/g, "").length;
+  // Ӣ�İ��հ��дʣ����İ��ַ��У��� Tiptap ��Ϊ���룩
+  const englishWords = (plain.match(/[A-Za-z0-9_']+/g) || []).length;
+  const cjkChars = (plain.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+  const words = englishWords + cjkChars;
+  return { chars, charsNoSpace, words };
+}
+
+function escapeMarkdownTitle(title: string): string {
+  return title.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+}
+
+function encodeMarkdownUrl(url: string): string {
+  return url.replace(/\s/g, "%20").replace(/\)/g, "%29");
+}
+
+function buildMarkdownVideoSnippet(result: MediaUploadResult): string {
+  return `\n\n@[video](${encodeMarkdownUrl(result.previewUrl)} "${escapeMarkdownTitle(result.filename)}")\n\n`;
+}
+
+// ---------------------------------------------------------------------------
+// ���
+// ---------------------------------------------------------------------------
+
+export default forwardRef<NoteEditorHandle, MarkdownEditorProps>(function MarkdownEditor({
+  note,
+  onUpdate,
+  onLocalUpdate,
+  onTagsChange,
+  onHeadingsChange,
+  onEditorReady,
+  editable = true,
+  isGuest = false,
+  onAIAssistant,
+  yDoc,
+  awareness,
+}, ref) {
+  const { t: tr, i18n } = useTranslation();
+  const { prefs: userPrefs } = useUserPreferences();
+  const remoteImagePasteModeRef = useRef(userPrefs.remoteImagePasteMode);
+  remoteImagePasteModeRef.current = userPrefs.remoteImagePasteMode;
+  const { visible: keyboardVisible } = useKeyboardVisible();
+  const compactMobileEditing = editable
+    && keyboardVisible
+    && typeof window !== "undefined"
+    && window.matchMedia("(max-width: 767px)").matches;
+  const [mobileToolbarExpanded, setMobileToolbarExpanded] = useState(false);
+  useEffect(() => {
+    setMobileToolbarExpanded(false);
+  }, [keyboardVisible, note.id]);
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const previewRootRef = useRef<HTMLDivElement | null>(null);
+  const splitContainerRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const [encryptedRegion, setEncryptedRegion] = useState<{ source?: string; initialContent?: { plaintext: string; format: "markdown" }; commit: (source: string) => void } | null>(null);
+  useEffect(() => { setEncryptedRegion(null); }, [note.id]);
+  const openEncryptedRegion = () => {
+    const view = viewRef.current;
+    if (!view || !editable || isGuest || note.isTrashed) return;
+    const snapshot = view.state.doc; const noteId = note.id; const selection = view.state.selection.main;
+    try {
+      const block = markdownEncryptedBlocks(snapshot.toString()).find((item) => selection.from >= item.from && selection.to <= item.to);
+      if (!block && !selection.empty) {
+        const selected = prepareMarkdownSelectionEncryption(view, historyCompartmentRef.current);
+        setEncryptedRegion({ initialContent: selected, commit: (source) => {
+          if (noteRef.current.id !== noteId || viewRef.current !== view || noteRef.current.isTrashed) throw new Error("Encrypted selection changed");
+          selected.commit(source);
+          collabUndoManagerRef.current?.clear();
+        } });
+        return;
+      }
+      // New regions start on their own line, never inside another code fence.
+      const syntax = syntaxTree(view.state).resolveInner(selection.from, -1);
+      let insideFence = false;
+      for (let parent: typeof syntax | null = syntax; parent; parent = parent.parent) if (parent.name === "FencedCode" || parent.name === "CodeBlock") insideFence = true;
+      if (!block && (view.state.doc.lineAt(selection.from).text.trim() || insideFence)) {
+        toast.error("请在普通正文的空白行插入加密区域"); return;
+      }
+      setEncryptedRegion({ source: block?.source, commit: (source) => {
+        if (noteRef.current.id !== noteId || viewRef.current !== view || !view.state.facet(EditorView.editable) || view.state.doc !== snapshot) throw new Error("Encrypted region changed");
+        commitMarkdownEncryptedRegion(view, snapshot, { from: block?.from ?? selection.from, to: block?.to ?? selection.to, prefix: block?.prefix }, source);
+      } });
+    } catch { toast.error(selection.empty ? "加密区域格式无效，请保留原始密文" : "请选择普通文本，暂不支持图片、附件、链接或代码块内的选区。"); }
+  };
+  const titleRef = useRef<HTMLTextAreaElement | null>(null);
+  const isTitleComposingRef = useRef(false);
+  const lastEmittedTitleRef = useRef(note.title);
+
+  /** Phase 3: �Ƿ����� CRDT Эͬģʽ��y-codemirror.next �й��ĵ��� */
+  const collabEnabled = !!(yDoc && awareness);
+  const collabEnabledRef = useRef(collabEnabled);
+  collabEnabledRef.current = collabEnabled;
+  const collabUndoManagerRef = useRef<Y.UndoManager | null>(null);
+
+  // �� ref ׷���� note / callbacks�������� CM6 listener ���õ����ڱհ�
+  const noteRef = useRef(note);
+  noteRef.current = note;
+  useEffect(() => listenMediaUploadLifecycle((detail) => {
+    if (detail.mediaType !== "video" || detail.noteId !== noteRef.current.id || !detail.result) return;
+    if (detail.phase === "success") {
+      if (detail.queued) toast.info("视频已插入，等待离线同步");
+      else toast.success(tr("tiptap.attachmentUploaded") || "Attachment uploaded");
+    } else if (detail.phase === "error") {
+      toast.error(detail.error || tr("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+    }
+  }), [tr]);
+  const pasteNoteScopeRef = useRef({ id: note.id, revision: 0 });
+  if (pasteNoteScopeRef.current.id !== note.id) {
+    pasteNoteScopeRef.current = { id: note.id, revision: pasteNoteScopeRef.current.revision + 1 };
+  }
+  const asyncPasteAnchorsRef = useRef(new Set<{ from: number; to: number }>());
+  const onUpdateRef = useRef(onUpdate);
+  onUpdateRef.current = onUpdate;
+  const onLocalUpdateRef = useRef(onLocalUpdate);
+  onLocalUpdateRef.current = onLocalUpdate;
+  const onHeadingsChangeRef = useRef(onHeadingsChange);
+  onHeadingsChangeRef.current = onHeadingsChange;
+
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isSettingContent = useRef(false);
+
+  // MARKDOWN-PREVIEW-MODE-01: 源码/预览/分屏模式
+  const defaultViewMode = userPrefs.markdownDefaultViewMode;
+  const [viewMode, setViewMode] = useState<MarkdownViewMode>(() =>
+    normalizeMarkdownViewModeForMobile(defaultViewMode, isMobileMarkdownViewport()),
+  );
+  const [previewMarkdown, setPreviewMarkdown] = useState(() =>
+    normalizeToMarkdown(note.content, note.contentText)
+  );
+  const [sourcePaneWidthPercent, setSourcePaneWidthPercent] = useState(50);
+  const previewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const viewModeRef = useRef<MarkdownViewMode>(viewMode);
+
+  useEffect(() => {
+    viewModeRef.current = viewMode;
+  }, [viewMode]);
+
+  const setMarkdownViewMode = useCallback((nextViewMode: MarkdownViewMode) => {
+    if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
+    const nextMode = normalizeMarkdownViewModeForMobile(nextViewMode, isMobileMarkdownViewport());
+    if (nextMode !== "source") {
+      const view = viewRef.current;
+      if (view) setPreviewMarkdown(view.state.doc.toString());
+    }
+    setViewMode(nextMode);
+  }, []);
+
+  /**
+   * ���༭�����һ���ɷ��� onUpdate �� markdown �ַ�����
+   *
+   * ������ TiptapEditor ���ͬ�� ref һ�£�EditorPane ����ɹ����� content
+   * ��� activeNote������ñ������ note.content �仯�������ؽ��ĵ��� effect��
+   * ��������ֵ����"�Լ����ɳ�ȥ���Ƿ�"����ȥ dispatch changes ���ǣ�
+   * ��û�����壬���������ڼ���������û���������ס�ѡ����ʧ����
+   *
+   * �������� �� no-op��������Դ��Tiptap �༭�����桢�汾�ָ����������У�������
+   * ·������֤�л��༭�����ܿ����Բ���������ݡ�
+   */
+  const lastEmittedContentRef = useRef<string | null>(null);
+
+  // �����л��õ� Compartment
+  const themeCompartmentRef = useRef(new Compartment());
+  const attachmentNoteCompartmentRef = useRef(new Compartment());
+  const historyCompartmentRef = useRef(new Compartment());
+  const editableCompartmentRef = useRef(new Compartment());
+  const searchPhraseCompartmentRef = useRef(new Compartment());
+
+  // ���һ�δ��� pointer ʱ���������"ѡ�����ݴ������� Android ϵͳ���Ʋ˵�"�߼�
+  const lastTouchAtRef = useRef<number>(0);
+  useEffect(() => {
+    const onPointer = (e: PointerEvent) => {
+      if (e.pointerType === "touch") lastTouchAtRef.current = Date.now();
+    };
+    window.addEventListener("pointerdown", onPointer, { passive: true });
+    window.addEventListener("pointerup", onPointer, { passive: true });
+    return () => {
+      window.removeEventListener("pointerdown", onPointer);
+      window.removeEventListener("pointerup", onPointer);
+    };
+  }, []);
+
+  const [wordStats, setWordStats] = useState({ chars: 0, charsNoSpace: 0, words: 0 });
+  const [slashState, setSlashState] = useState<SlashState>(emptySlashState);
+  const [noteLinkMenu, setNoteLinkMenu] = useState({
+    open: false,
+    position: { top: 0, left: 0 },
+    query: "",
+    from: 0,
+    to: 0,
+  });
+  const [attachmentLibraryOpen, setAttachmentLibraryOpen] = useState(false);
+  const attachmentLibrarySelectionRef = useRef<{ from: number; to: number } | null>(null);
+  // �༭���Ƿ�۽� ���� ���������ƶ��˸����������Ƿ���ʾ
+
+  // �ƶ����������Ƿ���������ԭ�� + ���̵���ʱ���ض������������ߵײ�������������
+
+
+  // ---------- ѡ�����ݲ˵������ʵ�����----------
+  /**
+   * ���� Tiptap �� BubbleMenu���û�ѡ�зǿ��ı�ʱ����ѡ���Ϸ���������������
+   * ���Ӵ� / б�� / ɾ���� / ���ڴ��� / AI ���֣���
+   *
+   * ʵ��Ҫ�㣺
+   *   - �� CM6 updateListener ����� `selectionSet`������ `sel.empty` �л��ɼ�
+   *   - ������ `view.coordsAtPos(from/to)` ȡ��β���˵�����ѡ���Ϸ�����
+   *   - ���� `view.hasFocus` ʱ������������ⲿ������ʱ��������Բ���
+   *   - �ÿ� (isGuest) ģʽ������ʾ��ʽ����ť�������� AI ���
+   */
+  const [selectedTextAction, setSelectedTextAction] = useState<TextAction | null>(null);
+  const [bubble, setBubble] = useState<{ open: boolean; top: number; left: number }>({
+    open: false,
+    top: 0,
+    left: 0,
+  });
+
+  // ---------- AI ���֣����ڸ��� ----------
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiSelectedText, setAiSelectedText] = useState("");
+  const [aiFullText, setAiFullText] = useState("");
+  const [aiPosition, setAiPosition] = useState<{ top: number; left: number }>({ top: 100, left: 100 });
+
+  /** �� AI ���㣺���ⲿ�ṩ onAIAssistant ��ת���ⲿ */
+  const openAIAssistant = useCallback(() => {
+    if (isGuest) return;
+    if (onAIAssistant) {
+      onAIAssistant();
+      return;
+    }
+    const view = viewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    const doc = view.state.doc;
+    const selected = doc.sliceString(sel.from, sel.to);
+    const full = doc.toString();
+    setAiSelectedText(selected || full.slice(0, 500));
+    setAiFullText(full);
+    // ���꣺����ѡ����㣬�䵽��Ļ��
+    const coords = view.coordsAtPos(sel.from);
+    if (coords) {
+      // Shared assistant owns viewport clamping (including mobile keyboards).
+      setAiPosition({ top: coords.top + 24, left: coords.left });
+    }
+    setAiOpen(true);
+  }, [isGuest, onAIAssistant]);
+
+  /** AI ���������ݲ��뵽��ǰѡ��β�� */
+  const handleAIInsert = useCallback((text: string) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const { to } = view.state.selection.main;
+    view.dispatch({
+      changes: { from: to, to, insert: text },
+    });
+    queueMicrotask(() => view.focus());
+  }, []);
+
+  /** AI �����������滻��ǰѡ�� */
+  const handleAIReplace = useCallback((text: string) => {
+    const view = viewRef.current;
+    if (!view) return;
+    replaceSelection(view, text);
+  }, []);
+
+  const openTaskCapture = useCallback(() => {
+    const view = viewRef.current;
+    const selection = view?.state.selection.main;
+    const text = view && selection && !selection.empty
+      ? view.state.doc.sliceString(selection.from, selection.to).trim().slice(0, 8_000)
+      : "";
+    openTaskQuickCapture({
+      text,
+      sourceType: text ? "selection" : "note",
+      sourceId: note.id,
+      sourceTitle: note.title,
+      noteId: note.id,
+    });
+    setBubble((current) => ({ ...current, open: false }));
+  }, [note.id, note.title]);
+
+  const copySelectionText = useCallback(async () => {
+    const view = viewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    if (sel.empty) return;
+    const ok = await copyText(sanitizeMarkdownClipboardText(
+      view.state.doc.sliceString(sel.from, sel.to),
+    ));
+    if (ok) toast.success(tr('tiptap.copySelectionText'));
+    else toast.info(tr('tiptap.copySelectionFail'));
+    queueMicrotask(() => view.focus());
+  }, [tr]);
+
+  const selectAllText = useCallback(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+    queueMicrotask(() => view.focus());
+  }, []);
+
+  const closeAttachmentLibrary = useCallback(() => {
+    setAttachmentLibraryOpen(false);
+    if (attachmentLibrarySelectionRef.current) asyncPasteAnchorsRef.current.delete(attachmentLibrarySelectionRef.current);
+    attachmentLibrarySelectionRef.current = null;
+  }, []);
+
+  const openAttachmentLibrary = useCallback(() => {
+    const view = viewRef.current;
+    if (!view || !editable) return;
+    const selection = view.state.selection.main;
+    attachmentLibrarySelectionRef.current = {
+      from: selection.from,
+      to: selection.to,
+    };
+    asyncPasteAnchorsRef.current.add(attachmentLibrarySelectionRef.current);
+    setAttachmentLibraryOpen(true);
+  }, [editable]);
+
+  useEffect(() => { closeAttachmentLibrary(); }, [note.id, closeAttachmentLibrary]);
+
+  const insertExistingAttachment = useCallback((item: FileItem) => {
+    if (!editable || noteRef.current.isTrashed) return;
+    const view = viewRef.current;
+    const selection = attachmentLibrarySelectionRef.current;
+    if (!view || !selection || selection.to > view.state.doc.length) {
+      closeAttachmentLibrary();
+      toast.error(tr("tiptap.attachmentInsertPositionLost", { defaultValue: "插入位置已失效，请重试" }));
+      return;
+    }
+    const snippet = buildMarkdownAttachmentSnippet(item);
+    view.dispatch({
+      changes: {
+        from: selection.from,
+        to: selection.to,
+        insert: snippet,
+      },
+      selection: { anchor: selection.from + snippet.length },
+    });
+    closeAttachmentLibrary();
+    queueMicrotask(() => view.focus());
+    toast.success(tr("tiptap.attachmentLinkInserted", { defaultValue: "附件链接已插入" }));
+  }, [closeAttachmentLibrary, editable, tr]);
+
+  // slash 菜单项：基础 Markdown、附件、AI 与日期日记命令共享同一个 CodeMirror 菜单。
+  const openVoiceRecorder = useCallback(() => {
+    const view = viewRef.current;
+    if (!view || !editable || isGuest || noteRef.current.isTrashed) return;
+    const noteId = noteRef.current.id;
+    const scope = pasteNoteScopeRef.current;
+    const anchor = { from: view.state.selection.main.from, to: view.state.selection.main.to };
+    asyncPasteAnchorsRef.current.add(anchor);
+    requestVoiceMemo({
+      noteId,
+      release: () => asyncPasteAnchorsRef.current.delete(anchor),
+      insert: (attachment) => {
+        if (noteRef.current.id !== noteId || noteRef.current.isTrashed || viewRef.current !== view || pasteNoteScopeRef.current !== scope || !view.state.facet(EditorView.editable)) return false;
+        const snippet = `\n\n${voiceMemoHtml(attachment)}\n\n`;
+        view.dispatch({ changes: { from: anchor.from, to: anchor.to, insert: snippet }, selection: { anchor: anchor.from + snippet.length } });
+        return true;
+      },
+    });
+  }, [editable, isGuest]);
+
+  const insertVoiceTranscript = useCallback((text: string) => {
+    const view = viewRef.current;
+    if (!view || !editable || isGuest || noteRef.current.id !== note.id || noteRef.current.isTrashed) return;
+    const selection = view.state.selection.main;
+    view.dispatch({ changes: { from: selection.from, to: selection.to, insert: text }, selection: { anchor: selection.from + text.length } });
+    view.focus();
+  }, [editable, isGuest, note.id]);
+
+  const slashItems: MdSlashItem[] = useMemo(
+    () => [
+      ...getDefaultMdSlashItems(tr as unknown as (key: string) => string, {
+        onImageUpload: () => {
+          triggerImagePicker();
+        },
+        onAttachmentLibrary: openAttachmentLibrary,
+        onVoiceRecord: editable && !isGuest && !note.isTrashed ? openVoiceRecorder : undefined,
+        onAIAssistant: isGuest ? undefined : openAIAssistant,
+      }),
+      ...getMarkdownDailyRecordSlashCommands(),
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tr, isGuest, editable, note.isTrashed, openAIAssistant, openAttachmentLibrary, openVoiceRecorder],
+  );
+
+  // ---------- ͼƬ�ϴ����㹤����/б��/��ק/ճ���� ----------
+
+  /** 上传图片附件，插入带真实图片扩展名的完整 URL。 */
+  const insertImageFromFile = useCallback((file: File) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const currentNote = noteRef.current;
+    const alt = file.name.replace(/\.[^.]+$/, "");
+    if (currentNote?.id) {
+      uploadAndInsertImage(
+        file,
+        file.name,
+        currentNote.id,
+        (url) => {
+          const v = viewRef.current;
+          if (v) insertImage(v, url, alt);
+        },
+        "markdown",
+      ).catch((err) => {
+        console.error("Image upload failed, falling back to base64:", err);
+        // 上传失败兜底：仍用 base64 插入，保证用户不丢失截图
+        const reader = new FileReader();
+        reader.onload = () => {
+          const src = reader.result;
+          const v = viewRef.current;
+          if (typeof src === "string" && v) insertImage(v, src, alt);
+        };
+        reader.readAsDataURL(file);
+      });
+    } else {
+      // û�� note �����ģ������ϲ�Ӧ���������˻� base64
+      const reader = new FileReader();
+      reader.onload = () => {
+        const src = reader.result;
+        if (typeof src === "string") insertImage(view, src, alt);
+      };
+      reader.readAsDataURL(file);
+    }
+  }, []);
+
+  const triggerImagePicker = useCallback(() => {
+    const view = viewRef.current;
+    if (!view || !editable) return;
+    const noteId = noteRef.current.id;
+    const scope = pasteNoteScopeRef.current;
+    const anchor = { from: view.state.selection.main.from, to: view.state.selection.main.to };
+    asyncPasteAnchorsRef.current.add(anchor);
+    const releaseAnchor = () => { asyncPasteAnchorsRef.current.delete(anchor); };
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*,.heic,.heif,.mov";
+    input.multiple = true;
+    input.addEventListener("cancel", releaseAnchor, { once: true });
+    input.onchange = () => {
+      const files = Array.from(input.files || []);
+      if (!files.length || viewRef.current !== view || pasteNoteScopeRef.current !== scope) { releaseAnchor(); return; }
+      if (!noteId) { toast.error("请先创建笔记，再上传照片"); releaseAnchor(); return; }
+      toast.info(tr("tiptap.imageUploading"));
+      void uploadPhotoSelection(noteId, files, "markdown")
+        .then((photos) => {
+          // 复用异步粘贴锚点映射，上传完成后恢复原选区；切换笔记则不插入。
+          if (viewRef.current !== view || pasteNoteScopeRef.current !== scope) return;
+          view.dispatch({ selection: { anchor: anchor.from, head: anchor.to } });
+          for (const photo of photos) insertImage(view, photo.url, photo.filename.replace(/\.[^.]+$/, ""));
+          toast.success(tr("tiptap.imageUploadSuccess"));
+        })
+        .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "照片上传失败"))
+        .finally(releaseAnchor);
+    };
+    input.click();
+  }, [editable, tr]);
+
+  const insertVideoFromFile = useCallback((file: File, source: "editor" | "paste" | "drag-drop" = "editor") => {
+    const currentNote = noteRef.current;
+    if (!currentNote?.id) {
+      toast.error(tr("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+      return;
+    }
+
+    toast.info(tr("tiptap.attachmentUploading") || "Uploading attachment...");
+    uploadMediaAttachment({
+      noteId: currentNote.id,
+      file,
+      source,
+    })
+      .then((result) => {
+        const v = viewRef.current;
+        if (!v) return;
+        replaceSelection(v, buildMarkdownVideoSnippet(result));
+      })
+      .catch((err: any) => {
+        console.error("Video upload failed:", err);
+        const msg = String(err?.message || "");
+        if (/���|max\s+\d+\s*MB/i.test(msg)) {
+          toast.error(tr("tiptap.attachmentTooLarge") || "File too large");
+        } else {
+          toast.error(tr("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+        }
+      });
+  }, [tr]);
+
+  const triggerVideoPicker = useCallback(() => {
+    const view = viewRef.current;
+    if (!view || !editable) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "video/*";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      if (!isVideoFile(file)) {
+        toast.error(tr("tiptap.videoUrlInvalid") || "Cannot recognize this video");
+        return;
+      }
+      insertVideoFromFile(file, "editor");
+    };
+    input.click();
+  }, [editable, insertVideoFromFile, tr]);
+
+  /**
+   * �����ʽ�����ϴ� �� �� Markdown ��ǰ��괦���룺
+   *   - ͼƬ���� insertImageFromFile һ�������� `![alt](url)`
+   *   - ��ͼƬ������ `[?? �ļ��� (��С)](url)` ���� �� markdown ���ӣ��﷨��������
+   *     ��Ⱦ������������������� Content-Disposition �������ء�
+   *
+   * �ϴ���·�� TiptapEditor ��ȫһ�£�api.attachments.upload���������ͬһ������
+   */
+  const insertAttachmentFromFile = useCallback((file: File) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const currentNote = noteRef.current;
+    if (!currentNote?.id) {
+      toast.error(tr("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+      return;
+    }
+    toast.info(tr("tiptap.attachmentUploading") || "Uploading attachment...");
+    api.attachments
+      .upload(currentNote.id, file)
+      .then((res) => {
+        const v = viewRef.current;
+        if (!v) return;
+        if (res.category === "image") {
+          insertImage(v, res.url, file.name.replace(/\.[^.]+$/, ""));
+        } else {
+          // �����ļ������ ] �ƻ� markdown ���ӣ�����Сת��
+          const label = (res.filename || "attachment")
+            .replace(/\]/g, "\\]")
+            .replace(/\|/g, "\\|");
+          const sizeLabel = formatBytesMd(res.size);
+          replaceSelection(v, `[?? ${label}${sizeLabel ? ` (${sizeLabel})` : ""}](${res.url})`);
+        }
+        toast.success(tr("tiptap.attachmentUploaded") || "Attachment uploaded");
+      })
+      .catch((err: any) => {
+        console.error("Attachment upload failed:", err);
+        const msg = String(err?.message || "");
+        if (/���|max\s+\d+\s*MB/i.test(msg)) {
+          toast.error(tr("tiptap.attachmentTooLarge") || "File too large");
+        } else {
+          toast.error(tr("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+        }
+      });
+  }, [tr]);
+
+  const triggerAttachmentPicker = useCallback(() => {
+    const view = viewRef.current;
+    if (!view || !editable) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    // ���� accept�������ʽ
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (file) insertAttachmentFromFile(file);
+    };
+    input.click();
+  }, [editable, insertAttachmentFromFile]);
+
+
+  // ---------- �����߼� ----------
+
+  const emitSave = useCallback(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const md = view.state.doc.toString();
+    const plain = markdownToPlainText(md);
+    const title = isTitleComposingRef.current
+      ? noteRef.current.title
+      : titleRef.current?.value || noteRef.current.title;
+    lastEmittedContentRef.current = md;
+    lastEmittedTitleRef.current = title;
+    // P0-#2 �޸���CRDT ģʽ�� content ��ȫ�ɷ���� Y.Doc �йܳ־û���
+    // �������ٷ� content ���� yjs �� debounce ��д����"���߸���ǰ��"�ľ�̬��
+    // ������ meta��title��������˫д��ͻ��
+    if (collabEnabledRef.current && !/nowen-encrypted/i.test(md)) {
+      if (title !== noteRef.current.title) {
+        onUpdateRef.current({ title, _noteId: noteRef.current.id });
+      }
+    } else {
+      onUpdateRef.current({ content: md, contentText: plain, title, _noteId: noteRef.current.id });
+    }
+  }, []);
+
+  const scheduleSave = useCallback(() => {
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    debounceTimer.current = setTimeout(() => {
+      debounceTimer.current = null;
+      emitSave();
+    }, 500);
+  }, [emitSave]);
+
+  const flushSave = useCallback(() => {
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+    }
+    emitSave();
+    try {
+      toast.success(tr("tiptap.saved") || "Saved");
+    } catch {
+      /* toast ������Ҳû��ϵ */
+    }
+  }, [emitSave, tr]);
+
+  const emitTitleUpdate = useCallback(() => {
+    const title = titleRef.current?.value || "";
+    const noteTitle = noteRef.current.title;
+    if (!shouldEmitTitleUpdate({
+      title,
+      noteTitle,
+      lastEmittedTitle: lastEmittedTitleRef.current,
+    })) {
+      return;
+    }
+    lastEmittedTitleRef.current = title;
+    onUpdateRef.current({ title, _noteId: noteRef.current.id });
+  }, []);
+
+  /**
+   * �Ը������¶����ʽ API��
+   *   - flushSave(): �л��༭�� / �л��ʼ�ʱ������ pending �� debounce ����д��ȥ��
+   *                 ��ֹ���֡�������� **���� toast**�������л�˲��ˢ����
+   */
+  useImperativeHandle(
+    ref,
+    () => ({
+      flushSave: () => {
+        const title = isTitleComposingRef.current
+          ? noteRef.current.title
+          : titleRef.current?.value || noteRef.current.title;
+        const mode = resolveEditorLifecycleSave({
+          hasPendingContent: !!debounceTimer.current,
+          title,
+          noteTitle: noteRef.current.title,
+          lastEmittedTitle: lastEmittedTitleRef.current,
+          isTitleComposing: isTitleComposingRef.current,
+        });
+        if (mode === "none") return;
+        if (debounceTimer.current) {
+          clearTimeout(debounceTimer.current);
+          debounceTimer.current = null;
+        }
+        if (mode === "content") {
+          emitSave();
+          return;
+        }
+        lastEmittedTitleRef.current = title;
+        onUpdateRef.current({ title, _noteId: noteRef.current.id });
+      },
+      discardPending: () => {
+        // �л��༭��ʱ���÷������� PUT����� debounce �����������
+        if (debounceTimer.current) {
+          clearTimeout(debounceTimer.current);
+          debounceTimer.current = null;
+        }
+      },
+      /**
+       * ͬ����ȡ CM6 ��ǰ�ĵ����ݣ�����"�л� MD��RTE"ʱ�����ֱ�ӻ���
+       * activeNote.content������ RTE mount ʱ������ֵ��CRDT ģʽ�� yDoc ����
+       * Ȩ����Դ��������� markdown �ַ���Ҳ�� yDoc ��������һ�£��Կ���Ϊ
+       * RTE ��ʼ���Ŀɿ����ա�
+       */
+      getSnapshot: () => {
+        const view = viewRef.current;
+        if (!view) return null;
+        const md = view.state.doc.toString();
+        return {
+          content: md,
+          contentText: markdownToPlainText(md),
+          title: titleRef.current?.value || noteRef.current.title,
+        };
+      },
+      isReady: () => !!viewRef.current,
+      applyCjkTypography: (action) => {
+        const view = viewRef.current;
+        if (!view || !editable || !view.state.facet(EditorView.editable)) return false;
+        return applyMarkdownCjkTypography(view, action);
+      },
+      insertMarkdownAtCursor: (md: string) => {
+        const view = viewRef.current;
+        if (!view) return false;
+        try {
+          const selection = view.state.selection.main;
+          const from = selection.from;
+          const to = selection.to;
+          view.dispatch({
+            changes: { from, to, insert: md },
+            selection: { anchor: from + md.length },
+            scrollIntoView: true,
+          });
+          view.focus();
+          return true;
+        } catch { return false; }
+      },
+      appendMarkdown: (md: string) => {
+        const view = viewRef.current;
+        if (!view) return false;
+        try {
+          view.dispatch({ changes: { from: view.state.doc.length, insert: md } });
+          return true;
+        } catch { return false; }
+      },
+    }),
+    [emitSave],
+  );
+
+  // ---------- ���ι��أ����� EditorView ----------
+
+  useEffect(() => {
+    if (!hostRef.current) return;
+    if (viewRef.current) return; // �����ظ�����
+
+    // Phase 3��CRDT ģʽ�£���ʼ doc ���� yDoc.getText("content")������Ϊ���ַ���������� sync �����䣩
+    // ע�⣺��ʱ yDoc ���ܻ�û synced��doc ���ǿյġ���yCollab ��չ���� applyUpdate ���Զ���ӳ�� CM��
+    //
+    // ��ȫ׼��CRDT ��֧��**��**�� normalizeToMarkdown(note.content) ���ף���������
+    // "�ͻ��˱������� �� CM diff �� yText �� �ͻ��˷� update��ͬʱ�����Ҳ seed �� yText ��
+    // sync ���� applyUpdate" ��˫�����Ӿ�̬������� yText �������ظ�/���ҡ�
+    //
+    // RTE��MD �л�������Ǩ���� EditorPane.toggleEditorMode ��ǰ����ɣ�
+    // �л�ǰ�Ȱ� Tiptap JSON �淶��Ϊ markdown д�ط���� notes.content��
+    // CRDT ������ʱ����� inferMarkdownSeed �� markdown ��֧��һ���԰ѽṹ�� MD
+    // ע�� yText��y:sync �������ܿ�����ȷ���ݡ�
+    let initialDoc: string;
+    if (collabEnabled && yDoc) {
+      initialDoc = yDoc.getText("content").toString();
+      // yText ���վ����գ��� y:sync
+      if (!initialDoc) initialDoc = "";
+    } else {
+      initialDoc = normalizeToMarkdown(note.content, note.contentText);
+    }
+
+    const saveKeymap = keymap.of([
+      {
+        key: "Mod-s",
+        preventDefault: true,
+        run: () => {
+          flushSave();
+          return true;
+        },
+      },
+    ]);
+
+    const updateListener = EditorView.updateListener.of((update) => {
+      if (!update.docChanged) return;
+      for (const anchor of asyncPasteAnchorsRef.current) {
+        const collapsed = anchor.from === anchor.to;
+        anchor.from = update.changes.mapPos(anchor.from, collapsed ? 1 : -1);
+        anchor.to = update.changes.mapPos(anchor.to, 1);
+      }
+      if (isSettingContent.current) return;
+
+      const text = update.state.doc.toString();
+      onLocalUpdateRef.current?.({
+        title: noteRef.current.title,
+        content: text,
+        _noteId: noteRef.current.id,
+      });
+      setWordStats(computeStats(text));
+      onHeadingsChangeRef.current?.(extractHeadings(update.view));
+      // Encrypted regions use the normal ciphertext save path; Yjs rejects them.
+      if (!collabEnabledRef.current || /nowen-encrypted/i.test(text)) {
+        scheduleSave();
+      }
+
+      const cursor = update.state.selection.main.head;
+      const line = update.state.doc.lineAt(cursor);
+      const activeWiki = detectActiveWikiNoteQuery(line.text.slice(0, cursor - line.from), cursor, line.from);
+      if (activeWiki) {
+        const coords = update.view.coordsAtPos(cursor);
+        if (coords) setNoteLinkMenu({ open: true, position: { top: coords.bottom + 8, left: coords.left }, query: activeWiki.query, from: activeWiki.from, to: activeWiki.to });
+      } else {
+        setNoteLinkMenu((previous) => previous.open ? { ...previous, open: false } : previous);
+      }
+
+      // MARKDOWN-PREVIEW-MODE-01: 分屏模式下实时更新预览（debounce 200ms）
+      if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
+      previewDebounceRef.current = setTimeout(() => {
+        setPreviewMarkdown(text);
+      }, 200);
+    });
+
+    /**
+     * ѡ�����ݲ˵� listener��
+     *   - ֻҪѡ���߽�򽹵㷢���仯�����¼���λ��
+     *   - ��ѡ�� / ʧ�� / �뿪�ӿ� �� �ر�
+     *   - �ǿ�ѡ�� �� �ŵ�ѡ�������Ϸ� 8px��ˮƽ���У������ӿڱ߽�ʱ�� clamp
+     */
+    const bubbleListener = EditorView.updateListener.of((update) => {
+      if (!update.selectionSet && !update.docChanged && !update.focusChanged && !update.geometryChanged) {
+        return;
+      }
+      const view = update.view;
+      const sel = update.state.selection.main;
+      if (sel.empty || !view.hasFocus) {
+        setBubble((b) => (b.open ? { ...b, open: false } : b));
+        return;
+      }
+      const startCoords = view.coordsAtPos(sel.from);
+      const endCoords = view.coordsAtPos(sel.to);
+      if (!startCoords || !endCoords) {
+        setBubble((b) => (b.open ? { ...b, open: false } : b));
+        return;
+      }
+      // ˮƽλ�ã�ѡ���е�
+      const cx = (startCoords.left + endCoords.right) / 2;
+      // ��ֱ���ò��ԣ��� Tiptap һ�£���
+      //   ���/����  �� ѡ���Ϸ�
+      //   ���ڴ��� �� ѡ���·������� Android ϵͳԭ�����Ʋ˵���
+      const isNativeAndroidSurface = document.documentElement.getAttribute("data-native") === "android";
+      const isTouch = isNativeAndroidSurface || Date.now() - lastTouchAtRef.current < 800;
+      const bubbleH = 40;
+      const visualViewport = window.visualViewport;
+      const { top, left } = resolveEditorBubblePosition({
+        anchorTop: startCoords.top,
+        anchorBottom: endCoords.bottom,
+        centerX: cx,
+        bubbleWidth: 220,
+        bubbleHeight: bubbleH,
+        viewportTop: visualViewport?.offsetTop ?? 0,
+        viewportLeft: visualViewport?.offsetLeft ?? 0,
+        viewportWidth: visualViewport?.width ?? window.innerWidth,
+        viewportHeight: visualViewport?.height ?? window.innerHeight,
+        touchLayout: isTouch,
+      });
+      setSelectedTextAction(findTextAction(view.state.doc.sliceString(sel.from, sel.to)));
+      setBubble({ open: true, top, left });
+    });
+
+    /**
+     * �۽�״̬ͬ�� listener��Ԥ���ⲿ�ӿڣ�
+     * v2026-05-18��ԭΪ�ƶ��˸���������ʹ�á��ָ�Ϊ��һ����
+     * sticky ��������������Ҫ���������� listener ���������Ҫ
+     * ʱ�ظ����롣���� state ����Զ���ᴥ�� re-render��
+     */
+    const focusListener = EditorView.updateListener.of((_update) => {
+      // ��ʵ�֣�Ԥ����չ�㡣
+    });
+
+
+
+
+    const state = EditorState.create({
+      doc: initialDoc,
+      extensions: [
+        attachmentNoteCompartmentRef.current.of(markdownLivePreviewNoteId.of(isGuest ? null : note.id)),
+        // Phase 3: CRDT Эͬ��չ�������ã�
+        // yCollab ������ڿ�ǰ��λ�ã������ȴ��� doc ���
+        // P3-#14����ʽ���� UndoManager �ó������Ȱ�����ϲ���350ms window��
+        ...(collabEnabled && yDoc && awareness
+          ? [yCollab(yDoc.getText("content"), awareness, {
+            undoManager: (collabUndoManagerRef.current = new Y.UndoManager(yDoc.getText("content"), { captureTimeout: 350 })),
+          })]
+          : []),
+
+        // �����༭����
+        lineNumbers({
+          // Ĭ�������кţ������� gutter������δ��װ��
+          formatNumber: () => "",
+        }),
+        highlightActiveLineGutter(),
+        historyCompartmentRef.current.of(history()),
+        drawSelection(),
+        dropCursor(),
+        EditorState.allowMultipleSelections.of(true),
+        indentOnInput(),
+        bracketMatching(),
+        closeBrackets(),
+        autocompletion(),
+        rectangularSelection(),
+        crosshairCursor(),
+        highlightActiveLine(),
+        search({ top: true }),
+        highlightSelectionMatches(),
+        EditorView.lineWrapping,
+        ...internalMarkdownMarkerExtensions,
+        EditorView.contentAttributes.of({ spellcheck: "false" }),
+        placeholder(tr("tiptap.placeholder") || "��ʼд��ʲô..."),
+
+        // MD �﷨ + �����Ƕ�׸���
+        markdown({
+          base: markdownLanguage,
+          codeLanguages: languages,
+          addKeymap: true,
+        }),
+        syntaxHighlighting(nowenMdHighlight),
+
+        // ���� + �ɱ༭���أ��� Compartment ��̬�л���
+        baseTheme,
+        themeCompartmentRef.current.of(isDarkMode() ? oneDark : []),
+        editableCompartmentRef.current.of(EditorView.editable.of(editable)),
+        searchPhraseCompartmentRef.current.of(markdownSearchPhrases(i18n.resolvedLanguage || i18n.language)),
+        searchPanelTheme,
+
+        // ��ݼ�������Ĭ�� keymap ע�ᣬ��֤ Mod-s ���� chrome �̣�
+        saveKeymap,
+        keymap.of([
+          ...closeBracketsKeymap,
+          ...defaultKeymap,
+          ...searchKeymap,
+          ...historyKeymap,
+          ...foldKeymap,
+          ...completionKeymap,
+          indentWithTab,
+        ]),
+
+        // �������
+        updateListener,
+        bubbleListener,
+        focusListener,
+
+        // б�ܲ˵� plugin
+        createSlashPlugin((s) => setSlashState(s)),
+
+        // ͼƬ / ���� ճ�� & ��ק���� TiptapEditor ��Ϊ����
+        EditorView.domEventHandlers({
+          click(event, view) {
+            if (!editable) return false;
+            const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+            if (typeof pos !== "number") return false;
+
+            const currentMarkdown = view.state.doc.toString();
+            const change = getMarkdownTaskCheckboxChangeAtOffset(currentMarkdown, pos);
+            if (!change) return false;
+
+            event.preventDefault();
+            event.stopPropagation();
+            view.dispatch({
+              changes: { from: change.from, to: change.to, insert: change.insert },
+              selection: { anchor: change.to },
+            });
+            setPreviewMarkdown(applyMarkdownTaskCheckboxChange(currentMarkdown, change));
+            return true;
+          },
+          paste(event) {
+            if (!editable) return false;
+            // 1) 视频文件优先走 Markdown 视频语法
+            const items = event.clipboardData?.items;
+            if (items) {
+              for (const item of items) {
+                if (item.type.startsWith("video/")) {
+                  const file = item.getAsFile();
+                  if (file) {
+                    event.preventDefault();
+                    insertVideoFromFile(file, "paste");
+                    return true;
+                  }
+                }
+              }
+            }
+            // 2) ����ͼƬ����ͼճ����
+            if (items) {
+              for (const item of items) {
+                if (item.type.startsWith("image/")) {
+                  const file = item.getAsFile();
+                  if (file) {
+                    event.preventDefault();
+                    insertImageFromFile(file);
+                    return true;
+                  }
+                }
+              }
+            }
+            // 3) ��ͼƬ�ļ�����Դ���������Ƶ��ļ����� ����
+            const files = Array.from(event.clipboardData?.files || []);
+            if (files.length > 0) {
+              event.preventDefault();
+              for (const f of files) {
+                if (isVideoFile(f)) {
+                  insertVideoFromFile(f, "paste");
+                } else if (f.type.startsWith("image/")) {
+                  insertImageFromFile(f);
+                } else {
+                  insertAttachmentFromFile(f);
+                }
+              }
+              return true;
+            }
+            const pastedText = event.clipboardData?.getData("text/plain") || "";
+            const remoteImages = extractRemoteImageUrlsFromMarkdown(pastedText);
+            if (remoteImages.length === 0 || remoteImagePasteModeRef.current === "keep-remote") return false;
+            event.preventDefault();
+            const view = viewRef.current;
+            if (!view) return true;
+            const scope = pasteNoteScopeRef.current;
+            const anchor = { from: view.state.selection.main.from, to: view.state.selection.main.to };
+            asyncPasteAnchorsRef.current.add(anchor);
+            void (async () => {
+              try {
+                if (remoteImagePasteModeRef.current === "ask") {
+                  const choice = await choose({
+                    title: tr("settings.remoteImagePasteAskTitle", { count: remoteImages.length }),
+                    description: tr("settings.remoteImagePasteAskDesc"),
+                    choices: [
+                      { value: "localize", label: tr("settings.remoteImagePasteSave") },
+                      { value: "keep-remote", label: tr("settings.remoteImagePasteKeep"), variant: "outline" },
+                    ],
+                  });
+                  if (choice === null) return;
+                  if (choice === "keep-remote") {
+                    if (viewRef.current === view && pasteNoteScopeRef.current === scope) {
+                      asyncPasteAnchorsRef.current.delete(anchor);
+                      view.dispatch({ changes: { from: anchor.from, to: anchor.to, insert: pastedText }, selection: { anchor: anchor.from + pastedText.length } });
+                    }
+                    return;
+                  }
+                }
+                if (viewRef.current !== view || pasteNoteScopeRef.current !== scope) return;
+                const progressToastId = toast.info(tr("settings.remoteImagePasteProgress", { done: 0, total: remoteImages.length }), 0);
+                const results = await localizeRemoteImages(
+                  remoteImages.map((image) => image.originalUrl), scope.id, "paste",
+                ).finally(() => toast.dismiss(progressToastId));
+                if (viewRef.current !== view || pasteNoteScopeRef.current !== scope) return;
+                const saved = results.filter((result) => result.success).length;
+                const replacements = new Map(results.filter((result) => result.success).map((result) => [result.originalUrl, result.localUrl]));
+                const preparedText = replaceRemoteUrlsInMarkdown(pastedText, replacements);
+                asyncPasteAnchorsRef.current.delete(anchor);
+                view.dispatch({ changes: { from: anchor.from, to: anchor.to, insert: preparedText }, selection: { anchor: anchor.from + preparedText.length } });
+                const message = tr("settings.remoteImagePasteResult", { saved, failed: results.length - saved });
+                if (saved === results.length) toast.success(message); else toast.warning(message);
+              } catch {
+                if (viewRef.current === view && pasteNoteScopeRef.current === scope) {
+                  asyncPasteAnchorsRef.current.delete(anchor);
+                  view.dispatch({ changes: { from: anchor.from, to: anchor.to, insert: pastedText }, selection: { anchor: anchor.from + pastedText.length } });
+                  toast.warning(tr("settings.remoteImagePasteResult", { saved: 0, failed: remoteImages.length }));
+                }
+              } finally {
+                asyncPasteAnchorsRef.current.delete(anchor);
+              }
+            })();
+            return true;
+          },
+          drop(event) {
+            if (!editable) return false;
+            const files = event.dataTransfer?.files;
+            if (!files || files.length === 0) return false;
+            event.preventDefault();
+            const pos = viewRef.current?.posAtCoords({ x: event.clientX, y: event.clientY });
+            const v = viewRef.current;
+            if (v && typeof pos === "number") {
+              v.dispatch({ selection: { anchor: pos } });
+            }
+            for (const f of Array.from(files)) {
+              if (isVideoFile(f)) {
+                insertVideoFromFile(f, "drag-drop");
+              } else if (f.type.startsWith("image/")) {
+                insertImageFromFile(f);
+              } else {
+                insertAttachmentFromFile(f);
+              }
+            }
+            return true;
+          },
+        }),
+      ],
+    });
+
+    const view = new EditorView({
+      state,
+      parent: hostRef.current,
+    });
+    viewRef.current = view;
+
+    // ��ʼͳ�� + ���
+    setWordStats(computeStats(initialDoc));
+    setPreviewMarkdown(initialDoc);
+    onHeadingsChangeRef.current?.(extractHeadings(view));
+
+    return () => {
+      if (debounceTimer.current) {
+        clearTimeout(debounceTimer.current);
+        debounceTimer.current = null;
+      }
+      view.destroy();
+      collabUndoManagerRef.current?.destroy(); collabUndoManagerRef.current = null;
+      viewRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- �л��ʼ� / �ⲿ�ָ��汾��ͬ���ĵ����� ----------
+
+  const lastSyncedNoteIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    viewRef.current?.dispatch({ effects: attachmentNoteCompartmentRef.current.reconfigure(
+      markdownLivePreviewNoteId.of(isGuest ? null : note.id),
+    ) });
+  }, [note.id, isGuest]);
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    // A delayed pre-save preview must not replace the server-confirmed document.
+    if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
+
+    // �л�ʱ�������� debounce������Ѿɱʼ�����д���±ʼ�
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+    }
+
+    // Phase 3: CRDT ģʽ���ĵ��� yCollab �йܣ���Ҫ�ֶ� dispatch setContent��
+    // ������������ update ����Զ��״̬��ֻ����ͳ��/���ˢ�¡�
+    const isSwitchingNote = lastSyncedNoteIdRef.current !== note.id;
+
+    if (collabEnabledRef.current) {
+      if (isSwitchingNote) {
+        lastSyncedNoteIdRef.current = note.id;
+        setViewMode(defaultViewMode);
+      }
+      const currentDoc = view.state.doc.toString();
+      setPreviewMarkdown(currentDoc);
+      setWordStats(computeStats(currentDoc));
+      onHeadingsChangeRef.current?.(extractHeadings(view));
+      if (titleRef.current && shouldSyncTitleValue({
+        inputValue: titleRef.current.value,
+        noteTitle: note.title,
+        isComposing: isTitleComposingRef.current,
+      })) {
+        titleRef.current.value = note.title;
+      }
+      return;
+    }
+
+    // �л��ʼ�ʱ������д�������±ʼǵ� content �϶�Ҫ����Ӧ�ã�
+    if (isSwitchingNote) {
+      lastEmittedContentRef.current = null;
+      lastSyncedNoteIdRef.current = note.id;
+      setViewMode(defaultViewMode);
+    }
+
+    // ��д�Զ����������� EditorPane ����ɹ���� content ��� activeNote��
+    // �������ľ���"�Լ���һ���ɳ�ȥ���Ƿ� markdown"������Ҫ dispatch �����ĵ�
+    // �����ϼ������� / ���ѡ������
+    //
+    // ע�⣺�Ƚ϶����� note.content������ normalize ��� markdown������Ϊ���༭��
+    // �ɷ�����ʱ�õľ������ markdown �ַ������Բ� Tiptap ������� JSON��
+    // ���������������� markdown����Ȼ���������������й��������õ��������ݡ�
+    if (
+      lastEmittedContentRef.current !== null &&
+      note.content === lastEmittedContentRef.current
+    ) {
+      const currentDoc = view.state.doc.toString();
+      setPreviewMarkdown(currentDoc);
+      setWordStats(computeStats(currentDoc));
+      onHeadingsChangeRef.current?.(extractHeadings(view));
+      if (titleRef.current && shouldSyncTitleValue({
+        inputValue: titleRef.current.value,
+        noteTitle: note.title,
+        isComposing: isTitleComposingRef.current,
+      })) {
+        titleRef.current.value = note.title;
+      }
+      return;
+    }
+
+    const nextDoc = normalizeToMarkdown(note.content, note.contentText);
+    const currentDoc = view.state.doc.toString();
+    if (currentDoc !== nextDoc) {
+      isSettingContent.current = true;
+      if (isSwitchingNote) {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: nextDoc },
+          selection: { anchor: 0 },
+        });
+      } else {
+        // 同一笔记的保存回填只替换实际变化的区间，让 CodeMirror 自动映射原选区。
+        // 服务端在行尾补充隐藏块 ID 时，末尾回车后的光标会随插入量向后移动，
+        // 不再因整篇替换并强制 anchor=0 而跳到文档开头。
+        let from = 0;
+        const sharedLength = Math.min(currentDoc.length, nextDoc.length);
+        while (from < sharedLength && currentDoc[from] === nextDoc[from]) from += 1;
+
+        let currentTo = currentDoc.length;
+        let nextTo = nextDoc.length;
+        while (
+          currentTo > from
+          && nextTo > from
+          && currentDoc[currentTo - 1] === nextDoc[nextTo - 1]
+        ) {
+          currentTo -= 1;
+          nextTo -= 1;
+        }
+
+        const currentSelection = view.state.selection.main;
+        const protectedSelection = resolveInternalMarkerSyncSelection({
+          currentMarkdown: currentDoc,
+          nextMarkdown: nextDoc,
+          from,
+          currentTo,
+          nextTo,
+          anchor: currentSelection.anchor,
+          head: currentSelection.head,
+        });
+
+        view.dispatch({
+          changes: { from, to: currentTo, insert: nextDoc.slice(from, nextTo) },
+          ...(protectedSelection ? { selection: protectedSelection } : {}),
+        });
+      }
+      // ������һ΢������������� Tiptap ��ȼ��߼���
+      queueMicrotask(() => {
+        isSettingContent.current = false;
+      });
+      // �ⲿ�������ؽ� doc ֮�󣬵�ǰ���е� content �Ѳ��ٵ����Լ�֮ǰ�ɳ�ȥ��ֵ��
+      // ��� lastEmitted ��������Ϊ"��д"��
+      lastEmittedContentRef.current = null;
+    }
+
+    setWordStats(computeStats(nextDoc));
+    setPreviewMarkdown(nextDoc);
+    onHeadingsChangeRef.current?.(extractHeadings(view));
+
+    if (titleRef.current && !isTitleComposingRef.current) {
+      titleRef.current.value = note.title;
+    }
+    // ���� content ������ version���� TiptapEditor ����һ�µ����塣
+    // ���� EditorPane ����� content������ effect ���Ƶ��������
+    // ����� lastEmittedContentRef �����������"�Լ�д���ֱ� setContent ����"��
+  }, [note.id, note.content, note.contentText, defaultViewMode]);
+
+  // ---------- ���ⵥ��ͬ�� ----------
+  //
+  // Ϊʲô������������� input �Ƿ��ܿصģ�`defaultValue={note.title}`����
+  // ������� effect ֻ�� [note.id, note.content] �仯ʱ�Ż��ܡ�
+  // ���ⲿֻ�Ķ� title�����ͣ���"AI ���ɱ���"��ť����˷����±��� �� setActiveNote����
+  // content û�䣬�� effect ��������DOM ��ı�����Զ���־�ֵ�����û�����Ϊ
+  //��AI ���ɱ���û��Ч���������һ��ר�� effect ���� note.title ���ɡ�
+  useEffect(() => {
+    const el = titleRef.current;
+    if (!el) return;
+    if (shouldSyncTitleValue({
+      inputValue: el.value,
+      noteTitle: note.title,
+      isComposing: isTitleComposingRef.current,
+    })) {
+      el.value = note.title;
+    }
+    if (!isTitleComposingRef.current) {
+      lastEmittedTitleRef.current = note.title;
+    }
+  }, [note.title]);
+
+  // 标题改为多行 textarea 后，根据实际内容高度自动撑开；同时覆盖标题相同但切换笔记的场景。
+  useEffect(() => {
+    const el = titleRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [note.id, note.title]);
+
+  // ---------- editable ����ͬ�� ----------
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: editableCompartmentRef.current.reconfigure(
+        EditorView.editable.of(editable)
+      ),
+    });
+  }, [editable]);
+
+  // ---------- ������� <html class="dark"> �л� ----------
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const html = document.documentElement;
+
+    const applyTheme = () => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch({
+        effects: themeCompartmentRef.current.reconfigure(
+          isDarkMode() ? oneDark : []
+        ),
+      });
+    };
+
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.type === "attributes" && m.attributeName === "class") {
+          applyTheme();
+          break;
+        }
+      }
+    });
+    observer.observe(html, { attributes: true, attributeFilter: ["class"] });
+
+    return () => observer.disconnect();
+  }, []);
+
+  // ---------- ��¶ scrollTo ��������������ת�� ----------
+
+  const scrollSourceTo = useCallback((pos: number, focus = true) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const size = view.state.doc.length;
+    const clamped = Math.max(0, Math.min(size, pos));
+    view.dispatch({
+      selection: { anchor: clamped },
+      effects: EditorView.scrollIntoView(clamped, { y: "start", yMargin: 40 }),
+    });
+    if (focus) view.focus();
+  }, []);
+
+  const scrollPreviewTo = useCallback((pos: number) => {
+    const root = previewRootRef.current;
+    if (!root) return false;
+    return scrollMarkdownPreviewToPosition(root, pos);
+  }, []);
+
+  useEffect(() => {
+    if (!onEditorReady) return;
+    const scrollTo = (pos: number) => {
+      const mode = viewModeRef.current;
+      if (mode === "preview") {
+        if (!scrollPreviewTo(pos)) scrollSourceTo(pos, false);
+        return;
+      }
+
+      if (mode === "split") {
+        scrollSourceTo(pos, false);
+        scrollPreviewTo(pos);
+        return;
+      }
+
+      scrollSourceTo(pos, true);
+    };
+    onEditorReady(scrollTo);
+  }, [onEditorReady, scrollPreviewTo, scrollSourceTo]);
+
+  /**
+   * ����˸�ʽ�˵��ţ�macOS ԭ���˵� / ��ݼ� �� CodeMirror��
+   * ----------------------------------------------------------------
+   * �� TiptapEditor ����ͬһ�� "nowen:format" �¼���Լ���� useDesktopMenuBridge
+   * ���յ� Electron ������ "menu:format" IPC ʱ�ɷ�����
+   *
+   * Markdown ? ����ӳ�䣺
+   *   bold      �� toggleWrap("**")
+   *   italic    �� toggleWrap("*")
+   *   strike    �� toggleWrap("~~")
+   *   code      �� toggleInlineCode
+   *   underline �� toggleWrap("<u>", "</u>")   // MD û��ԭ���»��ߣ��� HTML ��ǩ��
+   *                                             ��Ⱦ�ࣨԤ�� / contentFormat����֧��
+   *   heading lv�� toggleHeading(v, lv)
+   *   paragraph �� toggleHeading(v, 0)          // ������ toggleHeading ������룺0 = ȥ����
+   *
+   * ������view δ���� / !editable ʱ���ԣ������������� view �� dispatch��
+   */
+  useEffect(() => {
+    if (!editable) return;
+    const handler = (ev: Event) => {
+      const view = viewRef.current;
+      if (!view) return;
+      const detail = (ev as CustomEvent<FormatMenuPayload>).detail;
+      if (!detail) return;
+
+      if (detail.mark) {
+        switch (detail.mark) {
+          case "bold": toggleWrap(view, "**"); break;
+          case "italic": toggleWrap(view, "*"); break;
+          case "strike": toggleWrap(view, "~~"); break;
+          case "code": toggleInlineCode(view); break;
+          // MD ��ԭ���»����﷨���� HTML ���ס�toggleWrap �ĵ� 3 �����ڷǶԳư�����
+          case "underline": toggleWrap(view, "<u>", "</u>"); break;
+        }
+        view.focus();
+        return;
+      }
+      if (detail.node === "heading" && detail.level) {
+        const lv = normalizeFormatHeadingLevel(detail.level);
+        toggleHeading(view, lv);
+        view.focus();
+        return;
+      }
+      if (detail.node === "paragraph") {
+        // "ת����" = ��ȥ���� #{1,6} \s+���������κ���ǰ׺��
+        // toggleLinePrefix("", [/^#{1,6}\s+/]) ǡ��ʵ��������壺
+        //   - ƥ�䵽����ǰ׺ �� �滻Ϊ ""��ɾ������
+        //   - ����������    �� ���� "" ǰ׺��no-op����
+        toggleLinePrefix(view, "", [/^#{1,6}\s+/]);
+        view.focus();
+      }
+    };
+    window.addEventListener("nowen:format", handler as EventListener);
+    return () => window.removeEventListener("nowen:format", handler as EventListener);
+  }, [editable]);
+
+  // ---------- ����仯�������� ----------
+
+  const handleTitleBlur = useCallback(() => {
+    if (shouldSkipTitleChange({
+      isComposing: isTitleComposingRef.current,
+    })) {
+      return;
+    }
+    emitTitleUpdate();
+  }, [emitTitleUpdate]);
+
+  const handleTitleCompositionStart = useCallback(() => {
+    isTitleComposingRef.current = true;
+  }, []);
+
+  const handleTitleCompositionEnd = useCallback(() => {
+    isTitleComposingRef.current = false;
+  }, []);
+
+  const handleTitleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        viewRef.current?.focus();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        flushSave();
+      }
+    },
+    [flushSave]
+  );
+
+  const handleSplitResizerPointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    if (viewModeRef.current !== "split") return;
+
+    event.preventDefault();
+    const container = splitContainerRef.current;
+    if (!container) return;
+
+    const updateWidth = (clientX: number) => {
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      setSourcePaneWidthPercent(clampMarkdownSplitPercent(((clientX - rect.left) / rect.width) * 100));
+    };
+
+    updateWidth(event.clientX);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      updateWidth(moveEvent.clientX);
+    };
+    const handlePointerUp = () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp, { once: true });
+  }, []);
+
+  const handlePreviewTaskCheckboxChange = useCallback((taskIndex: number, checked: boolean) => {
+    const view = viewRef.current;
+    if (!view || !editable) return;
+
+    const currentMarkdown = view.state.doc.toString();
+    const change = getMarkdownTaskCheckboxChange(currentMarkdown, taskIndex, checked);
+    if (!change) return;
+    const nextMarkdown = applyMarkdownTaskCheckboxChange(currentMarkdown, change);
+
+    view.dispatch({
+      changes: { from: change.from, to: change.to, insert: change.insert },
+    });
+    setPreviewMarkdown(nextMarkdown);
+  }, [editable]);
+
+  const handlePreviewCodeBlockFormat = useCallback(async (source: string, offset: number) => {
+    const view = viewRef.current;
+    if (!view || !editable) return;
+    const { formatMarkdownCodeBlock } = await import("@/lib/markdownCodeBlockFormatting");
+    await formatMarkdownCodeBlock(view, source, offset);
+    setPreviewMarkdown(view.state.doc.toString());
+  }, [editable]);
+
+  const handlePreviewEncryptedBlockEdit = useCallback((source: string, rendered: string, offset: number) => {
+    const view = viewRef.current; const noteId = note.id;
+    if (!view || !editable || isGuest || note.isTrashed) throw new Error("Encrypted region is read-only");
+    const region = prepareMarkdownEncryptedRegionEdit(view, source, rendered, offset);
+    // Keep the private dialog outside the preview tree so a refreshed preview cannot discard edits.
+    setEncryptedRegion({ source: region.source, commit: (ciphertext: string) => {
+      if (noteRef.current.id !== noteId || viewRef.current !== view) throw new Error("Encrypted region changed");
+      region.commit(ciphertext);
+      setPreviewMarkdown(view.state.doc.toString());
+    } });
+  }, [editable, isGuest, note.id, note.isTrashed]);
+
+  // ---------- ��ǩ�仯 ----------
+
+  const noteTags = useMemo(() => note.tags || [], [note.tags]);
+
+  // ---------- ���������ͳһ�� viewRef ȡ view ----------
+
+  const withView = useCallback((fn: (v: EditorView) => void) => {
+    const v = viewRef.current;
+    if (!v) return;
+    fn(v);
+  }, []);
+
+  const openMarkdownSearch = useCallback(() => {
+    setMobileToolbarExpanded(false);
+    const revealSearch = () => {
+      const view = viewRef.current;
+      if (!view) return;
+      openSearchPanel(view);
+    };
+
+    if (viewModeRef.current === "preview") {
+      setMarkdownViewMode("source");
+      requestAnimationFrame(revealSearch);
+      return;
+    }
+    revealSearch();
+  }, [setMarkdownViewMode]);
+
+  const closeMarkdownSearch = useCallback(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    closeSearchPanel(view);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("nowen:open-search", openMarkdownSearch);
+    window.addEventListener("nowen:close-search", closeMarkdownSearch);
+    return () => {
+      window.removeEventListener("nowen:open-search", openMarkdownSearch);
+      window.removeEventListener("nowen:close-search", closeMarkdownSearch);
+    };
+  }, [closeMarkdownSearch, openMarkdownSearch]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: searchPhraseCompartmentRef.current.reconfigure(
+        markdownSearchPhrases(i18n.resolvedLanguage || i18n.language),
+      ),
+    });
+  }, [i18n.language, i18n.resolvedLanguage]);
+
+  const iconSize = 15;
+
+  const handleNoteLinkSelect = useCallback((
+    targetNote: NoteSearchResult,
+    block?: NoteLinkBlockItem,
+    options?: NoteLinkSelectionOptions,
+  ) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const alias = options?.alias?.trim() || "";
+    const syntax = buildWikiNoteLink(targetNote.id, block?.blockId, alias);
+    view.dispatch({
+      changes: { from: noteLinkMenu.from, to: noteLinkMenu.to, insert: syntax },
+      selection: { anchor: noteLinkMenu.from + syntax.length },
+    });
+    setNoteLinkMenu((previous) => ({ ...previous, open: false }));
+    queueMicrotask(() => view.focus());
+  }, [noteLinkMenu.from, noteLinkMenu.to]);
+
+  useEffect(() => {
+    const jump = async (blockId: string) => {
+      const view = viewRef.current;
+      if (!view) return;
+      try {
+        const block = await api.getBlock(note.id, blockId);
+        if (typeof block.startOffset !== "number") return;
+        const pos = Math.max(0, Math.min(block.startOffset, view.state.doc.length));
+        view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: "center" }) });
+        view.focus();
+      } catch { toast.info("引用块已不存在或无权访问"); }
+    };
+    const pending = consumeBlockNavigation(note.id);
+    if (pending) void jump(pending.blockId);
+    return subscribeBlockNavigation((request) => { if (request.noteId === note.id) void jump(request.blockId); });
+  }, [note.id]);
+
+  // ---------- ��Ⱦ ----------
+
+  return (
+    <div
+      data-markdown-mobile-editing-compact={compactMobileEditing ? "true" : "false"}
+      className="relative flex flex-col h-full overflow-hidden"
+    >
+      {editable && !isGuest && !note.isTrashed && <button type="button" className="border-b border-app-border px-3 py-1 text-left text-xs text-tx-secondary" onClick={openEncryptedRegion}>插入加密内容</button>}
+      {encryptedRegion && <EncryptedBlockDialog source={encryptedRegion.source} initialContent={encryptedRegion.initialContent} onCommit={encryptedRegion.commit} onClose={() => setEncryptedRegion(null)} />}
+      {noteLinkMenu.open && (
+        <NoteLinkMenu
+          position={noteLinkMenu.position}
+          query={noteLinkMenu.query}
+          notebookId={note.notebookId}
+          onSelect={handleNoteLinkSelect}
+          onClose={() => setNoteLinkMenu((previous) => ({ ...previous, open: false }))}
+        />
+      )}
+      {/* Status bar (char/word count, aligned with TiptapEditor) */}
+      {editable && (
+        <>
+          <div
+            data-markdown-mobile-toolbar="compact"
+            className="sticky top-0 z-20 flex min-w-0 items-center gap-0.5 border-b border-app-border bg-app-surface/95 px-1 py-1 backdrop-blur md:hidden"
+            style={compactMobileEditing ? { paddingTop: "calc(var(--safe-area-top) + 4px)" } : undefined}
+          >
+            <MobileEditorToolbarSlot location="leading" />
+            <div
+              data-mobile-editor-format-strip=""
+              className="hide-scrollbar flex min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto touch-pan-x px-1 [&>button]:shrink-0 [&>button]:p-1"
+            >
+              <ToolbarButton onClick={() => withView((view) => undo(view))} title={tr("tiptap.undo") || "撤销"}>
+                <Undo size={16} />
+              </ToolbarButton>
+              <ToolbarButton onClick={() => withView((view) => redo(view))} title={tr("tiptap.redo") || "重做"}>
+                <Redo size={16} />
+              </ToolbarButton>
+              <ToolbarDivider />
+              <ToolbarButton onClick={() => withView((view) => toggleHeading(view, 1))} title={tr("tiptap.heading1") || "一级标题"}>
+                <Heading1 size={16} />
+              </ToolbarButton>
+              <ToolbarButton onClick={() => withView((view) => toggleHeading(view, 2))} title={tr("tiptap.heading2") || "二级标题"}>
+                <Heading2 size={16} />
+              </ToolbarButton>
+              <ToolbarButton onClick={() => withView((view) => toggleWrap(view, "**"))} title={tr("tiptap.bold") || "加粗"}>
+                <Bold size={16} />
+              </ToolbarButton>
+              <ToolbarButton onClick={() => withView((view) => toggleBulletList(view))} title={tr("tiptap.bulletList") || "无序列表"}>
+                <List size={16} />
+              </ToolbarButton>
+              <ToolbarButton onClick={triggerImagePicker} title={tr("tiptap.insertImage") || "插入图片"}>
+                <ImagePlus size={16} />
+              </ToolbarButton>
+              <ToolbarButton onClick={triggerVideoPicker} title={tr("tiptap.uploadLocalVideo") || "插入本地视频"}>
+                <Film size={16} />
+              </ToolbarButton>
+            </div>
+            <MobileEditorToolbarSlot location="trailing" />
+            <ToolbarButton onClick={() => setMobileToolbarExpanded((value) => !value)} title={tr("common.more") || "更多"}>
+              <ChevronDown size={16} className={cn("transition-transform", mobileToolbarExpanded && "rotate-180")} />
+            </ToolbarButton>
+          </div>
+          <CollapsibleEditorToolbar>
+          <div
+            data-markdown-mobile-toolbar="expanded"
+            className={cn(
+              "z-30 items-center gap-0.5 overflow-x-auto border-b border-app-border bg-app-elevated px-3 py-2 hide-scrollbar touch-pan-x transition-colors md:flex md:flex-wrap md:bg-app-surface/95 md:px-4 md:pr-12 md:backdrop-blur md:supports-[backdrop-filter]:bg-app-surface/70",
+              mobileToolbarExpanded
+                ? "flex max-md:max-h-[38vh] max-md:flex-wrap max-md:overflow-y-auto max-md:shadow-xl"
+                : "hidden md:flex",
+            )}
+          >
+          <ToolbarButton
+            className="max-md:hidden"
+            onClick={() => withView((v) => undo(v))}
+            title={tr("tiptap.undo") || "����"}
+          >
+            <Undo size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            className="max-md:hidden"
+            onClick={() => withView((v) => redo(v))}
+            title={tr("tiptap.redo") || "重做"}
+          >
+            <Redo size={iconSize} />
+          </ToolbarButton>
+          <span className="hidden md:inline-flex">
+            <ToolbarButton
+              onClick={openMarkdownSearch}
+              title="查找与替换"
+            >
+              <Search size={iconSize} />
+            </ToolbarButton>
+          </span>
+
+          {/* MARKDOWN-MOBILE-PREVIEW-01: 预览入口前置，避免被横向工具栏遮挡。 */}
+          <div className="flex shrink-0 items-center gap-0.5 rounded-md border border-app-border sm:hidden">
+            <button
+              type="button"
+              onClick={() => setMarkdownViewMode("source")}
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-[5px] transition-colors",
+                viewMode === "source"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : "text-tx-tertiary active:bg-app-hover",
+              )}
+              title={tr("markdown.view.source") || "源码"}
+              aria-label={tr("markdown.view.source") || "源码"}
+              aria-pressed={viewMode === "source"}
+            >
+              <FileCode size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setMarkdownViewMode("preview")}
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-[5px] transition-colors",
+                viewMode === "preview"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : "text-tx-tertiary active:bg-app-hover",
+              )}
+              title={tr("markdown.view.preview") || "预览"}
+              aria-label={tr("markdown.view.preview") || "预览"}
+              aria-pressed={viewMode === "preview"}
+            >
+              <Eye size={14} />
+            </button>
+          </div>
+
+          <ToolbarDivider className="max-md:hidden" />
+
+          <ToolbarButton
+            className="max-md:hidden"
+            onClick={() => withView((v) => toggleHeading(v, 1))}
+            title={tr("tiptap.heading1") || "һ������"}
+          >
+            <Heading1 size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            className="max-md:hidden"
+            onClick={() => withView((v) => toggleHeading(v, 2))}
+            title={tr("tiptap.heading2") || "��������"}
+          >
+            <Heading2 size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleHeading(v, 3))}
+            title={tr("tiptap.heading3") || "��������"}
+          >
+            <Heading3 size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleHeading(v, 4))}
+            title={tr("tiptap.heading4") || "�ļ�����"}
+          >
+            <Heading4 size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleHeading(v, 5))}
+            title={tr("tiptap.heading5") || "�������"}
+          >
+            <Heading5 size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleHeading(v, 6))}
+            title={tr("tiptap.heading6") || "�������"}
+          >
+            <Heading6 size={iconSize} />
+          </ToolbarButton>
+
+          <ToolbarDivider />
+
+          <ToolbarButton
+            className="max-md:hidden"
+            onClick={() => withView((v) => toggleWrap(v, "**"))}
+            title={tr("tiptap.bold") || "�Ӵ�"}
+          >
+            <Bold size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleWrap(v, "*"))}
+            title={tr("tiptap.italic") || "б��"}
+          >
+            <Italic size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleWrap(v, "~~"))}
+            title={tr("tiptap.strikethrough") || "ɾ����"}
+          >
+            <Strikethrough size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleInlineCode(v))}
+            title={tr("tiptap.inlineCode") || "���ڴ���"}
+          >
+            <CodeIcon size={iconSize} />
+          </ToolbarButton>
+
+          <ToolbarDivider />
+
+          <ToolbarButton
+            className="max-md:hidden"
+            onClick={() => withView((v) => toggleBulletList(v))}
+            title={tr("tiptap.bulletList") || "�����б�"}
+          >
+            <List size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleOrderedList(v))}
+            title={tr("tiptap.orderedList") || "�����б�"}
+          >
+            <ListOrdered size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleTaskList(v))}
+            title={tr("tiptap.taskList") || "�����б�"}
+          >
+            <CheckSquare size={iconSize} />
+          </ToolbarButton>
+
+          <ToolbarDivider />
+
+          <ToolbarButton
+            onClick={() => withView((v) => toggleBlockquote(v))}
+            title={tr("tiptap.blockquote") || "����"}
+          >
+            <Quote size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleCodeBlock(v))}
+            title={tr("tiptap.codeBlock") || "�����"}
+          >
+            <FileCode size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => insertHorizontalRule(v))}
+            title={tr("tiptap.horizontalRule") || "�ָ���"}
+          >
+            <Minus size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => insertLink(v))}
+            title={tr("tiptap.insertLink") || "��������"}
+          >
+            <LinkIcon size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton className="max-md:hidden" onClick={triggerImagePicker} title={tr("tiptap.insertImage") || "����ͼƬ"}>
+            <ImagePlus size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton className="max-md:hidden" onClick={triggerVideoPicker} title={tr("tiptap.uploadLocalVideo") || "插入本地视频"}>
+            <Film size={iconSize} />
+          </ToolbarButton>
+          <VoiceInsertMenu onUpload={triggerAttachmentPicker} onRecord={openVoiceRecorder} recordDisabled={!editable || isGuest || !!note.isTrashed} iconSize={iconSize} />
+          <ToolbarButton
+            onClick={openAttachmentLibrary}
+            title={tr("tiptap.insertExistingAttachment", { defaultValue: "从文件管理插入" })}
+          >
+            <FolderSearch size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => insertTable(v))}
+            title={tr("tiptap.insertTable") || "�������"}
+          >
+            <Table2 size={iconSize} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => window.dispatchEvent(new CustomEvent("nowen:open-mindmap-insert"))}
+            title={tr("tiptap.insertMindMap")}
+          >
+            <BrainCircuit size={iconSize} />
+          </ToolbarButton>
+
+          {!isGuest && <ToolbarDivider />}
+          {!isGuest && (
+            <>
+              <ToolbarButton
+                onClick={openTaskCapture}
+                title={tr("tasks.quickCaptureToInbox", { defaultValue: "快速捕获到收集箱" })}
+              >
+                <ClipboardPlus size={iconSize} className="text-blue-500" />
+              </ToolbarButton>
+              <ToolbarButton onClick={openAIAssistant} title={tr("tiptap.aiAssistant") || "AI 助手"}>
+                <Sparkles size={iconSize} className="text-violet-500" />
+              </ToolbarButton>
+            </>
+          )}
+
+          {/* MARKDOWN-PREVIEW-MODE-01: 视图模式切换 */}
+          <div className="ml-auto hidden items-center gap-0.5 overflow-hidden rounded-md border border-app-border sm:flex">
+            <button
+              type="button"
+              onClick={() => setMarkdownViewMode("source")}
+              className={cn(
+                "max-md:hidden flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors",
+                viewMode === "source"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : "text-tx-tertiary hover:text-tx-secondary hover:bg-app-hover"
+              )}
+              title={tr("markdown.view.source") || "源码"}
+            >
+              <FileCode size={12} />
+              <span className="hidden sm:inline">{tr("markdown.view.source") || "源码"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setMarkdownViewMode("preview")}
+              className={cn(
+                "max-md:hidden flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors",
+                viewMode === "preview"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : "text-tx-tertiary hover:text-tx-secondary hover:bg-app-hover"
+              )}
+              title={tr("markdown.view.preview") || "预览"}
+            >
+              <Eye size={12} />
+              <span className="hidden sm:inline">{tr("markdown.view.preview") || "预览"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setMarkdownViewMode("split")}
+              className={cn(
+                "flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors",
+                viewMode === "split"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : "text-tx-tertiary hover:text-tx-secondary hover:bg-app-hover"
+              )}
+              title={tr("markdown.view.split") || "分屏"}
+            >
+              <Columns2 size={12} />
+              <span className="hidden sm:inline">{tr("markdown.view.split") || "分屏"}</span>
+            </button>
+          </div>
+          </div>
+          </CollapsibleEditorToolbar>
+        </>
+      )}
+
+      {/* ������ */}
+      <div
+        data-markdown-mobile-title=""
+        className={cn("px-4 md:px-8 pb-1", compactMobileEditing ? "pt-2" : "pt-3")}
+      >
+        <textarea
+          ref={titleRef}
+          rows={1}
+          defaultValue={note.title}
+          placeholder={tr("tiptap.titlePlaceholder") || "�ޱ���"}
+          onBlur={handleTitleBlur}
+          onCompositionStart={handleTitleCompositionStart}
+          onCompositionEnd={handleTitleCompositionEnd}
+          onInput={(event) => {
+            const el = event.currentTarget;
+            el.style.height = "auto";
+            el.style.height = `${el.scrollHeight}px`;
+          }}
+          onKeyDown={handleTitleKeyDown}
+          spellCheck={false}
+          readOnly={!editable}
+          className="block w-full resize-none overflow-hidden break-words bg-transparent p-0 outline-none text-lg leading-7 md:text-xl font-semibold text-tx-primary placeholder:text-tx-tertiary/60"
+        />
+        {!isGuest && (
+          <div className={cn("mt-1", compactMobileEditing && "hidden focus-within:block")}>
+            <TagInput
+              noteId={note.id}
+              noteTags={noteTags}
+              onTagsChange={onTagsChange}
+              mobileCompact
+            />
+          </div>
+        )}
+      </div>
+
+      {/* �༭������
+          paddingBottom ֻ�Լ��̸߶ȣ������걻���뷨��ס��
+          v2026-05-18 ���Ƴ��ƶ��������������ɶ��� sticky ��������ͳһ
+          �е���ʽ����� */}
+      {/* editor content area - source/preview/split */}
+      <div className={cn(
+        "flex-1 min-h-0",
+        viewMode === "split" ? "flex overflow-hidden" : "overflow-auto px-4 md:px-8"
+      )} ref={splitContainerRef} style={{ paddingBottom: viewMode !== "split" ? "var(--keyboard-height, 0px)" : undefined }}>
+        {/* CodeMirror host - always mounted, hidden in preview mode */}
+        <div className={cn(
+          viewMode === "split" ? "min-h-0 overflow-auto px-4 md:px-8 shrink-0" : "h-full",
+          viewMode === "preview" && "hidden"
+        )} style={viewMode === "split" ? { width: `${sourcePaneWidthPercent}%` } : undefined}>
+          <div ref={hostRef} className="nowen-md-editor h-full" style={{ minHeight: "100%" }} />
+        </div>
+        {/* Split divider */}
+        {viewMode === "split" && (
+          <button
+            type="button"
+            role="separator"
+            aria-orientation="vertical"
+            aria-valuemin={25}
+            aria-valuemax={75}
+            aria-valuenow={Math.round(sourcePaneWidthPercent)}
+            onPointerDown={handleSplitResizerPointerDown}
+            className="group relative flex w-3 shrink-0 cursor-col-resize touch-none items-center justify-center bg-app-hover/70 transition-colors hover:bg-accent-primary/10 active:bg-accent-primary/15"
+            title={tr("markdown.view.resizeSplit") || "拖拽调整分屏宽度"}
+          >
+            <span className="h-full w-px bg-app-border transition-colors group-hover:bg-accent-primary/80" />
+            <span className="absolute left-1/2 top-1/2 h-10 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-app-border bg-app-surface shadow-sm transition-colors group-hover:border-accent-primary/70 group-hover:bg-accent-primary/10" />
+          </button>
+        )}
+        {/* Preview area */}
+        {(viewMode === "preview" || viewMode === "split") && (
+          <div className={cn(
+            viewMode === "split" ? "min-h-0 overflow-auto px-4 md:px-8 shrink-0" : "h-full"
+          )} style={viewMode === "split" ? { width: `${100 - sourcePaneWidthPercent}%` } : undefined}>
+            <MarkdownPreview
+              markdown={previewMarkdown}
+              noteId={isGuest ? undefined : note.id}
+              className="h-full"
+              compact={viewMode === "split"}
+              containerRef={previewRootRef}
+              onTaskCheckboxChange={editable ? handlePreviewTaskCheckboxChange : undefined}
+              onFormatCodeBlock={editable ? handlePreviewCodeBlockFormat : undefined}
+              onEditEncryptedBlock={editable && !isGuest && !note.isTrashed ? handlePreviewEncryptedBlockEdit : undefined}
+              onInsertVoiceTranscript={editable && !isGuest && !note.isTrashed ? insertVoiceTranscript : undefined}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* ״̬��������ͳ�ƣ��� TiptapEditor ���룩 */}
+      <div
+        data-markdown-mobile-status=""
+        className={cn(
+          "px-4 md:px-8 py-1.5 border-t border-app-border/60 text-[11px] text-tx-tertiary items-center gap-3 select-none",
+          compactMobileEditing ? "hidden" : "flex",
+        )}
+      >
+        <span>{wordStats.chars}{tr('tiptap.chars')}</span>
+        <span className="opacity-60">·</span>
+        <span>{wordStats.words}{tr('tiptap.words')}</span>
+        <span className="ml-auto opacity-60">Markdown</span>
+      </div>
+
+      {/* б�ܲ˵����� */}
+      <MarkdownSlashMenu
+        state={slashState}
+        items={slashItems}
+        view={viewRef.current}
+        onClose={() => setSlashState(emptySlashState)}
+      />
+
+      <AttachmentLibraryPicker
+        key={note.id}
+        noteId={note.id}
+        workspaceId={note.workspaceId}
+        open={attachmentLibraryOpen}
+        onClose={closeAttachmentLibrary}
+        onSelect={insertExistingAttachment}
+      />
+
+      {/*
+        �������ݲ˵������� Tiptap �� BubbleMenu��
+        - ֻ���зǿ�ѡ�� + �༭���۽�ʱ����
+        - �� fixed ��λ + �ӿ����꣬���ⱻ��������ü�
+        - onMouseDown ��ֹĬ����Ϊ����ֹ�㰴ťʱ CM ʧ������ѡ����ʧ
+      */}
+      {editable && bubble.open && (
+        <div
+          className="fixed z-40 flex items-center gap-0.5 bg-app-elevated border border-app-border rounded-lg shadow-lg p-1 overflow-x-auto max-w-[calc(100vw-16px)]"
+          style={{ top: bubble.top, left: bubble.left }}
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          <ToolbarButton
+            onClick={() => void copySelectionText()}
+            title={tr('tiptap.copySelectionText')}
+          >
+            <Copy size={14} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => void selectAllText()}
+            title={tr('tiptap.selectAllText')}
+          >
+            <ArrowUp size={14} />
+          </ToolbarButton>
+          {!isGuest && !note.isTrashed && <ToolbarButton onClick={openEncryptedRegion} title="加密选中文字">加密</ToolbarButton>}
+          {selectedTextAction?.type === "phone" && (
+            <ToolbarButton
+              onClick={() => {
+                if (confirm(tr('tiptap.dialConfirm', { phone: selectedTextAction.value }) || '\u62e8\u6253\u7535\u8bdd\uff1f ' + selectedTextAction.value)) {
+                  window.location.href = selectedTextAction.href;
+                }
+              }}
+              title={selectedTextAction.value}
+            >
+              <Phone size={14} />
+            </ToolbarButton>
+          )}
+          {selectedTextAction?.type === "url" && (
+            <ToolbarButton
+              onClick={() => window.open(selectedTextAction.href, '_blank', 'noopener')}
+              title={selectedTextAction.value}
+            >
+              <ExternalLink size={14} />
+            </ToolbarButton>
+          )}
+          <ToolbarButton
+            onClick={() => withView((v) => toggleWrap(v, "**"))}
+            title={tr("tiptap.bold") || "�Ӵ�"}
+          >
+            <Bold size={14} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleWrap(v, "*"))}
+            title={tr("tiptap.italic") || "б��"}
+          >
+            <Italic size={14} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleWrap(v, "~~"))}
+            title={tr("tiptap.strikethrough") || "ɾ����"}
+          >
+            <Strikethrough size={14} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={() => withView((v) => toggleInlineCode(v))}
+            title={tr("tiptap.inlineCode") || "���ڴ���"}
+          >
+            <CodeIcon size={14} />
+          </ToolbarButton>
+          {!isGuest && (
+            <>
+              <div className="w-px h-4 bg-app-border mx-0.5" />
+              <ToolbarButton
+                onClick={openTaskCapture}
+                title={tr("tasks.quickCaptureToInbox", { defaultValue: "快速捕获到收集箱" })}
+              >
+                <ClipboardPlus size={14} className="text-blue-500" />
+              </ToolbarButton>
+              <ToolbarButton
+                onClick={openAIAssistant}
+                title={tr("tiptap.aiAssistant") || "AI ����"}
+              >
+                <Sparkles size={14} className="text-violet-500" />
+              </ToolbarButton>
+            </>
+          )}
+        </div>
+      )}
+
+
+      {/* AI д���������ڸ��㣨���Ƿÿ� & δ���� onAIAssistant ����ʱ���ã� */}
+      {!isGuest && aiOpen && (
+        <AIWritingAssistant
+          selectedText={aiSelectedText}
+          fullText={aiFullText}
+          onInsert={handleAIInsert}
+          onReplace={handleAIReplace}
+          onClose={() => setAiOpen(false)}
+          position={aiPosition}
+        />
+      )}
+
+      {/*
+        �ƶ��˸����������������������Ϸ���
+      {/* �ƶ��˹�������Ǩ�Ƶ��� Toolbar ֮�󣬲ο��·������Ⱦ�� */}
+    </div>
+  );
+});
+
+// ---------------------------------------------------------------------------
+// ������������ֹ Vite HMR ʱ���� view
+// ---------------------------------------------------------------------------
+// ��ռλ��δ������Ҫ���� import.meta.hot �ص������� viewRef��
+
+// ---------------------------------------------------------------------------
+// ���ߣ�����ɶ����ֽڴ�С���� TiptapEditor һ�£��������һ�ݱ������� import��
+// ---------------------------------------------------------------------------
+function formatBytesMd(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(gb < 10 ? 2 : 1)} GB`;
+}
+
+function buildMarkdownAttachmentSnippet(item: FileItem): string {
+  return buildExistingAttachmentMarkdownSnippet(item);
+}
+void StateEffect;

@@ -1,0 +1,521 @@
+/**
+ * MarkdownSlashMenu —— CodeMirror 6 Markdown 编辑器的斜杠命令菜单
+ * ----------------------------------------------------------------------------
+ * 设计：
+ *   - 通过 CM6 的 `updateListener` 识别"当前光标处于 `/xxx` 模式"
+ *   - 识别成功时派发一个外部回调，由 React 组件渲染浮层
+ *   - 浮层本身是 React Portal（挂到 body），通过 keymap 处理上/下/回车/Esc
+ *   - 执行命令后删除用户输入的 `/xxx` 文本，再调用命令
+ *
+ * 仅在当前"一行中、光标前的片段是 /[\w\u4e00-\u9fff]*、且该片段起点是行首或空格之后"时激活。
+ */
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
+import ReactDOM from "react-dom";
+import { EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
+import { StateEffect } from "@codemirror/state";
+import { syntaxTree } from "@codemirror/language";
+import { isolateHistory } from "@codemirror/commands";
+import {
+  Bold,
+  CheckSquare,
+  FileCode,
+  Heading1,
+  Heading2,
+  Heading3,
+  Heading4,
+  Heading5,
+  Heading6,
+  Image as ImagePlus,
+  FolderSearch,
+  Italic,
+  List,
+  ListOrdered,
+  Minus,
+  Quote,
+  Sparkles,
+  Table2,
+} from "lucide-react";
+import {
+  toggleHeading,
+  toggleBulletList,
+  toggleOrderedList,
+  toggleTaskList,
+  toggleBlockquote,
+  toggleCodeBlock,
+  insertHorizontalRule,
+  insertTable,
+  toggleWrap,
+} from "@/lib/markdownCommands";
+
+// ---------------------------------------------------------------------------
+// 命令项定义
+// ---------------------------------------------------------------------------
+
+export interface MdSlashItem {
+  id: string;
+  label: string;
+  description?: string;
+  icon: React.ReactNode;
+  category: string;
+  keywords: string[];
+  /** 命令被触发时执行：此时用户输入的 /xxx 已被删除 */
+  run: (view: EditorView) => void;
+}
+
+export function getDefaultMdSlashItems(
+  t: (key: string) => string,
+  opts: {
+    onImageUpload?: () => void;
+    onAttachmentLibrary?: () => void;
+    onVoiceRecord?: () => void;
+    onAIAssistant?: () => void;
+  },
+): MdSlashItem[] {
+  const size = 16;
+  return [
+    ...(opts.onVoiceRecord ? [{ id: "voice", label: t("voice.record"), description: t("voice.description"), icon: <span>🎙</span>, category: t("slash.catInsert"), keywords: ["voice", "audio", "录音", "语音"], run: opts.onVoiceRecord }] : []),
+    {
+      id: "h1",
+      label: t("slash.heading1"),
+      description: t("slash.heading1Desc"),
+      icon: <Heading1 size={size} />,
+      category: t("slash.catHeadings"),
+      keywords: ["h1", "heading", "title", "标题", "一级"],
+      run: (v) => toggleHeading(v, 1),
+    },
+    {
+      id: "h2",
+      label: t("slash.heading2"),
+      description: t("slash.heading2Desc"),
+      icon: <Heading2 size={size} />,
+      category: t("slash.catHeadings"),
+      keywords: ["h2", "heading", "标题", "二级"],
+      run: (v) => toggleHeading(v, 2),
+    },
+    {
+      id: "h3",
+      label: t("slash.heading3"),
+      description: t("slash.heading3Desc"),
+      icon: <Heading3 size={size} />,
+      category: t("slash.catHeadings"),
+      keywords: ["h3", "heading", "标题", "三级"],
+      run: (v) => toggleHeading(v, 3),
+    },
+    {
+      id: "h4",
+      label: t("slash.heading4"),
+      description: t("slash.heading4Desc"),
+      icon: <Heading4 size={size} />,
+      category: t("slash.catHeadings"),
+      keywords: ["h4", "heading", "标题", "四级"],
+      run: (v) => toggleHeading(v, 4),
+    },
+    {
+      id: "h5",
+      label: t("slash.heading5"),
+      description: t("slash.heading5Desc"),
+      icon: <Heading5 size={size} />,
+      category: t("slash.catHeadings"),
+      keywords: ["h5", "heading", "标题", "五级"],
+      run: (v) => toggleHeading(v, 5),
+    },
+    {
+      id: "h6",
+      label: t("slash.heading6"),
+      description: t("slash.heading6Desc"),
+      icon: <Heading6 size={size} />,
+      category: t("slash.catHeadings"),
+      keywords: ["h6", "heading", "标题", "六级"],
+      run: (v) => toggleHeading(v, 6),
+    },
+    {
+      id: "ul",
+      label: t("slash.bulletList"),
+      description: t("slash.bulletListDesc"),
+      icon: <List size={size} />,
+      category: t("slash.catLists"),
+      keywords: ["ul", "bullet", "list", "无序", "列表"],
+      run: (v) => toggleBulletList(v),
+    },
+    {
+      id: "ol",
+      label: t("slash.orderedList"),
+      description: t("slash.orderedListDesc"),
+      icon: <ListOrdered size={size} />,
+      category: t("slash.catLists"),
+      keywords: ["ol", "ordered", "number", "有序", "编号", "列表"],
+      run: (v) => toggleOrderedList(v),
+    },
+    {
+      id: "todo",
+      label: t("slash.taskList"),
+      description: t("slash.taskListDesc"),
+      icon: <CheckSquare size={size} />,
+      category: t("slash.catLists"),
+      keywords: ["todo", "task", "checkbox", "待办", "任务"],
+      run: (v) => toggleTaskList(v),
+    },
+    {
+      id: "quote",
+      label: t("slash.blockquote"),
+      description: t("slash.blockquoteDesc"),
+      icon: <Quote size={size} />,
+      category: t("slash.catFormat"),
+      keywords: ["quote", "blockquote", "引用"],
+      run: (v) => toggleBlockquote(v),
+    },
+    {
+      id: "code",
+      label: t("slash.codeBlock"),
+      description: t("slash.codeBlockDesc"),
+      icon: <FileCode size={size} />,
+      category: t("slash.catFormat"),
+      keywords: ["code", "codeblock", "代码", "代码块"],
+      run: (v) => toggleCodeBlock(v),
+    },
+    {
+      id: "hr",
+      label: t("slash.horizontalRule"),
+      description: t("slash.horizontalRuleDesc"),
+      icon: <Minus size={size} />,
+      category: t("slash.catFormat"),
+      keywords: ["hr", "divider", "separator", "分割线"],
+      run: (v) => insertHorizontalRule(v),
+    },
+    {
+      id: "bold",
+      label: t("slash.bold"),
+      description: t("slash.boldDesc"),
+      icon: <Bold size={size} />,
+      category: t("slash.catInline"),
+      keywords: ["bold", "strong", "加粗", "粗体"],
+      run: (v) => toggleWrap(v, "**"),
+    },
+    {
+      id: "italic",
+      label: t("slash.italic"),
+      description: t("slash.italicDesc"),
+      icon: <Italic size={size} />,
+      category: t("slash.catInline"),
+      keywords: ["italic", "em", "斜体"],
+      run: (v) => toggleWrap(v, "*"),
+    },
+    {
+      id: "image",
+      label: t("slash.image"),
+      description: t("slash.imageDesc"),
+      icon: <ImagePlus size={size} />,
+      category: t("slash.catInsert"),
+      keywords: ["image", "picture", "photo", "图片", "插图"],
+      run: () => opts.onImageUpload?.(),
+    },
+    {
+      id: "attachmentLibrary",
+      label: t("slash.attachmentLibrary"),
+      description: t("slash.attachmentLibraryDesc"),
+      icon: <FolderSearch size={size} />,
+      category: t("slash.catInsert"),
+      keywords: ["fj", "attachment", "file", "library", "附件", "文件", "文件管理"],
+      run: () => opts.onAttachmentLibrary?.(),
+    },
+    {
+      id: "table",
+      label: t("slash.table"),
+      description: t("slash.tableDesc"),
+      icon: <Table2 size={size} />,
+      category: t("slash.catInsert"),
+      keywords: ["table", "grid", "表格"],
+      run: (v) => insertTable(v),
+    },
+    ...(opts.onAIAssistant
+      ? [
+          {
+            id: "ai",
+            label: t("slash.ai"),
+            description: t("slash.aiDesc"),
+            icon: <Sparkles size={size} className="text-violet-500" />,
+            category: t("slash.catAI"),
+            keywords: ["ai", "assistant", "智能", "助手"],
+            run: () => opts.onAIAssistant?.(),
+          } as MdSlashItem,
+        ]
+      : []),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// CM6 扩展：检测 `/xxx` 并回调外部状态
+// ---------------------------------------------------------------------------
+
+export interface SlashState {
+  /** true: 菜单应显示 */
+  active: boolean;
+  /** 用户输入的查询（不含前缀 `/`） */
+  query: string;
+  /** /xxx 在文档中的起点位置（含 `/`） */
+  from: number;
+  /** 屏幕坐标，相对视口 */
+  coords: { top: number; left: number; bottom: number } | null;
+}
+
+export const emptySlashState: SlashState = {
+  active: false,
+  query: "",
+  from: 0,
+  coords: null,
+};
+
+/**
+ * 检测当前光标位置是否处于 `/query` 语境：
+ *   - 必须是空选区
+ *   - 光标前的文本以 `/` 开头
+ *   - `/` 的紧前字符必须是行首或空白
+ *   - `/` 和光标之间只能是字母/数字/中日韩字符
+ */
+function detectSlash(view: EditorView): SlashState {
+  const { state } = view;
+  const sel = state.selection.main;
+  if (!sel.empty || state.selection.ranges.length !== 1 || state.readOnly
+    || !state.facet(EditorView.editable) || !view.hasFocus || view.composing) return emptySlashState;
+  const pos = sel.from;
+  const line = state.doc.lineAt(pos);
+  const before = state.doc.sliceString(line.from, pos);
+  // 匹配行内最后一个 `/xxx`
+  const m = before.match(/(?:^|\s)(\/[\w\u4e00-\u9fff\u3400-\u4dbf]*)$/);
+  if (!m) return emptySlashState;
+  for (let node = syntaxTree(state).resolveInner(pos, -1); node; node = node.parent!) {
+    if (["FencedCode", "CodeBlock", "InlineCode"].includes(node.name)) return emptySlashState;
+  }
+  const token = m[1];
+  const from = pos - token.length;
+  const coords = view.coordsAtPos(from);
+  return {
+    active: true,
+    query: token.slice(1),
+    from,
+    coords: coords
+      ? { top: coords.top, left: coords.left, bottom: coords.bottom }
+      : null,
+  };
+}
+
+const dismissSlash = StateEffect.define<null>();
+
+/** 坐标只能在 CM6 测量阶段读取，不能在插件 update 中读取布局。 */
+export function createSlashPlugin(onChange: (state: SlashState) => void) {
+  return ViewPlugin.fromClass(class {
+    dismissed = false;
+    destroyed = false;
+    constructor(readonly view: EditorView) { this.measure(); }
+    measure() {
+      this.view.requestMeasure({
+        key: this,
+        read: () => this.dismissed || this.destroyed ? emptySlashState : detectSlash(this.view),
+        write: (state) => { if (!this.destroyed) onChange(state); },
+      });
+    }
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.selectionSet) this.dismissed = false;
+      if (update.transactions.some(tr => tr.effects.some(effect => effect.is(dismissSlash)))) {
+        this.dismissed = true;
+        onChange(emptySlashState);
+      }
+      if (update.docChanged || update.selectionSet || update.geometryChanged || update.focusChanged || update.transactions.length) this.measure();
+    }
+    destroy() { this.destroyed = true; onChange(emptySlashState); }
+  }, {
+    eventHandlers: {
+      scroll() { this.measure(); },
+      focus() { this.measure(); },
+      blur() { onChange(emptySlashState); },
+      compositionstart() { onChange(emptySlashState); },
+      compositionend() { this.measure(); },
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// React 浮层
+// ---------------------------------------------------------------------------
+
+interface SlashMenuProps {
+  state: SlashState;
+  items: MdSlashItem[];
+  view: EditorView | null;
+  /** 菜单关闭时通知外部（便于外部复位 state） */
+  onClose: () => void;
+}
+
+export const MarkdownSlashMenu: React.FC<SlashMenuProps> = ({ state, items, view, onClose }) => {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState({ top: 0, left: 0, width: 288, maxHeight: 288 });
+  const close = useCallback(() => {
+    if (view && view.dom.isConnected) view.dispatch({ effects: dismissSlash.of(null) });
+    onClose();
+  }, [view, onClose]);
+
+  const filtered = useMemo(() => {
+    if (!state.active) return [];
+    const q = state.query.toLowerCase();
+    if (!q) return items;
+    return items.filter((item) => {
+      if (item.label.toLowerCase().includes(q)) return true;
+      if (item.id.toLowerCase().includes(q)) return true;
+      return item.keywords.some((k) => k.toLowerCase().includes(q));
+    });
+  }, [items, state.active, state.query]);
+
+  useLayoutEffect(() => {
+    if (!state.active || !state.coords || !filtered.length) return;
+    const place = () => {
+      const viewport = window.visualViewport;
+      const x = viewport?.offsetLeft ?? 0, y = viewport?.offsetTop ?? 0;
+      const width = Math.min(288, (viewport?.width ?? window.innerWidth) - 16);
+      const bottom = y + (viewport?.height ?? window.innerHeight) - 8;
+      const coords = state.coords!;
+      const below = Math.max(0, bottom - coords.bottom - 6);
+      const above = Math.max(0, coords.top - y - 14);
+      const height = Math.min(288, menuRef.current?.scrollHeight || 288);
+      const flip = below < height && above > below;
+      const maxHeight = Math.min(288, Math.max(0, bottom - y - 8), flip ? above : below);
+      setPosition({
+        top: Math.max(y + 8, Math.min(bottom - Math.min(height, maxHeight), flip ? coords.top - 6 - Math.min(height, maxHeight) : coords.bottom + 6)),
+        left: Math.max(x + 8, Math.min(coords.left, x + (viewport?.width ?? window.innerWidth) - width - 8)),
+        width, maxHeight,
+      });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.visualViewport?.addEventListener("resize", place);
+    window.visualViewport?.addEventListener("scroll", place);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.visualViewport?.removeEventListener("resize", place);
+      window.visualViewport?.removeEventListener("scroll", place);
+    };
+  }, [state.active, state.coords, filtered.length]);
+
+  useEffect(() => {
+    if (!state.active) return;
+    const outside = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) close();
+    };
+    document.addEventListener("pointerdown", outside, true);
+    return () => document.removeEventListener("pointerdown", outside, true);
+  }, [state.active, close]);
+
+  // 查询变化后索引复位
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [state.query, state.active]);
+
+  // 滚动保证选中项可见
+  useEffect(() => {
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${activeIndex}"]`);
+    el?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
+
+  const execute = useCallback(
+    (item: MdSlashItem) => {
+      if (!view || !view.dom.isConnected || view.composing || view.state.readOnly || !view.state.facet(EditorView.editable)) return;
+      const current = detectSlash(view);
+      if (!current.active || current.from !== state.from || current.query !== state.query) return;
+      // 1) 删除用户输入的 "/xxx"
+      const endPos = state.from + 1 + state.query.length;
+      view.dispatch({
+        changes: { from: state.from, to: endPos, insert: "" },
+        annotations: isolateHistory.of("before"),
+      });
+      // 2) 执行命令
+      try {
+        item.run(view);
+      } finally {
+        view.dispatch({ annotations: isolateHistory.of("after") });
+        close();
+      }
+    },
+    [view, state.from, state.query, close],
+  );
+
+  // 键盘处理：注入 CM6 的 dom keydown
+  useEffect(() => {
+    if (!state.active || !view) return;
+    const handler = (e: KeyboardEvent) => {
+      if (!state.active) return;
+      // 中文输入法确认候选词时也会触发 Enter。监听器与 CodeMirror 位于同一节点，
+      // 需要阻断同节点后续监听器，避免回车被编辑器处理为换行并关闭菜单。
+      const isImeComposing = e.isComposing || e.keyCode === 229 || view.composing;
+      if (isImeComposing) {
+        if (e.key === "Enter") e.stopImmediatePropagation();
+        return;
+      }
+      if (filtered.length === 0) {
+        if (e.key === "Escape") {
+          close();
+          e.preventDefault();
+        }
+        return;
+      }
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveIndex((i) => (i + 1) % filtered.length);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveIndex((i) => (i - 1 + filtered.length) % filtered.length);
+      } else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        execute(filtered[activeIndex] ?? filtered[0]);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      }
+    };
+    const dom = view.dom;
+    dom.addEventListener("keydown", handler, true);
+    return () => dom.removeEventListener("keydown", handler, true);
+  }, [state.active, filtered, activeIndex, view, execute, close]);
+
+  if (!state.active || !state.coords || filtered.length === 0) return null;
+
+  return ReactDOM.createPortal(
+    <div
+      ref={menuRef}
+      role="listbox"
+      aria-label="Markdown /"
+      className="fixed z-[200] overflow-y-auto overscroll-contain rounded-lg border border-app-border bg-app-surface shadow-xl text-sm"
+      style={position}
+      // 不 stealFocus：用户还在 CM6 里输入
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      <div ref={listRef} className="py-1">
+        {filtered.map((item, idx) => (
+          <div
+            key={item.id}
+            role="option"
+            aria-selected={idx === activeIndex}
+            data-idx={idx}
+            className={`flex items-start gap-2 px-3 py-2 min-h-11 cursor-pointer ${
+              idx === activeIndex ? "bg-app-hover" : ""
+            }`}
+            onMouseEnter={() => setActiveIndex(idx)}
+            onClick={() => execute(item)}
+          >
+            <div className="mt-0.5 text-tx-secondary shrink-0">{item.icon}</div>
+            <div className="flex-1 min-w-0">
+              <div className="text-tx-primary font-medium leading-5 truncate">{item.label} <span className="text-[11px] text-tx-tertiary font-normal">/{item.id}</span></div>
+              {item.description && (
+                <div className="text-[11px] text-tx-tertiary leading-4 truncate">
+                  {item.description}
+                </div>
+              )}
+            </div>
+            <div className="text-[10px] text-tx-tertiary shrink-0 mt-0.5">{item.category}</div>
+          </div>
+        ))}
+      </div>
+    </div>,
+    document.body,
+  );
+};

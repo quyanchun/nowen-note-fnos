@@ -1,0 +1,35 @@
+name: ✨ 功能建议
+description: 想增加什么功能？一句话也可以
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢建议！不用考虑怎么实现，只需要告诉我们你想要什么。
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望增加或改进什么？
+      description: 简单说明想要的功能，以及它能解决什么问题。
+      placeholder: 例如：希望支持笔记本分享，这样可以一次分享整个目录，不用逐篇操作。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 主要用在哪？
+      options:
+        - 全平台
+        - 电脑端
+        - 手机端
+        - Docker / 自建服务
+        - 不确定
+
+  - type: textarea
+    id: reference
+    attributes:
+      label: 截图、录屏或参考产品（可选）
+      description: 有参考效果可以直接拖进来，没有可留空。
+      placeholder: 把截图、录屏、链接或补充说明放这里……

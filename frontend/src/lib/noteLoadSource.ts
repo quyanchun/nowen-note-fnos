@@ -1,0 +1,148 @@
+import { getOfflineQueueStorageKey } from "./offlineScope";
+import { ConversionCleanupError } from "./encryptedNotes/conversionCoordination";
+import { assertConversionNote } from "./encryptedNotes/conversionBarrier";
+import type { Note } from "@/types";
+import { pendingEncryptedNote } from "./encryptedNotes/pendingNote";
+import { getBaseUrl } from "@/lib/api";
+import { isAndroidNativeRuntime, isMobileLocalMode } from "./mobileLocalMode";
+import {
+  getNote as getCachedNote,
+  isNoteDetailCached,
+  putNote,
+  type CachedNote,
+} from "@/lib/localStore";
+import {
+  hasPersistentNoteAttachmentReference,
+  primeNoteAttachmentAccess,
+} from "@/lib/noteAttachmentAccessPriming";
+import {
+  reportTransientNoteImageSource,
+  stabilizeNoteMutationPayload,
+} from "@/lib/noteContentPersistence";
+
+export interface CacheFirstNoteLoadOptions {
+  noteId: string;
+  fetchRemote: () => Promise<Note>;
+  onRevalidated?: (remote: Note, cached: CachedNote) => void | Promise<void>;
+  /** Authorize before exposing any locally cached text on an online Web session. */
+  verifyCachedAccess?: () => Promise<void>;
+  /**
+   * Optional runtime preparation hook. Custom callers may still return a Promise when they truly
+   * need a prerequisite before publishing the note. The default attachment preparation is now
+   * deliberately fire-and-forget so note text is never held behind media authorization/network IO.
+   */
+  beforeUseCached?: (cached: CachedNote) => void | Promise<void>;
+}
+
+export interface RevalidatedNoteGuardInput {
+  current: Note | null | undefined;
+  cached: Note;
+  remote: Note;
+  hasDraft: boolean;
+  pendingNoteId: string | null;
+}
+
+export function canApplyRevalidatedNote({
+  current,
+  cached,
+  remote,
+  hasDraft,
+  pendingNoteId,
+}: RevalidatedNoteGuardInput): boolean {
+  if (!current || hasDraft || pendingNoteId) return false;
+  if (current.id !== cached.id || remote.id !== cached.id) return false;
+  if (remote.version <= cached.version) return false;
+
+  return current.version === cached.version
+    && current.title === cached.title
+    && current.content === cached.content
+    && current.contentText === cached.contentText
+    && current.updatedAt === cached.updatedAt;
+}
+
+async function persistDetail(note: Note): Promise<void> {
+  try {
+    const stableNote = stabilizeNoteMutationPayload(note);
+    await putNote({ ...stableNote, __detailCached: true });
+  } catch (error) {
+    reportTransientNoteImageSource(error, { operation: "persistNoteDetail", noteId: note.id });
+  }
+}
+
+function prepareNoteRuntime(note: CachedNote): void {
+  if (!hasPersistentNoteAttachmentReference(note.content)) return;
+  // Media access is a renderer enhancement, not a prerequisite for reading note text. Starting
+  // it here keeps the request warm while allowing cache/remote content to become visible at once.
+  void primeNoteAttachmentAccess(note.id, getBaseUrl()).catch((error) => {
+    console.warn("[noteLoadSource] attachment preparation failed:", error);
+  });
+}
+
+export async function loadNoteCacheFirst({
+  noteId,
+  fetchRemote,
+  onRevalidated,
+  verifyCachedAccess,
+  beforeUseCached = prepareNoteRuntime,
+}: CacheFirstNoteLoadOptions): Promise<Note> {
+  const scope = getOfflineQueueStorageKey();
+  const assertCurrent = (note: Note) => {
+    if (scope !== getOfflineQueueStorageKey()) throw new ConversionCleanupError("scope_changed");
+    assertConversionNote(note);
+  };
+  // 登录态 Android 的 Native API 已检查目录密码。不能在检查前展示另一份 IDB/队列缓存。
+  const nativeAccountRead = isAndroidNativeRuntime() && !isMobileLocalMode();
+  const pending = nativeAccountRead ? null : pendingEncryptedNote(noteId);
+  if (pending) return pending;
+  const cached = nativeAccountRead ? null : await getCachedNote(noteId);
+  if (cached && isNoteDetailCached(cached)) {
+    // A folder may have been locked or its password changed since IDB cached
+    // this plaintext. Validate the server ACL first, not asynchronously after
+    // rendering it. A 404/403 must never fall back to stale protected content.
+    if (verifyCachedAccess && (typeof navigator === "undefined" || navigator.onLine)) {
+      await verifyCachedAccess();
+      assertCurrent(cached);
+    }
+    // Start freshness revalidation immediately. Runtime/media preparation is best-effort by default;
+    // custom callers can still explicitly provide a blocking prerequisite through beforeUseCached.
+    void fetchRemote()
+      .then(async (remote) => {
+        assertCurrent(remote);
+        await persistDetail(remote);
+        try {
+          await beforeUseCached(remote);
+        } catch (error) {
+          console.warn("[noteLoadSource] revalidated-note preparation failed:", error);
+        }
+        assertCurrent(remote);
+        await onRevalidated?.(remote, cached);
+      })
+      .catch((error) => {
+        console.warn("[noteLoadSource] background revalidation failed:", error);
+      });
+
+    try {
+      await beforeUseCached(cached);
+    } catch (error) {
+      // Cached notes must remain available offline. The background revalidation above may still
+      // recover the runtime prerequisite when connectivity returns.
+      console.warn("[noteLoadSource] cached-note preparation failed:", error);
+    }
+    assertCurrent(cached);
+    return cached;
+  }
+
+  const remote = await fetchRemote();
+  assertCurrent(remote);
+  await persistDetail(remote);
+  try {
+    // The default preparation starts signed-URL priming but resolves synchronously. This keeps
+    // first-load text responsive while image/video NodeViews subscribe to the access bridge and
+    // upgrade themselves as soon as the signed URL map arrives.
+    await beforeUseCached(remote);
+  } catch (error) {
+    console.warn("[noteLoadSource] remote-note preparation failed:", error);
+  }
+  assertCurrent(remote);
+  return remote;
+}

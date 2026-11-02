@@ -1,0 +1,231 @@
+import { getBaseUrl } from "@/lib/api.impl";
+import type {
+  TiptapPatchJsonNode,
+  TiptapPatchTextBlockNode,
+} from "@/lib/tiptapBlockPatchNode";
+import type { MarkdownBlockPatchOperation } from "@/lib/markdownBlockPatch";
+
+export type BlockPatchBlockType =
+  | "heading"
+  | "paragraph"
+  | "listItem"
+  | "taskItem"
+  | "blockquote"
+  | "codeBlock"
+  | "table"
+  | "video"
+  | "blockEmbed"
+  | "mathBlock";
+
+export type BlockPatchCreatableBlockType = Exclude<BlockPatchBlockType, "table" | "video" | "blockEmbed" | "mathBlock">;
+
+export interface BlockPatchListItemNode {
+  type: "listItem" | "taskItem";
+  attrs: {
+    blockId: string;
+    checked?: boolean;
+  };
+  content: [TiptapPatchTextBlockNode];
+}
+
+export type BlockPatchOperation =
+  | {
+      type: "create";
+      scope?: undefined;
+      clientId?: string;
+      blockId?: string;
+      blockType?: BlockPatchCreatableBlockType;
+      text?: string;
+      afterBlockId?: string;
+    }
+  | {
+      type: "create";
+      scope: "listItem";
+      clientId?: string;
+      blockId: string;
+      targetBlockId: string;
+      position: "before" | "after";
+      node: BlockPatchListItemNode;
+    }
+  | {
+      type: "update";
+      blockId: string;
+      text: string;
+    }
+  | {
+      type: "replace";
+      blockId: string;
+      node: TiptapPatchJsonNode;
+    }
+  | {
+      type: "delete";
+      scope?: undefined;
+      blockId: string;
+    }
+  | {
+      type: "delete";
+      scope: "listItem";
+      blockId: string;
+    }
+  | {
+      type: "move";
+      scope?: undefined;
+      blockId: string;
+      targetBlockId: string;
+      position?: "before" | "after";
+    }
+  | {
+      type: "move";
+      scope: "listItem";
+      blockId: string;
+      targetBlockId: string;
+      position: "before" | "after" | "inside";
+    }
+  | {
+      type: "lift";
+      scope: "listItem";
+      blockId: string;
+      position: "before" | "after";
+    };
+
+export interface BlockPatchRequest {
+  expectedNoteVersion: number;
+  expectedStructureVersion?: number;
+  expectedBlockVersions?: Record<string, number>;
+  /** Keep the same ID when retrying an uncertain request. */
+  operationId: string;
+  operations: BlockPatchOperation[];
+}
+
+export interface MarkdownBlockPatchRequest {
+  expectedNoteVersion: number;
+  expectedStructureVersion?: number;
+  expectedBlockVersions?: Record<string, number>;
+  operationId: string;
+  operations: MarkdownBlockPatchOperation[];
+}
+
+export interface BlockPatchIndexRow {
+  noteId: string;
+  blockId: string;
+  blockType: BlockPatchBlockType;
+  parentBlockId: string | null;
+  blockOrder: number;
+  plainText: string;
+  contentHash: string;
+  path: string;
+  startOffset: number | null;
+  endOffset: number | null;
+}
+
+export interface BlockPatchResult {
+  success: true;
+  noteId: string;
+  title: string;
+  version: number;
+  updatedAt: string;
+  content: string;
+  contentText: string;
+  contentFormat: string;
+  notebookId: string | null;
+  operationCount: number;
+  affectedBlockIds: string[];
+  deletedBlockIds: string[];
+  createdBlocks: Array<{
+    operationIndex: number;
+    clientId: string | null;
+    blockId: string;
+  }>;
+  blocks: BlockPatchIndexRow[];
+  /** Whether the server updated a proven-safe subset or rebuilt every note index row. */
+  indexUpdateMode: "incremental" | "full";
+  /** Distinguishes leaf, top-level, list-subtree/list-structural updates and full fallback. */
+  indexUpdateKind:
+    | "leaf"
+    | "structural"
+    | "mixed"
+    | "list-subtree"
+    | "list-structural"
+    | "list-mixed"
+    | "full";
+  /** Block IDs inserted, updated or deleted by index synchronization. */
+  indexedBlockIds: string[];
+  contentChangedByNormalization: boolean;
+  blockVersion?: number;
+  structureVersion?: number;
+  idempotentReplay?: boolean;
+}
+
+export class BlockPatchRequestError extends Error {
+  code?: string;
+  status?: number;
+  currentVersion?: number;
+}
+
+export function createBlockPatchOperationId(): string {
+  const randomUUID = typeof crypto !== "undefined" ? crypto.randomUUID?.bind(crypto) : undefined;
+  if (randomUUID) return `block-patch-${randomUUID()}`;
+  return `block-patch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
+ * Send one confirmed, idempotent Tiptap block transaction.
+ *
+ * This intentionally bypasses the optimistic offline mutation queue. A caller must receive the
+ * authoritative version before applying a later patch, otherwise operation order would become
+ * ambiguous after reconnect.
+ */
+async function patchBlocks(
+  noteId: string,
+  input: BlockPatchRequest | MarkdownBlockPatchRequest,
+): Promise<BlockPatchResult> {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), 30_000);
+  const token = localStorage.getItem("nowen-token");
+
+  try {
+    const response = await fetch(
+      `${getBaseUrl()}/blocks/${encodeURIComponent(noteId)}/patch`,
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(input),
+      },
+    );
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) {
+      const error = new BlockPatchRequestError(
+        typeof payload.error === "string" ? payload.error : `HTTP ${response.status}`,
+      );
+      error.code = typeof payload.code === "string" ? payload.code : undefined;
+      error.status = response.status;
+      error.currentVersion = typeof payload.currentVersion === "number"
+        ? payload.currentVersion
+        : undefined;
+      throw error;
+    }
+    return payload as unknown as BlockPatchResult;
+  } catch (error) {
+    if ((error as { name?: string })?.name === "AbortError") {
+      const timeoutError = new BlockPatchRequestError("块级保存超时，请检查网络后使用同一 operationId 重试");
+      timeoutError.code = "BLOCK_PATCH_TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
+}
+
+export function patchTiptapBlocks(noteId: string, input: BlockPatchRequest): Promise<BlockPatchResult> {
+  return patchBlocks(noteId, input);
+}
+
+/** 发送一个已确认且幂等的 Markdown Block Patch 事务。 */
+export function patchMarkdownBlocks(noteId: string, input: MarkdownBlockPatchRequest): Promise<BlockPatchResult> {
+  return patchBlocks(noteId, input);
+}

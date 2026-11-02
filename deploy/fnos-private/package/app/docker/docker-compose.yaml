@@ -1,0 +1,30 @@
+services:
+  nowen-private:
+    image: {{IMAGE}}
+    pull_policy: never
+    container_name: nowen-note-private
+    user: "${TRIM_UID:?fnOS app UID is required}:${TRIM_GID:?fnOS app GID is required}"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:{{PORT}}:3001"
+      - "{{WEB_BIND}}:{{WEB_PORT}}:3001"
+    volumes:
+      # Exactly one data-share is declared, so this value is one absolute directory.
+      - "${TRIM_DATA_SHARE_PATHS:?fnOS data-share path is required}:/app/data"
+      - "${TRIM_APPDEST:?fnOS app target is required}:/app/fnos"
+    environment:
+      NODE_ENV: production
+      DB_PATH: /app/data/nowen-note.db
+      PORT: "3001"
+      TZ: Asia/Shanghai
+      ATTACHMENT_LEGACY_PUBLIC_URL: "false"
+      DISABLE_MDNS: "1"
+      NOWEN_SECURE_BOOTSTRAP: "1"
+      NOWEN_FNOS_SOCKET: /app/fnos/app.sock
+      NOWEN_CLIPBOARD_PUBLIC_URL: {{CLIPBOARD_PUBLIC_URL}}
+      NOWEN_WEB_PUBLIC_URL: {{WEB_PUBLIC_URL}}
+      NOWEN_FNOS_PORTAL_URL: {{PORTAL_URL}}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

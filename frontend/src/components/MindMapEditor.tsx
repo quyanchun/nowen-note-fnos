@@ -1,0 +1,3623 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import {
+  BrainCircuit, Plus, Edit2,
+  ZoomIn, ZoomOut, Maximize2, Minimize2, Scan,
+  Loader2, Check, Map as MapIcon, Image, FileImage, FileDown, MoreHorizontal,
+  Undo2, Redo2, PanelLeft, ChevronLeft, ChevronRight, ChevronDown, Link as LinkIcon, StickyNote, ExternalLink, FileText, ArrowDownToLine, Spline, Square, Search as SearchIcon, ChevronUp, AlertTriangle, X, Copy
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { api } from "@/lib/api";
+import MindMapOverview from "@/components/MindMapOverview";
+import { knowledgeTreeApi, type KnowledgeTreeNode } from "@/lib/knowledgeTreeApi";
+import { loadMobileKnowledgeTreeRecentEntries, saveMobileKnowledgeTreeRecentEntries, upsertMobileKnowledgeTreeRecentEntry } from "@/lib/mobileKnowledgeTree";
+import { MindMap, MindMapListItem, MindMapNode, MindMapData, MindMapRelation, MindMapBoundary, MindMapViewport } from "@/types";
+import { cn } from "@/lib/utils";
+import { toast } from "@/lib/toast";
+import { assertExportCanvasHasContent, EXPORT_CANVAS_CONTENT_ERROR } from "@/lib/exportCanvasGuard";
+import { useMindMapHistory } from "@/hooks/useMindMapHistory";
+import { buildXmindContent, buildZip, downloadBlob } from "@/lib/mindmapExport";
+import { markdownToMindMapData, mindMapDataToMarkdown } from "@/lib/mindmapTransform";
+import { computeLayoutBounds, fitMindMapToViewport, isValidViewport } from "@/lib/mindmapViewport";
+import { dispatchDocumentMindMapChanged } from "@/lib/documentMindMapRuntime";
+import {
+  buildMindMapDeepLinkUrl,
+  pushMindMapAppPath,
+  replaceMindMapAppPath,
+} from "@/lib/mindMapDeepLink";
+/* ===== macOS-style Mindmap Theme Tokens ===== */
+const MT = {
+  canvasBg: "var(--mm-canvas-bg, #f5f5f7)",
+  canvasDot: "var(--mm-canvas-dot, rgba(0,0,0,0.06))",
+  toolbarBtn: "p-1.5 rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.06] text-tx-secondary transition-colors duration-150 ease-out w-8 h-8 flex items-center justify-center",
+  toolbarBtnActive: "bg-black/[0.06] dark:bg-white/[0.08] text-accent-primary",
+  toolbarBtnDisabled: "opacity-30 pointer-events-none",
+  nodeShadow: "var(--mm-node-shadow, 0 1px 3px rgba(0,0,0,0.06))",
+  nodeShadowHover: "var(--mm-node-shadow-hover, 0 2px 8px rgba(0,0,0,0.10))",
+  nodeRadius: "12px",
+  nodeSelectedRing: "ring-2 ring-blue-400/40 dark:ring-blue-500/30 ring-offset-1 dark:ring-offset-zinc-900",
+  rootBg: "linear-gradient(135deg, #4f46e5 0%, #6366f1 100%)",
+  rootText: "#ffffff",
+  rootShadow: "0 2px 12px rgba(99,102,241,0.25)",
+  edgeStroke: "var(--mm-edge-stroke, rgba(148,163,184,0.5))",
+  edgeWidth: 1.5,
+  menuCls: "rounded-[12px] shadow-lg shadow-black/[0.08] dark:shadow-black/30 border border-black/[0.06] dark:border-white/[0.08] py-1",
+  menuBgCls: "bg-app-elevated",
+  menuHover: "hover:bg-black/[0.04] dark:hover:bg-white/[0.06]",
+  menuDivider: "h-px bg-black/[0.06] dark:bg-white/[0.08] my-1",
+} as const;
+
+
+/* ===== 布局算法：计算树节点的 x,y 位置 ===== */
+interface LayoutNode {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  depth: number;
+  collapsed: boolean;
+  children: LayoutNode[];
+  parent: LayoutNode | null;
+}
+
+const NODE_H = 36;
+const NODE_MIN_W = 80;
+const NODE_MAX_W = 520;
+const NODE_CHAR_W = 14;
+const H_GAP = 50;
+const V_GAP = 12;
+
+function clampNodeWidth(width: number): number {
+  return Math.max(NODE_MIN_W, Math.min(Math.round(width), NODE_MAX_W));
+}
+
+function measureNode(node: Pick<MindMapNode, "text" | "width">): { width: number; height: number } {
+  const autoWidth = Math.max(NODE_MIN_W, Math.min(node.text.length * NODE_CHAR_W + 32, 260));
+  const width = typeof node.width === "number" && Number.isFinite(node.width)
+    ? clampNodeWidth(node.width)
+    : autoWidth;
+  return { width, height: NODE_H };
+}
+
+function buildLayout(node: MindMapNode, depth: number, parent: LayoutNode | null): LayoutNode {
+  const { width, height } = measureNode(node);
+  const ln: LayoutNode = {
+    id: node.id,
+    text: node.text,
+    x: 0,
+    y: 0,
+    width,
+    height,
+    depth,
+    collapsed: !!node.collapsed,
+    children: [],
+    parent,
+  };
+  if (!node.collapsed && node.children) {
+    ln.children = node.children.map((c) => buildLayout(c, depth + 1, ln));
+  }
+  return ln;
+}
+
+export function countMindMapDescendants(node: Pick<MindMapNode, "children">): number {
+  return node.children.reduce(
+    (count, child) => count + 1 + countMindMapDescendants(child),
+    0,
+  );
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && !!target.closest("input, textarea, [contenteditable='true']");
+}
+
+type MindMapSelectionRect = { x: number; y: number; width: number; height: number };
+type ClientRectLike = { left: number; top: number; right: number; bottom: number };
+
+export function getNodeScreenRect(
+  node: Pick<LayoutNode, "x" | "y" | "width" | "height">,
+  pan: { x: number; y: number },
+  zoom: number,
+): MindMapSelectionRect {
+  return {
+    x: pan.x + node.x * zoom,
+    y: pan.y + node.y * zoom,
+    width: node.width * zoom,
+    height: node.height * zoom,
+  };
+}
+
+export function rectsIntersect(a: MindMapSelectionRect, b: MindMapSelectionRect): boolean {
+  return (
+    a.x <= b.x + b.width &&
+    a.x + a.width >= b.x &&
+    a.y <= b.y + b.height &&
+    a.y + a.height >= b.y
+  );
+}
+
+export function hitTestSelectionRect(
+  selectionRect: MindMapSelectionRect,
+  nodes: Array<Pick<LayoutNode, "id" | "x" | "y" | "width" | "height">>,
+  pan: { x: number; y: number },
+  zoom: number,
+): string[] {
+  return nodes
+    .filter((node) => rectsIntersect(selectionRect, getNodeScreenRect(node, pan, zoom)))
+    .map((node) => node.id);
+}
+
+export function createClientSelectionRect(
+  startClientX: number,
+  startClientY: number,
+  endClientX: number,
+  endClientY: number,
+): ClientRectLike {
+  return {
+    left: Math.min(startClientX, endClientX),
+    top: Math.min(startClientY, endClientY),
+    right: Math.max(startClientX, endClientX),
+    bottom: Math.max(startClientY, endClientY),
+  };
+}
+
+export function rectsIntersectClient(a: ClientRectLike, b: ClientRectLike): boolean {
+  return (
+    a.left <= b.right &&
+    a.right >= b.left &&
+    a.top <= b.bottom &&
+    a.bottom >= b.top
+  );
+}
+
+export function hitTestSelectionElements(
+  selectionClientRect: ClientRectLike,
+  elements: Array<Pick<HTMLElement, "dataset" | "getBoundingClientRect">>,
+): string[] {
+  return elements
+    .filter((el) => {
+      const rect = el.getBoundingClientRect();
+      return rectsIntersectClient(selectionClientRect, {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+      });
+    })
+    .map((el) => el.dataset.mindmapNodeId)
+    .filter(Boolean) as string[];
+}
+
+export type MindMapMoveRejectReason = "self" | "target-selected" | "descendant";
+export type MindMapDropPlacement = "before" | "inside" | "after";
+
+export function resolveMindMapDropPlacement(
+  clientY: number,
+  top: number,
+  height: number,
+): MindMapDropPlacement {
+  if (!Number.isFinite(height) || height <= 0) return "inside";
+  const ratio = (clientY - top) / height;
+  if (ratio < 0.28) return "before";
+  if (ratio > 0.72) return "after";
+  return "inside";
+}
+
+function cloneMindMapNode(node: MindMapNode): MindMapNode {
+  return {
+    ...node,
+    children: node.children.map(cloneMindMapNode),
+  };
+}
+
+export function isNodeDescendant(root: MindMapNode, ancestorId: string, checkId: string): boolean {
+  if (ancestorId === checkId) return false;
+  if (root.id === ancestorId) {
+    const walk = (node: MindMapNode): boolean =>
+      node.id === checkId || node.children.some(walk);
+    return root.children.some(walk);
+  }
+  return root.children.some((child) => isNodeDescendant(child, ancestorId, checkId));
+}
+
+export function hasSelectedAncestor(root: MindMapNode, nodeId: string, selected: Set<string>): boolean {
+  const walk = (node: MindMapNode, ancestorSelected: boolean): boolean => {
+    if (node.id === nodeId) return ancestorSelected;
+    return node.children.some((child) => walk(child, ancestorSelected || selected.has(node.id)));
+  };
+  return walk(root, false);
+}
+
+export function collectNodesInTreeOrder(root: MindMapNode, ids: Set<string>): MindMapNode[] {
+  const nodes: MindMapNode[] = [];
+  const walk = (node: MindMapNode) => {
+    if (ids.has(node.id)) nodes.push(cloneMindMapNode(node));
+    node.children.forEach(walk);
+  };
+  walk(root);
+  return nodes;
+}
+
+export function getMovableNodeIdsForDrag(
+  root: MindMapNode,
+  sourceId: string,
+  targetId: string,
+  selectedNodeIds: string[],
+): { nodeIds: string[]; reason?: MindMapMoveRejectReason } {
+  if (sourceId === targetId) return { nodeIds: [], reason: "self" };
+
+  const rawIds = selectedNodeIds.length > 1 && selectedNodeIds.includes(sourceId)
+    ? selectedNodeIds
+    : [sourceId];
+
+  if (rawIds.includes(targetId)) {
+    return { nodeIds: [], reason: "target-selected" };
+  }
+
+  const selected = new Set(rawIds.filter((id) => id !== "root" && id !== targetId));
+  if (selected.size === 0) return { nodeIds: [] };
+
+  for (const id of selected) {
+    if (isNodeDescendant(root, id, targetId)) {
+      return { nodeIds: [], reason: "descendant" };
+    }
+  }
+
+  const nodeIds = collectNodesInTreeOrder(root, selected)
+    .map((node) => node.id)
+    .filter((id) => !hasSelectedAncestor(root, id, selected));
+
+  return { nodeIds };
+}
+
+function removeMindMapNodes(root: MindMapNode, nodeIds: Set<string>): MindMapNode {
+  return {
+    ...root,
+    children: root.children
+      .filter((child) => !nodeIds.has(child.id))
+      .map((child) => removeMindMapNodes(child, nodeIds)),
+  };
+}
+
+function appendMindMapChildren(root: MindMapNode, targetId: string, children: MindMapNode[]): MindMapNode {
+  if (root.id === targetId) {
+    return {
+      ...root,
+      collapsed: false,
+      children: [...root.children, ...children],
+    };
+  }
+  return {
+    ...root,
+    children: root.children.map((child) => appendMindMapChildren(child, targetId, children)),
+  };
+}
+
+function containsMindMapNode(root: MindMapNode, nodeId: string): boolean {
+  return root.id === nodeId || root.children.some((child) => containsMindMapNode(child, nodeId));
+}
+
+function insertMindMapNodesRelative(
+  root: MindMapNode,
+  targetId: string,
+  nodes: MindMapNode[],
+  placement: Exclude<MindMapDropPlacement, "inside">,
+): MindMapNode {
+  const targetIndex = root.children.findIndex((child) => child.id === targetId);
+  if (targetIndex >= 0) {
+    const insertAt = placement === "before" ? targetIndex : targetIndex + 1;
+    return {
+      ...root,
+      children: [
+        ...root.children.slice(0, insertAt),
+        ...nodes,
+        ...root.children.slice(insertAt),
+      ],
+    };
+  }
+  return {
+    ...root,
+    children: root.children.map((child) =>
+      insertMindMapNodesRelative(child, targetId, nodes, placement)),
+  };
+}
+
+export function moveMindMapNodes(
+  root: MindMapNode,
+  targetId: string,
+  nodeIds: string[],
+  placement: MindMapDropPlacement = "inside",
+): MindMapNode {
+  if (!containsMindMapNode(root, targetId)) return root;
+  const movingIds = new Set(nodeIds);
+  const nodesToMove = collectNodesInTreeOrder(root, movingIds);
+  if (nodesToMove.length === 0) return root;
+
+  const newRoot = removeMindMapNodes(root, movingIds);
+  if (placement === "inside" || targetId === root.id) {
+    return appendMindMapChildren(newRoot, targetId, nodesToMove);
+  }
+  return insertMindMapNodesRelative(newRoot, targetId, nodesToMove, placement);
+}
+
+/** Shift+Tab: move a node immediately after its parent, preserving its subtree. */
+export function promoteMindMapNode(root: MindMapNode, nodeId: string): MindMapNode {
+  for (let index = 0; index < root.children.length; index++) {
+    const parent = root.children[index];
+    const childIndex = parent.children.findIndex((child) => child.id === nodeId);
+    if (childIndex >= 0) {
+      const promoted = parent.children[childIndex];
+      return {
+        ...root,
+        children: [
+          ...root.children.slice(0, index),
+          { ...parent, children: parent.children.filter((child) => child.id !== nodeId) },
+          promoted,
+          ...root.children.slice(index + 1),
+        ],
+      };
+    }
+    const updated = promoteMindMapNode(parent, nodeId);
+    if (updated !== parent) {
+      return { ...root, children: root.children.map((child, at) => at === index ? updated : child) };
+    }
+  }
+  return root;
+}
+
+/** Navigate the visible outline without selecting children hidden by a collapsed node. */
+export function navigateMindMapNode(
+  root: MindMapNode,
+  nodeId: string,
+  direction: "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight",
+): string | null {
+  const visible: Array<{ node: MindMapNode; parentId: string | null }> = [];
+  const visit = (node: MindMapNode, parentId: string | null) => {
+    visible.push({ node, parentId });
+    if (!node.collapsed) node.children.forEach((child) => visit(child, node.id));
+  };
+  visit(root, null);
+  const index = visible.findIndex(({ node }) => node.id === nodeId);
+  if (index < 0) return null;
+  if (direction === "ArrowUp") return visible[index - 1]?.node.id ?? null;
+  if (direction === "ArrowDown") return visible[index + 1]?.node.id ?? null;
+  if (direction === "ArrowLeft") return visible[index].parentId;
+  const current = visible[index].node;
+  return current.collapsed ? null : current.children[0]?.id ?? null;
+}
+
+function getSubtreeHeight(node: LayoutNode): number {
+  if (node.children.length === 0) return node.height;
+  let total = 0;
+  node.children.forEach((c, i) => {
+    total += getSubtreeHeight(c);
+    if (i > 0) total += V_GAP;
+  });
+  return Math.max(node.height, total);
+}
+
+function layoutTree(node: LayoutNode, x: number, yCenter: number) {
+  node.x = x;
+  node.y = yCenter - node.height / 2;
+  if (node.children.length === 0) return;
+
+  const childX = x + node.width + H_GAP;
+  const totalH = node.children.reduce(
+    (sum, c, i) => sum + getSubtreeHeight(c) + (i > 0 ? V_GAP : 0),
+    0
+  );
+  let cy = yCenter - totalH / 2;
+  node.children.forEach((c) => {
+    const ch = getSubtreeHeight(c);
+    layoutTree(c, childX, cy + ch / 2);
+    cy += ch + V_GAP;
+  });
+}
+
+/**
+ * Layout children to the LEFT of the parent node.
+ * Child right edge = parent.x - H_GAP; child extends leftward.
+ */
+function layoutTreeLeft(node: LayoutNode, x: number, yCenter: number) {
+  // x here is the RIGHT edge of the subtree (parent left edge)
+  node.x = x - node.width;
+  node.y = yCenter - node.height / 2;
+  if (node.children.length === 0) return;
+
+  const childRightX = x - node.width - H_GAP;
+  const totalH = node.children.reduce(
+    (sum, c, i) => sum + getSubtreeHeight(c) + (i > 0 ? V_GAP : 0),
+    0
+  );
+  let cy = yCenter - totalH / 2;
+  node.children.forEach((c) => {
+    const ch = getSubtreeHeight(c);
+    layoutTreeLeft(c, childRightX, cy + ch / 2);
+    cy += ch + V_GAP;
+  });
+}
+
+function flattenNodes(node: LayoutNode): LayoutNode[] {
+  const result: LayoutNode[] = [node];
+  node.children.forEach((c) => result.push(...flattenNodes(c)));
+  return result;
+}
+
+/* ===== 颜色方案 ===== */
+const DEPTH_COLORS = [
+  { bg: "rgb(99,102,241)", text: "#fff", border: "rgb(99,102,241)" },
+  { bg: "#f0f4ff", text: "rgb(55,65,81)", border: "#dbeafe" },
+  { bg: "#f8fafc", text: "rgb(55,65,81)", border: "#e2e8f0" },
+  { bg: "#fafafa", text: "rgb(55,65,81)", border: "#e5e7eb" },
+  { bg: "#fafafa", text: "rgb(55,65,81)", border: "#e5e7eb" },
+  { bg: "#fafafa", text: "rgb(55,65,81)", border: "#e5e7eb" },
+];
+
+const NODE_COLORS = [
+  { bg: "#6366f1", color: "#fff" },
+  { bg: "#3b82f6", color: "#fff" },
+  { bg: "#22c55e", color: "#fff" },
+  { bg: "#f59e0b", color: "#fff" },
+  { bg: "#ef4444", color: "#fff" },
+  { bg: "#8b5cf6", color: "#fff" },
+  { bg: "#ec4899", color: "#fff" },
+  { bg: "#06b6d4", color: "#fff" },
+  { bg: "#f0fdf4", color: "#374151" },
+  { bg: "#fff7ed", color: "#374151" },
+  { bg: "#faf5ff", color: "#374151" },
+  { bg: "#fef2f2", color: "#374151" },
+];
+
+/* ===== Theme templates ===== */
+interface ThemeTemplate {
+  name: string;
+  nameKey: string;
+  colors: { bg: string; text: string; border: string; accent: string }[];
+}
+const THEME_TEMPLATES: ThemeTemplate[] = [
+  { name: "Indigo", nameKey: "mindMap.themeIndigo", colors: [
+    { bg: "#6366f1", text: "#fff", border: "#4f46e5", accent: "#6366f1" },
+    { bg: "#eef2ff", text: "#374151", border: "#c7d2fe", accent: "#6366f1" },
+    { bg: "#e0e7ff", text: "#374151", border: "#a5b4fc", accent: "#6366f1" },
+  ]},
+  { name: "Emerald", nameKey: "mindMap.themeEmerald", colors: [
+    { bg: "#10b981", text: "#fff", border: "#059669", accent: "#10b981" },
+    { bg: "#ecfdf5", text: "#374151", border: "#a7f3d0", accent: "#10b981" },
+    { bg: "#d1fae5", text: "#374151", border: "#6ee7b7", accent: "#10b981" },
+  ]},
+  { name: "Sunset", nameKey: "mindMap.themeSunset", colors: [
+    { bg: "#f97316", text: "#fff", border: "#ea580c", accent: "#f97316" },
+    { bg: "#fff7ed", text: "#374151", border: "#fed7aa", accent: "#f97316" },
+    { bg: "#ffedd5", text: "#374151", border: "#fdba74", accent: "#f97316" },
+  ]},
+  { name: "Rose", nameKey: "mindMap.themeRose", colors: [
+    { bg: "#f43f5e", text: "#fff", border: "#e11d48", accent: "#f43f5e" },
+    { bg: "#fff1f2", text: "#374151", border: "#fecdd3", accent: "#f43f5e" },
+    { bg: "#ffe4e6", text: "#374151", border: "#fda4af", accent: "#f43f5e" },
+  ]},
+  { name: "Dark", nameKey: "mindMap.themeDark", colors: [
+    { bg: "#18181b", text: "#fafafa", border: "#3f3f46", accent: "#a1a1aa" },
+    { bg: "#27272a", text: "#e4e4e7", border: "#3f3f46", accent: "#a1a1aa" },
+    { bg: "#3f3f46", text: "#fafafa", border: "#52525b", accent: "#a1a1aa" },
+  ]},
+];
+
+function getNodeColor(depth: number) {
+  return DEPTH_COLORS[Math.min(depth, DEPTH_COLORS.length - 1)];
+}
+
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+export function buildMindMapExportSvg(data: MindMapData) {
+  const root = buildLayout(data.root, 0, null);
+  const treeH = getSubtreeHeight(root);
+  layoutTree(root, 0, treeH / 2);
+  const allNodes = flattenNodes(root);
+
+  const edgeList: { from: LayoutNode; to: LayoutNode }[] = [];
+  const collectEdges = (n: LayoutNode) => {
+    n.children.forEach((c) => {
+      edgeList.push({ from: n, to: c });
+      collectEdges(c);
+    });
+  };
+  collectEdges(root);
+
+  if (allNodes.length === 0) return null;
+
+  const pad = 40;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  allNodes.forEach((n) => {
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.width);
+    maxY = Math.max(maxY, n.y + n.height);
+  });
+  const w = maxX - minX + pad * 2;
+  const h = maxY - minY + pad * 2;
+
+  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="${minX - pad} ${minY - pad} ${w} ${h}" style="background:#fff">\n`;
+
+  edgeList.forEach((e) => {
+    const x1 = e.from.x + e.from.width;
+    const y1 = e.from.y + e.from.height / 2;
+    const x2 = e.to.x;
+    const y2 = e.to.y + e.to.height / 2;
+    const mx = (x1 + x2) / 2;
+    svgContent += `  <path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="rgb(203,213,225)" stroke-width="2"/>\n`;
+  });
+
+  allNodes.forEach((n) => {
+    const color = getNodeColor(n.depth);
+    const isRoot = n.depth === 0;
+    const fontSize = isRoot ? 14 : 13;
+    const fontWeight = isRoot ? 700 : 500;
+    svgContent += `  <rect x="${n.x}" y="${n.y}" width="${n.width}" height="${n.height}" rx="8" fill="${color.bg}" stroke="${color.border}" stroke-width="1.5"/>\n`;
+    svgContent += `  <text x="${n.x + 12}" y="${n.y + n.height / 2}" dominant-baseline="central" font-family="system-ui,-apple-system,sans-serif" font-size="${fontSize}" font-weight="${fontWeight}" fill="${color.text}">${escapeXml(n.text)}</text>\n`;
+  });
+
+  svgContent += `</svg>`;
+  return { svgContent, width: w, height: h };
+}
+
+/* ===== CRC-32（用于 ZIP 打包） ===== */
+const crc32Table = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) {
+      c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c;
+  }
+  return table;
+})();
+
+function crc32(data: Uint8Array): number {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < data.length; i++) {
+    crc = crc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+/* ===== Undo/Redo history ===== */
+interface HistoryEntry {
+  data: MindMapData;
+  title?: string;
+}
+const MAX_HISTORY = 50;
+
+/* ===== Marker icon SVGs ===== */
+const MARKER_SVGS: Record<string, string> = {
+  done: '<circle cx="8" cy="8" r="7" fill="#22c55e"/><path d="M5 8l2 2 4-4" stroke="white" stroke-width="1.5" fill="none"/>',
+  todo: '<circle cx="8" cy="8" r="7" fill="#e5e7eb" stroke="#9ca3af" stroke-width="1"/><path d="M5 8h6M8 5v6" stroke="#9ca3af" stroke-width="1.5" fill="none"/>',
+  "priority-high": '<circle cx="8" cy="8" r="7" fill="#ef4444"/><text x="8" y="11" text-anchor="middle" font-size="10" font-weight="bold" fill="white">!</text>',
+  warning: '<path d="M8 1l7 14H1z" fill="#f59e0b"/><text x="8" y="12" text-anchor="middle" font-size="10" font-weight="bold" fill="white">!</text>',
+  idea: '<circle cx="8" cy="8" r="7" fill="#8b5cf6"/><text x="8" y="11" text-anchor="middle" font-size="10" fill="white">★</text>',
+  pin: '<circle cx="8" cy="8" r="7" fill="#06b6d4"/><path d="M8 4v5M6 9l2 3 2-3" stroke="white" stroke-width="1.5" fill="none"/>',
+};
+
+function MarkerIcons({ markers }: { markers?: string[] }) {
+  if (!markers || markers.length === 0) return null;
+  return (
+    <span className="flex items-center gap-0.5 mr-1 shrink-0">
+      {markers.map((m) => {
+        const svg = MARKER_SVGS[m];
+        if (!svg) return null;
+        return (
+          <svg key={m} width="14" height="14" viewBox="0 0 16 16" dangerouslySetInnerHTML={{ __html: svg }} />
+        );
+      })}
+    </span>
+  );
+}
+
+/* ===== 连线组件 ===== */
+export interface MindMapEdgeGeometry {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  controlX: number;
+}
+
+/** 节点和连线共用同一份布局边界，避免宽度/方向计算分叉。 */
+export function getMindMapEdgeGeometry(
+  from: Pick<LayoutNode, "x" | "y" | "width" | "height">,
+  to: Pick<LayoutNode, "x" | "y" | "width" | "height">,
+): MindMapEdgeGeometry {
+  const toIsLeft = to.x + to.width < from.x;
+  const x1 = toIsLeft ? from.x : from.x + from.width;
+  const y1 = from.y + from.height / 2;
+  const x2 = toIsLeft ? to.x + to.width : to.x;
+  const y2 = to.y + to.height / 2;
+  return { x1, y1, x2, y2, controlX: (x1 + x2) / 2 };
+}
+
+const Edge = React.memo(function Edge({ from, to }: { from: LayoutNode; to: LayoutNode }) {
+  const { x1, y1, x2, y2, controlX: mx } = getMindMapEdgeGeometry(from, to);
+  return (
+    <path
+      d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`}
+      fill="none"
+      stroke={MT.edgeStroke}
+      strokeWidth={MT.edgeWidth}
+      vectorEffect="non-scaling-stroke"
+      shapeRendering="geometricPrecision"
+      className=""
+    />
+  );
+});
+
+/* ===== 节点组件 ===== */
+const NodeBox = React.memo(function NodeBox({
+  node, isSelected, isEditing, editValue,
+  onSelect, onDoubleClick, onEditChange, onEditSubmit,
+  onToggleCollapse, isMobile, onContextMenu, nodeData,
+  markerIcons, isSearchMatch, isSearchActive, onDragStart, onDragOver, onDragLeave, onDrop, onDragEnd,
+  isDragTarget, dragPlacement, onResizeStart, isDragging,
+  onTouchDragStart, onTouchDragMove, onTouchDragEnd,
+}: {
+  node: LayoutNode;
+  isSelected: boolean;
+  isEditing: boolean;
+  editValue: string;
+  onSelect: (e?: React.MouseEvent) => void;
+  onDoubleClick: () => void;
+  onEditChange: (v: string) => void;
+  onEditSubmit: () => void;
+  onToggleCollapse: () => void;
+  isMobile: boolean;
+  onContextMenu: (e: React.MouseEvent) => void;
+  nodeData?: MindMapNode;
+  markerIcons?: React.ReactNode;
+  isSearchMatch?: boolean;
+  isSearchActive?: boolean;
+  onDragStart?: (e: React.DragEvent) => void;
+  onDragOver?: (e: React.DragEvent) => void;
+  onDragLeave?: (e: React.DragEvent) => void;
+  onDrop?: (e: React.DragEvent) => void;
+  onDragEnd?: (e: React.DragEvent) => void;
+  isDragTarget?: boolean;
+  dragPlacement?: MindMapDropPlacement | null;
+  onResizeStart?: (e: React.PointerEvent<HTMLButtonElement>) => void;
+  isDragging?: boolean;
+  onTouchDragStart?: (point: { clientX: number; clientY: number }) => void;
+  onTouchDragMove?: (point: { clientX: number; clientY: number }) => void;
+  onTouchDragEnd?: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const color = getNodeColor(node.depth);
+  const isRoot = node.depth === 0;
+  const hasChildren = node.children.length > 0 || node.collapsed;
+  const collapsedDescendantCount = node.collapsed && nodeData
+    ? countMindMapDescendants(nodeData)
+    : 0;
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const touchDragRef = useRef<{ startX: number; startY: number; active: boolean } | null>(null);
+
+  const clearNodeLongPress = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+    useEffect(() => {
+    if (isEditing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [isEditing]);
+
+  return (
+    <g>
+      <foreignObject
+        x={node.x}
+        y={node.y}
+        width={node.width}
+        height={node.height}
+        overflow="visible"
+      >
+        <div
+          data-mindmap-node-id={node.id}
+          data-mindmap-node-depth={node.depth}
+          data-mindmap-node-surface="true"
+          data-mindmap-drop-placement={isDragTarget ? dragPlacement ?? undefined : undefined}
+          className={cn(
+            "relative flex items-center h-full px-3 rounded-[12px] cursor-pointer select-none transition-colors duration-150 ease-out text-sm font-medium whitespace-nowrap overflow-hidden group",
+            isDragging && "opacity-55 cursor-grabbing",
+            isSearchMatch && "ring-2 ring-amber-400/70",
+            isSearchActive && "ring-2 ring-amber-500 shadow-lg shadow-amber-500/20",
+            isDragTarget && dragPlacement === "inside"
+              && "ring-2 ring-emerald-500 bg-emerald-50/50 dark:bg-emerald-900/20",
+            isDragTarget && dragPlacement === "before"
+              && "before:absolute before:inset-x-1 before:top-0 before:h-0.5 before:bg-emerald-500",
+            isDragTarget && dragPlacement === "after"
+              && "after:absolute after:inset-x-1 after:bottom-0 after:h-0.5 after:bg-emerald-500",
+          )}
+          style={{
+            width: "100%",
+            height: "100%",
+            boxSizing: "border-box",
+            background: isRoot ? (nodeData?.style?.bg || MT.rootBg) : (nodeData?.style?.bg || color.bg),
+            color: isRoot ? (nodeData?.style?.color || MT.rootText) : (nodeData?.style?.color || color.text),
+            border: `1px solid ${nodeData?.style?.border || color.border}`,
+            boxShadow: isSelected
+              ? "0 0 0 2px rgba(59,130,246,0.65), 0 4px 12px rgba(59,130,246,0.18)"
+              : isRoot ? MT.rootShadow : MT.nodeShadow,
+            fontSize: isRoot ? 14 : 13,
+            fontWeight: isRoot ? 700 : 500,
+            touchAction: isMobile ? "none" : undefined,
+          }}
+          draggable={!!onDragStart && !isEditing}
+          onPointerDown={(e) => e.stopPropagation()}
+          onDragStart={onDragStart}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+          onDragEnd={onDragEnd}
+          onClick={(e) => { e.stopPropagation(); onSelect(e); }}
+          onDoubleClick={(e) => { e.stopPropagation(); onDoubleClick(); }}
+          onContextMenu={onContextMenu}
+          onTouchStart={(e) => {
+            if (!isMobile) return;
+            e.stopPropagation();
+            const touch = e.touches[0];
+            if (!touch) return;
+            clearNodeLongPress();
+            touchDragRef.current = {
+              startX: touch.clientX,
+              startY: touch.clientY,
+              active: false,
+            };
+            if (!isRoot && !isEditing && onTouchDragStart) {
+              const point = { clientX: touch.clientX, clientY: touch.clientY };
+              longPressTimer.current = setTimeout(() => {
+                longPressTimer.current = null;
+                if (!touchDragRef.current) return;
+                touchDragRef.current.active = true;
+                onSelect();
+                onTouchDragStart(point);
+                try { navigator.vibrate?.(10); } catch { /* best-effort haptic */ }
+              }, 320);
+            }
+          }}
+          onTouchMove={(e) => {
+            if (!isMobile) return;
+            e.stopPropagation();
+            const touch = e.touches[0];
+            const state = touchDragRef.current;
+            if (!touch || !state) return;
+            const dx = touch.clientX - state.startX;
+            const dy = touch.clientY - state.startY;
+            if (!state.active && dx * dx + dy * dy > 64) {
+              clearNodeLongPress();
+              return;
+            }
+            if (state.active) {
+              e.preventDefault();
+              onTouchDragMove?.({ clientX: touch.clientX, clientY: touch.clientY });
+            }
+          }}
+          onTouchEnd={(e) => {
+            if (!isMobile) return;
+            e.stopPropagation();
+            clearNodeLongPress();
+            if (touchDragRef.current?.active) {
+              e.preventDefault();
+              onTouchDragEnd?.();
+            }
+            touchDragRef.current = null;
+          }}
+          onTouchCancel={(e) => {
+            if (!isMobile) return;
+            e.stopPropagation();
+            clearNodeLongPress();
+            if (touchDragRef.current?.active) onTouchDragEnd?.();
+            touchDragRef.current = null;
+          }}
+        >
+          {markerIcons}
+          {nodeData?.link && (<a href={nodeData.link} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="inline-flex items-center mr-1 shrink-0 text-blue-500 hover:text-blue-600"><ExternalLink size={10} /></a>)}
+          {nodeData?.note && (<span className="inline-flex items-center mr-0.5 shrink-0 text-amber-500" title={nodeData.note}><StickyNote size={10} /></span>)}
+          {isEditing ? (
+            <input
+              ref={inputRef}
+              value={editValue}
+              onChange={(e) => onEditChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onEditSubmit();
+                if (e.key === "Escape") onEditSubmit();
+              }}
+              onBlur={onEditSubmit}
+              className="flex-1 bg-transparent outline-none text-inherit min-w-0"
+              style={{ fontSize: "inherit", fontWeight: "inherit" }}
+            />
+          ) : (
+            <span className="truncate">{node.text}</span>
+          )}
+          {isSelected && !isEditing && onResizeStart && (
+            <button
+              type="button"
+              data-mindmap-node-resize-handle="true"
+              aria-label="Resize node"
+              className="absolute right-1 top-1/2 h-5 w-2 -translate-y-1/2 cursor-ew-resize rounded-full border border-blue-400/70 bg-white/90 opacity-80 shadow-sm transition-opacity hover:opacity-100 dark:bg-zinc-900/90"
+              onPointerDown={onResizeStart}
+              onClick={(e) => e.stopPropagation()}
+            />
+          )}
+        </div>
+      </foreignObject>
+
+      {/* 折叠/展开按钮 */}
+      {hasChildren && !isEditing && (
+        <foreignObject
+          x={node.x + node.width - 2}
+          y={node.y + node.height / 2 - 10}
+          width={20}
+          height={20}
+        >
+          <div
+            className="w-5 h-5 rounded-full bg-white dark:bg-zinc-800 border border-black/[0.08] dark:border-white/[0.08] flex items-center justify-center cursor-pointer hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); onToggleCollapse(); }}
+          >
+            {node.collapsed ? (
+              <span className="text-tx-secondary text-[9px] font-bold">+{collapsedDescendantCount}</span>
+            ) : (
+              <span className="text-tx-secondary text-[10px] font-bold">−</span>
+            )}
+          </div>
+        </foreignObject>
+      )}
+
+    </g>
+  );
+});
+
+/* ===== 列表项组件 ===== */
+
+/* ===== Floating toolbar: HTML absolute overlay ===== */
+function FloatingToolbar({
+  position, isRoot, isMobile,
+  onAddChild, onAddSibling, onEdit, onDelete, onAddMarker, onSetLink, onSetNote, onSetColor, currentStyle, onApplyTheme, onStartRelation, onCreateBoundary, onFocusNode, onCopy, onCut, onPaste, t,
+}: {
+  position: { x: number; y: number };
+  isRoot: boolean;
+  isMobile: boolean;
+  onAddChild: () => void;
+  onAddSibling: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onAddMarker: (marker: string) => void;
+  onSetLink: (link: string) => void;
+  onSetNote: (note: string) => void;
+  onSetColor: (style: { bg: string; color: string; border: string } | undefined) => void;
+  currentStyle?: { bg?: string; color?: string; border?: string };
+  onApplyTheme: (idx: number) => void;
+  onStartRelation: () => void;
+  onCreateBoundary: () => void;
+  onFocusNode?: () => void;
+  onCopy: () => void;
+  onCut: () => void;
+  onPaste: () => void;
+  t: (key: string) => string;
+}) {
+  const [showMore, setShowMore] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
+
+  
+  useEffect(() => {
+    if (!showMore) return;
+    const close = (e: MouseEvent) => {
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) setShowMore(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [showMore]);
+
+  return (
+    <div
+      data-mindmap-floating-toolbar="true"
+      className="absolute z-40 flex items-center gap-1.5"
+      style={{ left: position.x, top: position.y, transform: "translateX(-50%)" }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <button className={cn("flex items-center gap-1 rounded-full border border-accent-primary bg-accent-primary text-tx-inverse font-medium shadow-md transition-opacity duration-150 ease-out hover:opacity-90 active:opacity-80", isMobile ? "px-3.5 py-2 text-xs" : "px-3 py-1.5 text-[11px]")}
+        onClick={(e) => { e.stopPropagation(); onAddChild(); }}>
+        <Plus size={isMobile ? 14 : 10} />
+        <span className="hidden sm:inline">{t("mindMap.addChild")}</span>
+      </button>
+      {!isRoot && (
+        <button className={cn("flex items-center gap-1 rounded-full bg-gray-100 dark:bg-white/[0.08] text-gray-700 dark:text-gray-200 font-medium hover:bg-gray-200 dark:hover:bg-white/[0.12] active:bg-gray-300 dark:active:bg-white/[0.16] transition-colors duration-150 ease-out shadow-sm border border-gray-200/80 dark:border-white/[0.08]", isMobile ? "px-3.5 py-2 text-xs" : "px-3 py-1.5 text-[11px]")}
+          onClick={(e) => { e.stopPropagation(); onAddSibling(); }}>
+          <MoreHorizontal size={isMobile ? 14 : 10} />
+          <span className="hidden sm:inline">{t("mindMap.addSibling")}</span>
+        </button>
+      )}
+      <button className={cn("flex items-center gap-1 rounded-full bg-gray-100 dark:bg-white/[0.08] text-gray-700 dark:text-gray-200 font-medium hover:bg-gray-200 dark:hover:bg-white/[0.12] active:bg-gray-300 dark:active:bg-white/[0.16] transition-colors duration-150 ease-out shadow-sm border border-gray-200/80 dark:border-white/[0.08]", isMobile ? "px-3.5 py-2 text-xs" : "px-3 py-1.5 text-[11px]")}
+        onClick={(e) => { e.stopPropagation(); onEdit(); }}>
+        <Edit2 size={isMobile ? 14 : 10} />
+        <span className="hidden sm:inline">{t("mindMap.editNode")}</span>
+      </button>
+      <div className="relative" ref={moreRef}>
+        <button className={cn("rounded-full bg-gray-100 dark:bg-white/[0.08] text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-white/[0.12] active:bg-gray-300 dark:active:bg-white/[0.16] transition-colors duration-150 ease-out shadow-sm border border-gray-200/80 dark:border-white/[0.08]", isMobile ? "p-2" : "p-1.5")}
+          onClick={(e) => { e.stopPropagation(); setShowMore(!showMore); }}>
+          <MoreHorizontal size={isMobile ? 14 : 10} />
+        </button>
+        {showMore && (
+          <div className={`absolute top-full mt-1.5 right-0 min-w-[180px] ${MT.menuCls} ${MT.menuBgCls} z-50 max-h-[300px] overflow-auto`}>
+            <div className="px-3 py-1 text-[10px] text-tx-tertiary uppercase tracking-wider">{t("mindMap.markers")}</div>
+            {[{ key: "done", labelKey: "mindMap.markerDone" }, { key: "todo", labelKey: "mindMap.markerTodo" }, { key: "priority-high", labelKey: "mindMap.markerPriorityHigh" }, { key: "warning", labelKey: "mindMap.markerWarning" }, { key: "idea", labelKey: "mindMap.markerIdea" }, { key: "pin", labelKey: "mindMap.markerPin" }].map((m) => (
+              <button key={m.key} className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+                onClick={(e) => { e.stopPropagation(); onAddMarker(m.key); setShowMore(false); }}>
+                {MARKER_SVGS[m.key] && <svg width="14" height="14" viewBox="0 0 16 16" className="shrink-0" dangerouslySetInnerHTML={{ __html: MARKER_SVGS[m.key] }} />} {t(m.labelKey)}
+              </button>
+            ))}
+            <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1" />
+            <div className="px-3 py-1 text-[10px] text-tx-tertiary uppercase tracking-wider">{t("mindMap.nodeColors")}</div>
+            <div className="flex flex-wrap gap-1 px-3 py-1">
+              {currentStyle?.bg && (
+                <button className="w-6 h-6 rounded-full border-2 border-black/20 dark:border-white/20 flex items-center justify-center text-[10px]"
+                  onClick={(e) => { e.stopPropagation(); onSetColor(undefined); setShowMore(false); }} title={t("mindMap.clearColor")}>\u2715</button>
+              )}
+              {NODE_COLORS.map((nc) => (
+                <button key={nc.bg} className="w-6 h-6 rounded-full border border-black/10 dark:border-white/10 hover:scale-110 transition-transform duration-150 ease-out"
+                  style={{ background: nc.bg }} title={nc.bg}
+                  onClick={(e) => { e.stopPropagation(); onSetColor({ bg: nc.bg, color: nc.color, border: nc.bg }); setShowMore(false); }} />
+              ))}
+            </div>
+            <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1" />
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => {
+                e.stopPropagation();
+                const link = window.prompt(t("mindMap.enterLink"), "https://");
+                if (link !== null) onSetLink(link);
+                setShowMore(false);
+              }}>
+              <LinkIcon size={14} className="text-accent-primary" /> {t("mindMap.setLink")}
+            </button>
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => {
+                e.stopPropagation();
+                const note = window.prompt(t("mindMap.enterNote"), "");
+                if (note !== null) onSetNote(note);
+                setShowMore(false);
+              }}>
+              <StickyNote size={14} className="text-amber-500" /> {t("mindMap.setNote")}
+            </button>
+            <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1" />
+            <div className="px-3 py-1 text-[10px] text-tx-tertiary uppercase tracking-wider">{t("mindMap.themes")}</div>
+            {THEME_TEMPLATES.map((theme, idx) => (
+              <button key={theme.name} className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+                onClick={(e) => { e.stopPropagation(); onApplyTheme(idx); setShowMore(false); }}>
+                <span className="flex gap-0.5">{theme.colors.map((c, ci) => <span key={ci} className="w-3 h-3 rounded-full" style={{ background: c.bg }} />)}</span>
+                {t(theme.nameKey)}
+              </button>
+            ))}
+            <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1" />
+            {onFocusNode && (
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onFocusNode(); setShowMore(false); }}>
+              <Scan size={14} className="text-emerald-500" /> {t("mindMap.focusNode")}
+            </button>
+            )}
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onCopy(); setShowMore(false); }}>
+              <span className="text-[14px]">⎘</span> {t("mindMap.copyNode")} <span className="ml-auto text-[10px] text-tx-tertiary">Ctrl+C</span>
+            </button>
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onCut(); setShowMore(false); }}>
+              <span className="text-[14px]">✂</span> {t("mindMap.cutNode")} <span className="ml-auto text-[10px] text-tx-tertiary">Ctrl+X</span>
+            </button>
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onPaste(); setShowMore(false); }}>
+              <span className="text-[14px]">⧉</span> {t("mindMap.pasteNode")} <span className="ml-auto text-[10px] text-tx-tertiary">Ctrl+V</span>
+            </button>
+            <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1" />
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onStartRelation(); setShowMore(false); }}>
+              <Spline size={14} className="text-amber-500" /> {t("mindMap.addRelation")}
+            </button>
+            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm text-tx-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onCreateBoundary(); setShowMore(false); }}>
+              <Square size={14} className="text-cyan-500" /> {t("mindMap.addBoundary")}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ===== Outline panel ===== */
+function OutlinePanel({
+  mapData, selectedNodeId, onSelectNode, onAddChild, onEdit, onToggleCollapse,
+  editNodeId, editValue, onEditChange, onEditSubmit, t,
+}: {
+  mapData: MindMapData;
+  selectedNodeId: string | null;
+  onSelectNode: (id: string) => void;
+  onAddChild: (parentId: string) => void;
+  onEdit: (nodeId: string, text: string) => void;
+  onToggleCollapse: (nodeId: string) => void;
+  editNodeId: string | null;
+  editValue: string;
+  onEditChange: (v: string) => void;
+  onEditSubmit: () => void;
+  t: (key: string) => string;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (editNodeId && inputRef.current) { inputRef.current.focus(); inputRef.current.select(); }
+  }, [editNodeId]);
+
+  const renderNode = (node: MindMapNode, depth: number) => {
+    const hasChildren = node.children && node.children.length > 0;
+    const isEditing = editNodeId === node.id;
+    const isSelected = selectedNodeId === node.id;
+    return (
+      <div key={node.id}>
+        <div className={cn("flex items-center gap-1 px-2 py-1 rounded cursor-pointer text-sm transition-colors duration-150 ease-out group",
+          isSelected && "bg-app-active text-accent-primary",
+          !isSelected && "hover:bg-black/[0.03] dark:hover:bg-white/[0.04] text-tx-primary"
+        )} style={{ paddingLeft: depth * 20 + 8 }}
+          onClick={() => onSelectNode(node.id)} onDoubleClick={() => onEdit(node.id, node.text)}>
+          {hasChildren ? (
+            <button className="p-0.5 hover:bg-black/[0.06] dark:hover:bg-white/[0.08] rounded transition-colors duration-150 ease-out"
+              onClick={(e) => { e.stopPropagation(); onToggleCollapse(node.id); }}>
+              {node.collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+            </button>
+          ) : <span className="w-4" />}
+          {isEditing ? (
+            <input ref={inputRef} value={editValue} onChange={(e) => onEditChange(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onEditSubmit(); } if (e.key === "Escape") onEditSubmit(); }}
+              onBlur={onEditSubmit} className="flex-1 min-w-0 border-b border-accent-primary bg-transparent text-sm outline-none" />
+          ) : <span className="truncate flex-1 text-xs">{node.text}</span>}
+        </div>
+        {hasChildren && !node.collapsed && <div>{node.children.map((c) => renderNode(c, depth + 1))}</div>}
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      <div className="px-3 py-2 border-b border-app-border flex items-center gap-2">
+        <PanelLeft size={14} className="text-accent-primary" />
+        <span className="text-xs font-semibold text-tx-primary">{t("mindMap.outline")}</span>
+      </div>
+      <div className="flex-1 overflow-auto p-1">{renderNode(mapData.root, 0)}</div>
+    </div>
+  );
+}
+/* ===== 主组件 ===== */
+export interface MindMapCenterProps {
+  /** 文档内弹层编辑：只打开指定源导图，不展示导图列表/文件夹。 */
+  embeddedMode?: boolean;
+  embeddedMindMapId?: string;
+  /** 从知识树打开单篇导图时，只展示主画布，保留普通路由和保存行为。 */
+  documentMode?: boolean;
+  /** 主应用路由控制：undefined=不参与；null=/mindmaps；uuid=/mindmaps/:id。 */
+  routeMindMapId?: string | null;
+  onRequestClose?: () => void;
+  onSaved?: (map: MindMap) => void;
+}
+
+type MindMapSaveConflict = {
+  localData: MindMapData;
+  title?: string;
+};
+
+export default function MindMapCenter({
+  embeddedMode = false,
+  embeddedMindMapId,
+  documentMode = false,
+  routeMindMapId,
+  onRequestClose,
+  onSaved,
+}: MindMapCenterProps = {}) {
+  const { t } = useTranslation();
+
+  // 移动端检测
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768);
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
+
+  const [maps, setMaps] = useState<MindMapListItem[]>([]);
+  const [treeNodes, setTreeNodes] = useState<KnowledgeTreeNode[]>([]);
+  const treeLoadRequestRef = useRef(0);
+  const loadTree = useCallback(async () => {
+    const requestId = ++treeLoadRequestRef.current;
+    try {
+      const result = await knowledgeTreeApi.list();
+      if (requestId === treeLoadRequestRef.current) setTreeNodes(result.nodes);
+    } catch (error) {
+      if (requestId === treeLoadRequestRef.current) setTreeNodes([]);
+      console.error("Failed to load knowledge tree for mind maps:", error);
+    }
+  }, []);
+  const [activeMap, setActiveMap] = useState<MindMap | null>(null);
+  const [mapData, setMapData] = useState<MindMapData | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [clipboard, setClipboard] = useState<{ node: MindMapNode; isCut: boolean } | null>(null);
+  const [dragNodeId, setDragNodeId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{
+    nodeId: string;
+    placement: MindMapDropPlacement;
+  } | null>(null);
+  const touchDropTargetRef = useRef<{
+    nodeId: string;
+    placement: MindMapDropPlacement;
+  } | null>(null);
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  useEffect(() => { setSelectedNodeIds([]); setClipboard(null); setFocusedNodeId(null); }, [activeMap?.id]);
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
+  const [selectionRect, setSelectionRect] = useState<null | MindMapSelectionRect>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapDataRef = useRef<MindMapData | null>(null);
+  const activeMapRef = useRef<MindMap | null>(null);
+  const viewportSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingAutoFitMapIdRef = useRef<string | null>(null);
+  const viewportUserSetRef = useRef(false);
+  const panFrameRef = useRef<number | null>(null);
+  const suppressCanvasClickRef = useRef(false);
+  const removeNodeResizeListenersRef = useRef<(() => void) | null>(null);
+  const pointerStateRef = useRef<{
+    mode: "none" | "pan" | "select";
+    pointerId: number | null;
+    startX: number;
+    startY: number;
+    panX: number;
+    panY: number;
+  }>({ mode: "none", pointerId: null, startX: 0, startY: 0, panX: 0, panY: 0 });
+  // callback ref：画布挂载后保存 DOM，触发 useEffect 绑定 non-passive wheel listener
+  const [canvasEl, setCanvasEl] = useState<HTMLDivElement | null>(null);
+  const setCanvasNode = useCallback((node: HTMLDivElement | null) => {
+    setCanvasEl(node);
+  }, []);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [showSearch, setShowSearch] = useState(false);
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<string[]>([]);
+  const [searchIndex, setSearchIndex] = useState(0);
+  const [createParentId, setCreateParentId] = useState<string | null>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const embeddedPendingSaveRef = useRef<{ data: MindMapData; title?: string } | null>(null);
+  const embeddedSaveRunningRef = useRef(false);
+  const embeddedSaveConflictRef = useRef(false);
+  const embeddedFlushRef = useRef<(() => Promise<void>) | null>(null);
+  const [saveConflict, setSaveConflict] = useState<MindMapSaveConflict | null>(null);
+  // 每次选择导图或切换目录都递增，用于丢弃已经失效的异步加载结果。
+  const mapLoadRequestRef = useRef(0);
+
+
+  // 节点搜索
+  useEffect(() => {
+    if (!searchQuery.trim() || !mapData) { setSearchResults([]); setSearchIndex(0); return; }
+    const q = searchQuery.trim().toLowerCase();
+    const results: string[] = [];
+    const walk = (n: MindMapNode) => {
+      if (n.text.toLowerCase().includes(q) || n.note?.toLowerCase().includes(q) || n.link?.toLowerCase().includes(q)) {
+        results.push(n.id);
+      }
+      n.children?.forEach(walk);
+    };
+    walk(mapData.root);
+    setSearchResults(results);
+    setSearchIndex(results.length > 0 ? 0 : -1);
+  }, [searchQuery, mapData]);
+
+  // 自动展开匹配节点的父级 + 居中
+  useEffect(() => {
+    if (searchResults.length === 0 || searchIndex < 0 || !mapData) return;
+    const targetId = searchResults[searchIndex];
+    const expandParents = (node: MindMapNode, path: MindMapNode[]): boolean => {
+      if (node.id === targetId) {
+        path.forEach(p => { if (p.collapsed) p.collapsed = false; });
+        return true;
+      }
+      return node.children?.some(c => expandParents(c, [...path, node])) ?? false;
+    };
+    const newRoot = JSON.parse(JSON.stringify(mapData.root));
+    expandParents(newRoot, []);
+    if (JSON.stringify(newRoot) !== JSON.stringify(mapData.root)) {
+      setMapData({ ...mapData, root: newRoot });
+    }
+    const targetNode = layoutNodes.find(n => n.id === targetId);
+    if (targetNode && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect();
+      const cx = targetNode.x + targetNode.width / 2;
+      const cy = targetNode.y + targetNode.height / 2;
+      setPan({ x: rect.width / 2 - cx * zoom, y: rect.height / 2 - cy * zoom });
+    }
+    setSelectedNodeId(targetId);
+  }, [searchIndex, searchResults]);
+
+  // Ctrl+F 打开搜索
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f' && activeMap) {
+        e.preventDefault();
+        setShowSearch(true);
+        setTimeout(() => searchInputRef.current?.focus(), 50);
+      }
+      if (e.key === 'Escape' && showSearch) {
+        setShowSearch(false);
+        setSearchQuery("");
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [showSearch, activeMap]);
+
+  // 加载列表
+  const loadMaps = useCallback(async () => {
+    try {
+      const data = await api.getMindMaps();
+      setMaps(data);
+      return data;
+    } catch (err) {
+      console.error("Failed to load mindmaps:", err);
+      return null;
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (embeddedMode) {
+      setIsLoading(false);
+      return;
+    }
+    loadMaps();
+    void loadTree();
+  }, [embeddedMode, loadMaps, loadTree]);
+
+  // 切换目录后不保留上一个导图，避免用户误以为目录没有切换成功。
+  // 同时递增请求序号，让切换前发出的 getMindMap 请求即使晚返回也不能恢复旧内容。
+  const clearActiveMap = useCallback(() => {
+    mapLoadRequestRef.current += 1;
+    setActiveMap(null);
+    setMapData(null);
+    setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    setEditingNodeId(null);
+    setFocusedNodeId(null);
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchResults([]);
+    setSearchIndex(0);
+  }, []);
+
+  useEffect(() => {
+    if (embeddedMode) return;
+    const onTreeChanged = () => {
+      void loadTree();
+      void loadMaps().then((current) => {
+        if (activeMap && current && !current.some((map) => map.id === activeMap.id)) clearActiveMap();
+      });
+    };
+    window.addEventListener("nowen:knowledge-tree-changed", onTreeChanged);
+    return () => window.removeEventListener("nowen:knowledge-tree-changed", onTreeChanged);
+  }, [activeMap, clearActiveMap, embeddedMode, loadMaps, loadTree]);
+
+  // 工作区切换：清空当前打开的导图 + 重拉列表，避免显示其他 scope 的图
+  useEffect(() => {
+    const onWs = () => {
+      clearActiveMap();
+      setTreeNodes([]);
+      loadMaps();
+      void loadTree();
+    };
+    window.addEventListener("nowen:workspace-changed", onWs);
+    return () => window.removeEventListener("nowen:workspace-changed", onWs);
+  }, [clearActiveMap, loadMaps, loadTree]);
+
+  // 选择一个导图
+  // 收藏/取消收藏
+  const handleToggleStar = useCallback(async (mapId: string) => {
+    try {
+      const updated = await api.toggleStarMindMap(mapId);
+      setMaps((prev) => prev.map((m) => m.id === mapId ? { ...m, starred: (updated as any).starred } : m));
+    } catch (err) {
+      console.error("Failed to toggle star:", err);
+    }
+  }, []);
+
+  const handleSelect = useCallback(async (id: string) => {
+    const requestId = ++mapLoadRequestRef.current;
+    try {
+      const map = await api.getMindMap(id);
+      if (requestId !== mapLoadRequestRef.current) return false;
+      setActiveMap(map);
+      activeMapRef.current = map;
+      try {
+        const parsed = JSON.parse(map.data);
+        setMapData(parsed);
+        mapDataRef.current = parsed;
+        setLayoutMode(parsed.layout || "right");
+        if (parsed.viewport?.userSet && isValidViewport(parsed.viewport)) {
+          setPan({ x: parsed.viewport.x, y: parsed.viewport.y });
+          setZoom(parsed.viewport.zoom);
+          viewportUserSetRef.current = true;
+          pendingAutoFitMapIdRef.current = null;
+        } else {
+          setPan({ x: 0, y: 0 });
+          setZoom(1);
+          viewportUserSetRef.current = false;
+          pendingAutoFitMapIdRef.current = map.id;
+        }
+        // Initialize history
+        const entry: HistoryEntry = { data: JSON.parse(JSON.stringify(parsed)) };
+        historyRef.current = { stack: [entry], idx: 0 };
+        setHistory([entry]);
+        setHistoryIndex(0);
+      } catch {
+        const fallback = { root: { id: "root", text: map.title, children: [] } };
+        setMapData(fallback);
+        mapDataRef.current = fallback;
+        setPan({ x: 0, y: 0 });
+        setZoom(1);
+        viewportUserSetRef.current = false;
+        pendingAutoFitMapIdRef.current = map.id;
+      }
+      setSelectedNodeId(null);
+      setSelectedNodeIds([]);
+      setEditingNodeId(null);
+      if (!embeddedMode) {
+        saveMobileKnowledgeTreeRecentEntries(upsertMobileKnowledgeTreeRecentEntry(
+          loadMobileKnowledgeTreeRecentEntries(), `mindmap:${map.id}`,
+        ));
+        pushMindMapAppPath(map.id);
+      }
+      return true;
+    } catch (err) {
+      console.error("Failed to load mindmap:", err);
+      if (!embeddedMode) {
+        toast.error("思维导图不存在、已删除或当前账号无权访问");
+        replaceMindMapAppPath(null);
+      }
+      return false;
+    }
+  }, [embeddedMode]);
+
+  useEffect(() => {
+    if (!embeddedMode || !embeddedMindMapId) return;
+    void handleSelect(embeddedMindMapId);
+  }, [embeddedMindMapId, embeddedMode, handleSelect]);
+
+
+  useEffect(() => {
+    if (embeddedMode || routeMindMapId === undefined) return;
+    if (routeMindMapId === null) {
+      if (activeMapRef.current) clearActiveMap();
+      return;
+    }
+    if (activeMapRef.current?.id === routeMindMapId) return;
+    void handleSelect(routeMindMapId);
+  }, [clearActiveMap, embeddedMode, handleSelect, routeMindMapId]);
+
+  // 监听来自笔记编辑器的"保存为思维导图"事件 + sessionStorage 持久化
+  useEffect(() => {
+    if (embeddedMode) return;
+    const handler = (e: Event) => {
+      const id = (e as CustomEvent).detail?.id;
+      if (id) {
+        sessionStorage.setItem("pendingOpenMindMapId", id);
+        loadMaps().then(() => handleSelect(id));
+      }
+    };
+    window.addEventListener("nowen:open-mindmap", handler);
+
+    // 组件挂载时检查是否有待打开的导图（从笔记编辑器保存后切换过来的）
+    const pendingId = sessionStorage.getItem("pendingOpenMindMapId");
+    if (pendingId) {
+      sessionStorage.removeItem("pendingOpenMindMapId");
+      loadMaps().then(() => handleSelect(pendingId));
+    }
+
+    return () => window.removeEventListener("nowen:open-mindmap", handler);
+  }, [embeddedMode, loadMaps, handleSelect]);
+
+  const applySavedMindMap = useCallback((updated: MindMap) => {
+    const titleChanged = activeMapRef.current?.title !== updated.title;
+    activeMapRef.current = updated;
+    setActiveMap((current) => current?.id === updated.id ? updated : current);
+    setMaps((prev) =>
+      prev.map((m) => (m.id === updated.id ? { ...m, title: updated.title, updatedAt: updated.updatedAt } : m))
+    );
+    dispatchDocumentMindMapChanged({ id: updated.id, kind: "updated" });
+    if (titleChanged) window.dispatchEvent(new Event("nowen:knowledge-tree-changed"));
+    onSaved?.(updated);
+  }, [onSaved]);
+
+  const flushEmbeddedSave = useCallback(async () => {
+    if (!embeddedMode || embeddedSaveRunningRef.current || embeddedSaveConflictRef.current) return;
+    const pending = embeddedPendingSaveRef.current;
+    const currentMap = activeMapRef.current;
+    if (!pending || !currentMap) return;
+
+    embeddedPendingSaveRef.current = null;
+    embeddedSaveRunningRef.current = true;
+    setIsSaving(true);
+    try {
+      const payload: { data: string; title?: string; expectedUpdatedAt: string } = {
+        data: JSON.stringify(pending.data),
+        expectedUpdatedAt: currentMap.updatedAt,
+      };
+      if (pending.title !== undefined) payload.title = pending.title;
+      const updated = await api.updateMindMap(currentMap.id, payload);
+      applySavedMindMap(updated);
+    } catch (err) {
+      const error = err as Error & { status?: number; code?: string };
+      if (error.status === 409 && error.code === "MINDMAP_CONFLICT") {
+        embeddedSaveConflictRef.current = true;
+        setSaveConflict({ localData: pending.data, title: pending.title });
+      } else {
+        console.error("Failed to save embedded mindmap:", err);
+        toast.error(error.message || "思维导图保存失败");
+        // 网络/服务端错误保留最新一次本地数据，后续编辑或手动操作仍可重试。
+        embeddedPendingSaveRef.current = pending;
+      }
+    } finally {
+      embeddedSaveRunningRef.current = false;
+      setIsSaving(false);
+      if (embeddedPendingSaveRef.current && !embeddedSaveConflictRef.current) {
+        window.setTimeout(() => { void embeddedFlushRef.current?.(); }, 0);
+      }
+    }
+  }, [applySavedMindMap, embeddedMode]);
+
+  embeddedFlushRef.current = flushEmbeddedSave;
+
+  // 自动保存
+  const triggerSave = useCallback((data: MindMapData, title?: string) => {
+    const currentMap = activeMapRef.current || activeMap;
+    if (!currentMap) return;
+
+    if (embeddedMode && embeddedSaveConflictRef.current) {
+      setSaveConflict((current) => current ? { ...current, localData: data, title } : { localData: data, title });
+      return;
+    }
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      if (embeddedMode) {
+        embeddedPendingSaveRef.current = { data, title };
+        void embeddedFlushRef.current?.();
+        return;
+      }
+
+      setIsSaving(true);
+      try {
+        const payload: { data: string; title?: string } = { data: JSON.stringify(data) };
+        if (title !== undefined) payload.title = title;
+        const updated = await api.updateMindMap(currentMap.id, payload);
+        applySavedMindMap(updated);
+      } catch (err) {
+        const error = err as Error;
+        console.error("Failed to save mindmap:", err);
+        toast.error(error.message || "思维导图保存失败");
+      } finally {
+        setIsSaving(false);
+      }
+    }, 600);
+  }, [activeMap, applySavedMindMap, embeddedMode]);
+
+  const reloadConflictVersion = useCallback(async () => {
+    const id = activeMapRef.current?.id || embeddedMindMapId;
+    if (!id) return;
+    embeddedPendingSaveRef.current = null;
+    embeddedSaveConflictRef.current = false;
+    setSaveConflict(null);
+    await handleSelect(id);
+  }, [embeddedMindMapId, handleSelect]);
+
+  const overwriteConflictVersion = useCallback(async () => {
+    const conflict = saveConflict;
+    const currentMap = activeMapRef.current;
+    if (!conflict || !currentMap) return;
+    setIsSaving(true);
+    try {
+      const payload: { data: string; title?: string } = {
+        data: JSON.stringify(conflict.localData),
+      };
+      if (conflict.title !== undefined) payload.title = conflict.title;
+      const updated = await api.updateMindMap(currentMap.id, payload);
+      embeddedSaveConflictRef.current = false;
+      setSaveConflict(null);
+      applySavedMindMap(updated);
+      setMapData(conflict.localData);
+      mapDataRef.current = conflict.localData;
+    } catch (err) {
+      const error = err as Error;
+      toast.error(error.message || "覆盖保存失败");
+    } finally {
+      setIsSaving(false);
+    }
+  }, [applySavedMindMap, saveConflict]);
+
+  // Undo/Redo
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const historyRef = useRef<{ stack: HistoryEntry[]; idx: number }>({ stack: [], idx: -1 });
+
+  const pushHistory = useCallback((data: MindMapData, title?: string) => {
+    const h = historyRef.current;
+    h.stack = h.stack.slice(0, h.idx + 1);
+    h.stack.push({ data: JSON.parse(JSON.stringify(data)), title });
+    if (h.stack.length > MAX_HISTORY) h.stack.shift();
+    h.idx = h.stack.length - 1;
+    setHistory([...h.stack]);
+    setHistoryIndex(h.idx);
+  }, []);
+
+  const canUndo = historyIndex > 0;
+  const canRedo = historyIndex < history.length - 1;
+
+  const handleUndo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.idx <= 0) return;
+    h.idx--;
+    const entry = h.stack[h.idx];
+    setMapData(entry.data);
+    setHistoryIndex(h.idx);
+    triggerSave(entry.data, entry.title);
+  }, [triggerSave]);
+
+  const handleRedo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.idx >= h.stack.length - 1) return;
+    h.idx++;
+    const entry = h.stack[h.idx];
+    setMapData(entry.data);
+    setHistoryIndex(h.idx);
+    triggerSave(entry.data, entry.title);
+  }, [triggerSave]);
+
+  // Outline mode
+  const [showOutline, setShowOutline] = useState(false);
+  const [layoutMode, setLayoutMode] = useState<"right" | "left-right">("right");
+
+
+  // 更新节点树（递归辅助函数）
+  const updateNode = useCallback(
+    (root: MindMapNode, nodeId: string, updater: (n: MindMapNode) => MindMapNode): MindMapNode => {
+      if (root.id === nodeId) return updater(root);
+      return {
+        ...root,
+        children: root.children.map((c) => updateNode(c, nodeId, updater)),
+      };
+    }, []
+  );
+
+  const findNode = useCallback(
+    (root: MindMapNode, nodeId: string): MindMapNode | null => {
+      if (root.id === nodeId) return root;
+      for (const c of root.children) {
+        const found = findNode(c, nodeId);
+        if (found) return found;
+      }
+      return null;
+    }, []
+  );
+
+  const removeNode = useCallback(
+    (root: MindMapNode, nodeId: string): MindMapNode => {
+      return {
+        ...root,
+        children: root.children
+          .filter((c) => c.id !== nodeId)
+          .map((c) => removeNode(c, nodeId)),
+      };
+    }, []
+  );
+
+  const removeNodes = useCallback((root: MindMapNode, nodeIds: Set<string>): MindMapNode => {
+    return {
+      ...root,
+      children: root.children
+        .filter((child) => !nodeIds.has(child.id))
+        .map((child) => removeNodes(child, nodeIds)),
+    };
+  }, []);
+
+  const findParentNode = useCallback(
+    (root: MindMapNode, nodeId: string, parent: MindMapNode | null = null): MindMapNode | null => {
+      if (root.id === nodeId) return parent;
+      for (const c of root.children) {
+        const found = findParentNode(c, nodeId, root);
+        if (found) return found;
+      }
+      return null;
+    }, []
+  );
+
+  // 操作：添加子节点
+  const handleAddChild = useCallback((parentId: string) => {
+    if (!mapData) return;
+    const newId = `node_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const newNode: MindMapNode = { id: newId, text: t("mindMap.newNode"), children: [] };
+    const newRoot = updateNode(mapData.root, parentId, (n) => ({
+      ...n,
+      collapsed: false,
+      children: [...n.children, newNode],
+    }));
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    setSelectedNodeId(newId);
+    setSelectedNodeIds([newId]);
+    setEditingNodeId(newId);
+    setEditValue(newNode.text);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, updateNode, triggerSave, t]);
+
+  // 操作：添加同级节点
+  const handleAddSibling = useCallback((nodeId: string) => {
+    if (!mapData || nodeId === "root") {
+      toast.error(t("mindMap.cannotAddSiblingToRoot"));
+      return;
+    }
+    const parent = findParentNode(mapData.root, nodeId);
+    if (!parent) return;
+    const newId = `node_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const newNode: MindMapNode = { id: newId, text: t("mindMap.newNode"), children: [] };
+    const idx = parent.children.findIndex(c => c.id === nodeId);
+    const newParent = {
+      ...parent,
+      children: [
+        ...parent.children.slice(0, idx + 1),
+        newNode,
+        ...parent.children.slice(idx + 1),
+      ],
+    };
+    const newRoot = updateNode(mapData.root, parent.id, () => newParent);
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    setSelectedNodeId(newId);
+    setSelectedNodeIds([newId]);
+    setEditingNodeId(newId);
+    setEditValue(newNode.text);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, findParentNode, updateNode, triggerSave, t]);
+
+  const handlePromoteNode = useCallback((nodeId: string) => {
+    if (!mapData) return;
+    const newRoot = promoteMindMapNode(mapData.root, nodeId);
+    if (newRoot === mapData.root) return;
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, pushHistory, triggerSave]);
+
+  // 操作：删除节点
+  const handleDeleteNode = useCallback((nodeId: string) => {
+    if (!mapData || nodeId === "root") return;
+    const newRoot = removeNode(mapData.root, nodeId);
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, removeNode, triggerSave]);
+
+  const handleDeleteSelectedNodes = useCallback(() => {
+    if (!mapData) return;
+    const ids = new Set((selectedNodeIds.length > 0 ? selectedNodeIds : selectedNodeId ? [selectedNodeId] : []).filter((id) => id !== "root"));
+    if (ids.size === 0) return;
+    const newRoot = removeNodes(mapData.root, ids);
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, pushHistory, removeNodes, selectedNodeId, selectedNodeIds, triggerSave]);
+
+  // 操作：编辑提交
+  const handleEditSubmit = useCallback(() => {
+    if (!mapData || !editingNodeId) return;
+    const trimmed = editValue.trim() || t("mindMap.newNode");
+    const newRoot = updateNode(mapData.root, editingNodeId, (n) => ({ ...n, text: trimmed }));
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    pushHistory(newData);
+    setEditingNodeId(null);
+    // 如果编辑的是根节点，同步更新标题
+    const isRoot = editingNodeId === "root";
+    triggerSave(newData, isRoot ? trimmed : undefined);
+    if (isRoot) {
+      setMaps((prev) =>
+        prev.map((m) => (m.id === activeMap?.id ? { ...m, title: trimmed } : m))
+      );
+    }
+  }, [mapData, editingNodeId, editValue, updateNode, triggerSave, activeMap, t]);
+
+  // 操作：折叠/展开
+  const handleToggleCollapse = useCallback((nodeId: string) => {
+    if (!mapData) return;
+    const newRoot = updateNode(mapData.root, nodeId, (n) => ({
+      ...n,
+      collapsed: !n.collapsed,
+    }));
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, updateNode, triggerSave]);
+
+  const handleAddMarker = useCallback((marker: string) => {
+    if (!mapData || !selectedNodeId) return;
+    const node = findNode(mapData.root, selectedNodeId);
+    if (!node) return;
+    const existing = node.markers || [];
+    const newMarkers = existing.includes(marker as any)
+      ? existing.filter(m => m !== marker)
+      : [...existing, marker as any];
+    const newRoot = updateNode(mapData.root, selectedNodeId, (n) => ({
+      ...n,
+      markers: newMarkers.length > 0 ? newMarkers : undefined,
+    }));
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, selectedNodeId, findNode, updateNode, triggerSave, pushHistory]);
+
+  const handleSetLink = useCallback((link: string) => {
+    if (!mapData || !selectedNodeId) return;
+    const newRoot = updateNode(mapData.root, selectedNodeId, (n) => ({ ...n, link: link || undefined }));
+    const newData = { ...mapData, root: newRoot }; setMapData(newData); pushHistory(newData); triggerSave(newData);
+  }, [mapData, selectedNodeId, updateNode, triggerSave, pushHistory]);
+
+  const handleSetNote = useCallback((note: string) => {
+    if (!mapData || !selectedNodeId) return;
+    const newRoot = updateNode(mapData.root, selectedNodeId, (n) => ({ ...n, note: note || undefined }));
+    const newData = { ...mapData, root: newRoot }; setMapData(newData); pushHistory(newData); triggerSave(newData);
+  }, [mapData, selectedNodeId, updateNode, triggerSave, pushHistory]);
+
+  const applyNodeWidth = useCallback((nodeId: string, width: number): MindMapData | null => {
+    const current = mapDataRef.current;
+    if (!current) return null;
+    const nextWidth = clampNodeWidth(width);
+    const newRoot = updateNode(current.root, nodeId, (n) => ({ ...n, width: nextWidth }));
+    const newData = { ...current, root: newRoot };
+    mapDataRef.current = newData;
+    setMapData(newData);
+    return newData;
+  }, [updateNode]);
+
+  const handleNodeResizeStart = useCallback((nodeId: string, width: number, e: React.PointerEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    removeNodeResizeListenersRef.current?.();
+    suppressCanvasClickRef.current = true;
+
+    const state = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startWidth: clampNodeWidth(width),
+      lastWidth: clampNodeWidth(width),
+      zoom,
+      didChange: false,
+    };
+
+    const removeListeners = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      removeNodeResizeListenersRef.current = null;
+    };
+
+    const onMove = (event: PointerEvent) => {
+      if (event.pointerId !== state.pointerId) return;
+      event.preventDefault();
+      const nextWidth = clampNodeWidth(state.startWidth + (event.clientX - state.startX) / state.zoom);
+      if (nextWidth === state.lastWidth) return;
+      state.lastWidth = nextWidth;
+      state.didChange = nextWidth !== state.startWidth;
+      applyNodeWidth(nodeId, nextWidth);
+    };
+
+    const onEnd = (event: PointerEvent) => {
+      if (event.pointerId !== state.pointerId) return;
+      event.preventDefault();
+      removeListeners();
+      if (state.didChange && mapDataRef.current) {
+        pushHistory(mapDataRef.current);
+        triggerSave(mapDataRef.current);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+    removeNodeResizeListenersRef.current = removeListeners;
+  }, [applyNodeWidth, pushHistory, triggerSave, zoom]);
+
+  useEffect(() => {
+    return () => removeNodeResizeListenersRef.current?.();
+  }, []);
+
+
+  // Theme application
+  const [currentTheme, setCurrentTheme] = useState<string | undefined>(undefined);
+
+  const handleApplyTheme = useCallback((themeIdx: number) => {
+    if (!mapData) return;
+    const theme = THEME_TEMPLATES[themeIdx];
+    if (!theme) return;
+    const rootColor = theme.colors[0];
+    function applyTheme(node: MindMapNode, depth: number): MindMapNode {
+      const colorSet = theme.colors[Math.min(depth, theme.colors.length - 1)];
+      return {
+        ...node,
+        style: { bg: colorSet.bg, color: colorSet.text, border: colorSet.border },
+        children: (node.children || []).map(c => applyTheme(c, depth + 1)),
+      };
+    }
+    const newData = { ...mapData, root: applyTheme(mapData.root, 0), theme: theme.name };
+    setMapData(newData);
+    setCurrentTheme(theme.name);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, pushHistory, triggerSave]);
+
+  // Relation drawing mode
+  const [drawingRelation, setDrawingRelation] = useState(false);
+  const [relationStart, setRelationStart] = useState<string | null>(null);
+
+  const handleRelationClick = useCallback((nodeId: string) => {
+    if (!drawingRelation) return;
+    if (!relationStart) {
+      setRelationStart(nodeId);
+      toast.success(t("mindMap.relationStart"));
+      return;
+    }
+    if (relationStart === nodeId) { setRelationStart(null); return; }
+    if (!mapData) return;
+    const existing = mapData.relations || [];
+    const dup = existing.find(r => r.fromId === relationStart && r.toId === nodeId);
+    if (dup) { setRelationStart(null); setDrawingRelation(false); return; }
+    const newRelation: MindMapRelation = {
+      id: "rel_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+      fromId: relationStart,
+      toId: nodeId,
+    };
+    const newData = { ...mapData, relations: [...existing, newRelation] };
+    setMapData(newData);
+    pushHistory(newData);
+    triggerSave(newData);
+    setRelationStart(null);
+    setDrawingRelation(false);
+    toast.success(t("mindMap.relationCreated"));
+  }, [drawingRelation, relationStart, mapData, pushHistory, triggerSave, t]);
+
+  const handleCreateBoundary = useCallback(() => {
+    if (!mapData || selectedNodeIds.length < 2) {
+      toast.error(t("mindMap.selectNodesFirst"));
+      return;
+    }
+    const existing = mapData.boundaries || [];
+    const colors = ["#6366f1", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
+    const color = colors[existing.length % colors.length];
+    const boundary: MindMapBoundary = {
+      id: "bnd_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+      nodeIds: selectedNodeIds,
+      color,
+    };
+    const newData = { ...mapData, boundaries: [...existing, boundary] };
+    setMapData(newData);
+    pushHistory(newData);
+    triggerSave(newData);
+    toast.success(t("mindMap.boundaryCreated"));
+  }, [mapData, selectedNodeIds, pushHistory, triggerSave, t]);
+  const handleSetColor = useCallback((style: { bg: string; color: string; border: string } | undefined) => {
+    if (!mapData || !selectedNodeId) return;
+    const newRoot = updateNode(mapData.root, selectedNodeId, (n) => ({ ...n, style: style || undefined }));
+    const newData = { ...mapData, root: newRoot }; setMapData(newData); pushHistory(newData); triggerSave(newData);
+  }, [mapData, selectedNodeId, updateNode, triggerSave, pushHistory]);
+
+  // 创建新导图
+  const handleImportMarkdown = useCallback(async () => {
+    const md = window.prompt(t("mindMap.enterMarkdown"));
+    if (!md) return;
+    try {
+      const data = markdownToMindMapData(md);
+      const title = data.root.text.slice(0, 50) || t("mindMap.untitled");
+      const created = await api.createMindMap({ title, data: JSON.stringify(data) });
+      window.dispatchEvent(new Event("nowen:knowledge-tree-changed"));
+      setMaps((prev) => [{ id: created.id, userId: created.userId, workspaceId: created.workspaceId, title: created.title, createdAt: created.createdAt, updatedAt: created.updatedAt }, ...prev]);
+      handleSelect(created.id);
+      toast.success(t("mindMap.importSuccess"));
+    } catch (e: any) {
+      toast.error(e?.message || t("mindMap.importFailed"));
+    }
+  }, [handleSelect, t]);
+
+  const handleExportMarkdown = useCallback(() => {
+    if (!mapData) return;
+    const md = mindMapDataToMarkdown(mapData);
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeMap?.title || "mindmap"}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [mapData, activeMap]);
+
+  // ????
+  const MINDMAP_TEMPLATES = useMemo(() => [
+    { name: t("mindMap.templateBlank"), icon: "📜", data: null },
+    { name: t("mindMap.templateProject"), icon: "💻", data: { root: { id: "root", text: t("mindMap.templateProject"), children: [
+      { id: "n1", text: "目标", children: [{ id: "n1a", text: "核心目标", children: [] }, { id: "n1b", text: "关键指标", children: [] }] },
+      { id: "n2", text: "任务", children: [{ id: "n2a", text: "待办", children: [] }, { id: "n2b", text: "进行中", children: [] }, { id: "n2c", text: "已完成", children: [] }] },
+      { id: "n3", text: "时间线", children: [{ id: "n3a", text: "Q1", children: [] }, { id: "n3b", text: "Q2", children: [] }] },
+    ] } } },
+    { name: t("mindMap.templateMeeting"), icon: "📝", data: { root: { id: "root", text: "会议纪要", children: [
+      { id: "n1", text: "参会人", children: [] },
+      { id: "n2", text: "议题", children: [{ id: "n2a", text: "议题 1", children: [{ id: "n2a1", text: "结论", children: [] }, { id: "n2a2", text: "待跟进", children: [] }] }] },
+      { id: "n3", text: "行动项", children: [{ id: "n3a", text: "负责人 | 截止日期", children: [] }] },
+    ] } } },
+    { name: t("mindMap.templateReading"), icon: "📚", data: { root: { id: "root", text: "读书笔记", children: [
+      { id: "n1", text: "书名 / 作者", children: [] },
+      { id: "n2", text: "核心观点", children: [{ id: "n2a", text: "观点 1", children: [] }, { id: "n2b", text: "观点 2", children: [] }] },
+      { id: "n3", text: "重要摘录", children: [] },
+      { id: "n4", text: "我的思考", children: [] },
+    ] } } },
+    { name: t("mindMap.templateAnalysis"), icon: "🔍", data: { root: { id: "root", text: "问题分析", children: [
+      { id: "n1", text: "问题描述", children: [] },
+      { id: "n2", text: "原因分析", children: [{ id: "n2a", text: "根因 1", children: [] }, { id: "n2b", text: "根因 2", children: [] }] },
+      { id: "n3", text: "解决方案", children: [{ id: "n3a", text: "方案 A", children: [] }, { id: "n3b", text: "方案 B", children: [] }] },
+      { id: "n4", text: "行动计划", children: [] },
+    ] } } },
+  ], [t]);
+
+  const handleCreateWithTemplate = useCallback(async (templateIdx: number) => {
+    setShowTemplates(false);
+    try {
+      const template = MINDMAP_TEMPLATES[templateIdx];
+      const title = templateIdx === 0 ? t("mindMap.untitled") : template.name;
+      const created = await knowledgeTreeApi.create({ parentId: createParentId, nodeType: "mindmap", title });
+      if (template.data) {
+        try {
+          await api.updateMindMap(created.resourceId, { data: JSON.stringify(template.data) });
+        } catch (error) {
+          toast.error("脑图已创建，但模板内容未能保存，请在空白脑图中重试");
+          console.error("Failed to apply mind map template:", error);
+        }
+      }
+      window.dispatchEvent(new Event("nowen:knowledge-tree-changed"));
+      void loadMaps();
+      void loadTree();
+      void handleSelect(created.resourceId);
+    } catch (err) {
+      console.error("Failed to create mindmap:", err);
+      toast.error(err instanceof Error ? err.message : "创建思维导图失败");
+    }
+  }, [createParentId, handleSelect, loadMaps, loadTree, t, MINDMAP_TEMPLATES]);
+
+  const handleCreate = useCallback((parentId: string | null = null) => {
+    setCreateParentId(parentId);
+    setShowTemplates(true);
+  }, []);
+
+
+  // 删除导图
+  const handleDeleteMap = useCallback(async (id: string) => {
+    try {
+      await api.deleteMindMap(id);
+      window.dispatchEvent(new Event("nowen:knowledge-tree-changed"));
+      dispatchDocumentMindMapChanged({ id, kind: "deleted" });
+      toast.success("已移入回收站");
+      setMaps((prev) => prev.filter((m) => m.id !== id));
+      if (activeMap?.id === id) {
+        setActiveMap(null);
+        activeMapRef.current = null;
+        setMapData(null);
+        mapDataRef.current = null;
+        if (!embeddedMode) replaceMindMapAppPath(null);
+      }
+    } catch (err) {
+      console.error("Failed to delete mindmap:", err);
+      toast.error(err instanceof Error ? err.message : "删除思维导图失败");
+    }
+  }, [activeMap, embeddedMode]);
+
+  const applyViewport = useCallback((viewport: MindMapViewport, options: { userSet?: boolean; persist?: boolean } = {}) => {
+    const next = { ...viewport, userSet: options.userSet ?? viewport.userSet };
+    viewportUserSetRef.current = !!next.userSet;
+    setPan({ x: next.x, y: next.y });
+    setZoom(next.zoom);
+    if (!options.persist) return;
+
+    if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+    viewportSaveTimerRef.current = setTimeout(() => {
+      const current = mapDataRef.current;
+      const currentMap = activeMapRef.current;
+      if (!current || !currentMap) return;
+      const nextData = { ...current, viewport: next };
+      mapDataRef.current = nextData;
+      setMapData(nextData);
+      triggerSave(nextData);
+    }, 700);
+  }, [triggerSave]);
+
+  // 缩放
+  const zoomBy = useCallback((delta: number) => {
+    const centerX = canvasSize.width / 2;
+    const centerY = canvasSize.height / 2;
+    const newZoom = Math.max(0.3, Math.min(2.5, zoom + delta));
+    const scale = newZoom / zoom;
+    const nextPan = {
+      x: centerX - (centerX - pan.x) * scale,
+      y: centerY - (centerY - pan.y) * scale,
+    };
+    applyViewport({ ...nextPan, zoom: newZoom, userSet: true }, { userSet: true, persist: true });
+  }, [applyViewport, canvasSize.height, canvasSize.width, pan, zoom]);
+
+  const handleZoomIn = () => zoomBy(0.15);
+  const handleZoomOut = () => zoomBy(-0.15);
+  const handleZoomReset = () => fitCurrentMap({ userSet: true, persist: true });
+
+  // 全屏时锁定 body 滚动 + Esc 退出
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !editingNodeId) setIsFullscreen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    // 切换后触发 resize 适配画布
+    const t = window.setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener("keydown", onKey);
+      window.clearTimeout(t);
+    };
+  }, [isFullscreen, editingNodeId]);
+
+  // 滚轮缩放：画布挂载后用原生 addEventListener 绑定，确保 { passive: false } 使 preventDefault 生效
+  useEffect(() => {
+    if (!canvasEl) return;
+
+    const onWheel = (e: WheelEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.closest("input, textarea, [contenteditable='true']")) return;
+
+      e.preventDefault();
+
+      const raw = e.deltaY > 0 ? -1 : 1;
+      const magnitude = Math.min(Math.abs(e.deltaY), 100);
+      const delta = raw * magnitude * 0.003;
+
+      const rect = canvasEl.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      const newZoom = Math.max(0.3, Math.min(2.5, zoom + delta));
+      const scale = newZoom / zoom;
+      applyViewport({
+        x: mouseX - (mouseX - pan.x) * scale,
+        y: mouseY - (mouseY - pan.y) * scale,
+        zoom: newZoom,
+        userSet: true,
+      }, { userSet: true, persist: true });
+    };
+
+    canvasEl.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvasEl.removeEventListener("wheel", onWheel);
+  }, [applyViewport, canvasEl, pan, zoom]);
+
+  // 触摸手势（移动端）
+  const touchRef = useRef<{ startX: number; startY: number; panX: number; panY: number; dist: number; zoom: number; isTap: boolean; tapTimer: ReturnType<typeof setTimeout> | null }>({
+    startX: 0, startY: 0, panX: 0, panY: 0, dist: 0, zoom: 1, isTap: true, tapTimer: null,
+  });
+
+  const getTouchDist = (t1: React.Touch, t2: React.Touch) =>
+    Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    const t = touchRef.current;
+    if (e.touches.length === 1) {
+      t.startX = e.touches[0].clientX;
+      t.startY = e.touches[0].clientY;
+      t.panX = pan.x;
+      t.panY = pan.y;
+      t.isTap = true;
+    } else if (e.touches.length === 2) {
+      e.preventDefault();
+      t.dist = getTouchDist(e.touches[0], e.touches[1]);
+      t.zoom = zoom;
+      t.isTap = false;
+    }
+  }, [pan, zoom]);
+
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    const t = touchRef.current;
+    if (e.touches.length === 1) {
+      const dx = e.touches[0].clientX - t.startX;
+      const dy = e.touches[0].clientY - t.startY;
+      if (Math.abs(dx) > 5 || Math.abs(dy) > 5) t.isTap = false;
+      setPan({ x: t.panX + dx, y: t.panY + dy });
+    } else if (e.touches.length === 2) {
+      e.preventDefault();
+      const newDist = getTouchDist(e.touches[0], e.touches[1]);
+      const scale = newDist / t.dist;
+      setZoom(Math.max(0.3, Math.min(2.5, t.zoom * scale)));
+    }
+  }, []);
+
+  const handleTouchEnd = useCallback(() => {
+    // tap 由 onClick 处理
+  }, []);
+
+  // 拖拽支持 before / inside / after：既可改父子关系，也可精确调整同级顺序。
+  const handleMoveNodes = useCallback((
+    sourceId: string,
+    targetId: string,
+    placement: MindMapDropPlacement,
+  ) => {
+    if (!mapData) return;
+    const { nodeIds, reason } = getMovableNodeIdsForDrag(mapData.root, sourceId, targetId, selectedNodeIds);
+    if (reason === "target-selected") {
+      toast.error("不能移动到已选中的目标位置");
+      return;
+    }
+    if (reason === "descendant") {
+      toast.error("不能移动到自己的子节点位置");
+      return;
+    }
+    if (nodeIds.length === 0) return;
+
+    const newRoot = moveMindMapNodes(mapData.root, targetId, nodeIds, placement);
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    setSelectedNodeIds(nodeIds);
+    setSelectedNodeId(nodeIds[nodeIds.length - 1] || null);
+    pushHistory(newData);
+    triggerSave(newData);
+  }, [mapData, selectedNodeIds, pushHistory, triggerSave]);
+
+  const beginTouchNodeDrag = useCallback((sourceId: string) => {
+    if (sourceId === "root") return;
+    if (!selectedNodeIds.includes(sourceId)) {
+      setSelectedNodeIds([sourceId]);
+      setSelectedNodeId(sourceId);
+    }
+    touchDropTargetRef.current = null;
+    setDropTarget(null);
+    setDragNodeId(sourceId);
+  }, [selectedNodeIds]);
+
+  const moveTouchNodeDrag = useCallback((
+    sourceId: string,
+    point: { clientX: number; clientY: number },
+  ) => {
+    const element = document.elementFromPoint(point.clientX, point.clientY);
+    const surface = element?.closest<HTMLElement>("[data-mindmap-node-id]");
+    if (!surface || !svgRef.current?.contains(surface)) {
+      touchDropTargetRef.current = null;
+      setDropTarget(null);
+      return;
+    }
+
+    const targetId = surface.dataset.mindmapNodeId || "";
+    const targetDepth = Number(surface.dataset.mindmapNodeDepth || "0");
+    const targetIsSelected = selectedNodeIds.length > 1
+      && selectedNodeIds.includes(sourceId)
+      && selectedNodeIds.includes(targetId);
+    if (!targetId || targetId === sourceId || targetIsSelected) {
+      touchDropTargetRef.current = null;
+      setDropTarget(null);
+      return;
+    }
+
+    const rect = surface.getBoundingClientRect();
+    const placement: MindMapDropPlacement = targetDepth === 0
+      ? "inside"
+      : resolveMindMapDropPlacement(point.clientY, rect.top, rect.height);
+    const next = { nodeId: targetId, placement };
+    touchDropTargetRef.current = next;
+    setDropTarget((current) => (
+      current?.nodeId === next.nodeId && current.placement === next.placement
+        ? current
+        : next
+    ));
+  }, [selectedNodeIds]);
+
+  const endTouchNodeDrag = useCallback((sourceId: string) => {
+    const target = touchDropTargetRef.current;
+    if (target && target.nodeId !== sourceId) {
+      handleMoveNodes(sourceId, target.nodeId, target.placement);
+    }
+    touchDropTargetRef.current = null;
+    setDropTarget(null);
+    setDragNodeId(null);
+  }, [handleMoveNodes]);
+
+  // 复制节点
+  const handleCopyNode = useCallback((nodeId: string) => {
+    if (!mapData) return;
+    const node = findNode(mapData.root, nodeId);
+    if (!node) return;
+    const cloneWithNewIds = (n: MindMapNode): MindMapNode => ({
+      ...n,
+      id: `node_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      children: n.children?.map(cloneWithNewIds) ?? [],
+    });
+    setClipboard({ node: cloneWithNewIds(node), isCut: false });
+    toast.success(t("mindMap.copied"));
+  }, [mapData, findNode, t]);
+
+  // 剪切节点
+  const handleCutNode = useCallback((nodeId: string) => {
+    if (!mapData || nodeId === "root") return;
+    const node = findNode(mapData.root, nodeId);
+    if (!node) return;
+    setClipboard({ node: JSON.parse(JSON.stringify(node)), isCut: true });
+    toast.success(t("mindMap.cut"));
+  }, [mapData, findNode, t]);
+
+  // 粘贴节点为当前选中节点的子节点
+  const handlePasteNode = useCallback(() => {
+    if (!mapData || !clipboard || !selectedNodeId) return;
+    const pasteNode = (src: MindMapNode): MindMapNode => ({
+      ...src,
+      id: `node_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      children: src.children?.map(pasteNode) ?? [],
+    });
+    const newNode = pasteNode(clipboard.node);
+    let newRoot = updateNode(mapData.root, selectedNodeId, (n) => ({
+      ...n,
+      collapsed: false,
+      children: [...n.children, newNode],
+    }));
+    if (clipboard.isCut) {
+      newRoot = removeNode(newRoot, clipboard.node.id);
+    }
+    const newData = { ...mapData, root: newRoot };
+    setMapData(newData);
+    setSelectedNodeId(newNode.id);
+    setSelectedNodeIds([newNode.id]);
+    pushHistory(newData);
+    triggerSave(newData);
+    if (clipboard.isCut) setClipboard(null);
+    toast.success(t("mindMap.pasted"));
+  }, [mapData, clipboard, selectedNodeId, updateNode, removeNode, triggerSave, t]);
+
+  // 键盘快捷键
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target)) return;
+      if (!mapData) return;
+      if (e.key === " ") setIsSpacePressed(true);
+      if (e.key === "Escape") {
+        setSelectedNodeIds([]);
+        setSelectedNodeId(null);
+        setSelectionRect(null);
+        return;
+      }
+      // Undo: Ctrl+Z
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
+        if (editingNodeId) return;
+        e.preventDefault(); handleUndo(); return;
+      }
+      // Redo: Ctrl+Y or Ctrl+Shift+Z
+      if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.key === "z" && e.shiftKey))) {
+        if (editingNodeId) return;
+        e.preventDefault(); handleRedo(); return;
+      }
+
+      if (editingNodeId) return;
+      const activeNodeId = selectedNodeIds.length > 1 ? null : selectedNodeIds[0] || selectedNodeId;
+      if ((e.key === "Delete" || e.key === "Backspace") && (selectedNodeIds.length > 0 || selectedNodeId)) {
+        e.preventDefault();
+        handleDeleteSelectedNodes();
+        return;
+      }
+      if (!activeNodeId) return;
+
+
+      if (e.key === "Tab" && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        if (e.shiftKey) handlePromoteNode(activeNodeId);
+        else handleAddChild(activeNodeId);
+      } else if (e.key === "Enter" && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        handleAddSibling(activeNodeId);
+      } else if ((e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight")
+        && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        const nextId = navigateMindMapNode(mapData.root, activeNodeId, e.key);
+        if (nextId) {
+          e.preventDefault();
+          setSelectedNodeId(nextId);
+          setSelectedNodeIds([nextId]);
+        }
+      } else if (e.key === "F2") {
+        e.preventDefault();
+        const node = findNode(mapData.root, activeNodeId);
+        if (node) {
+          setEditingNodeId(activeNodeId);
+          setEditValue(node.text);
+        }
+      } else if (e.key === " ") {
+        e.preventDefault();
+        handleToggleCollapse(activeNodeId);
+      } else if ((e.ctrlKey || e.metaKey) && e.key === "c") {
+        e.preventDefault();
+        if (selectedNodeIds.length <= 1) handleCopyNode(activeNodeId);
+      } else if ((e.ctrlKey || e.metaKey) && e.key === "x") {
+        e.preventDefault();
+        if (selectedNodeIds.length <= 1) handleCutNode(activeNodeId);
+      } else if ((e.ctrlKey || e.metaKey) && e.key === "v") {
+        e.preventDefault();
+        if (selectedNodeIds.length <= 1) handlePasteNode();
+      }
+    };
+    const keyupHandler = (e: KeyboardEvent) => {
+      if (e.key === " ") setIsSpacePressed(false);
+    };
+    window.addEventListener("keydown", handler);
+    window.addEventListener("keyup", keyupHandler);
+    return () => {
+      window.removeEventListener("keydown", handler);
+      window.removeEventListener("keyup", keyupHandler);
+    };
+  }, [mapData, selectedNodeId, selectedNodeIds, editingNodeId, handleUndo, handleRedo, handleAddChild, handleAddSibling, handlePromoteNode, handleDeleteSelectedNodes, handleToggleCollapse, findNode, handleCopyNode, handleCutNode, handlePasteNode]);
+
+  // 构建布局
+  const { layoutNodes, edges, viewBox, bounds } = useMemo(() => {
+    if (!mapData) return { layoutNodes: [], edges: [], viewBox: "0 0 800 600", bounds: { minX: 0, minY: 0, width: 800, height: 600 } };
+
+    // ???????????????
+    let layoutRoot = mapData.root;
+    if (focusedNodeId) {
+      const found = (function find(n: MindMapNode): MindMapNode | null {
+        if (n.id === focusedNodeId) return n;
+        for (const c of n.children) { const r = find(c); if (r) return r; }
+        return null;
+      })(mapData.root);
+      if (found) layoutRoot = found;
+    }
+    const root = buildLayout(layoutRoot, 0, null);
+    const treeH = getSubtreeHeight(root);
+    if (layoutMode === "left-right" && root.children.length > 1) {
+      // Split children: odd index right, even index left
+      const leftChildren: LayoutNode[] = [];
+      const rightChildren: LayoutNode[] = [];
+      root.children.forEach((c, idx) => {
+        if (idx % 2 === 0) rightChildren.push(c);
+        else leftChildren.push(c);
+      });
+      root.children = rightChildren;
+      // Create a virtual left root for layout
+      if (leftChildren.length > 0) {
+        const leftRoot: LayoutNode = { ...root, id: root.id + "-left", children: leftChildren };
+        layoutTree(root, 0, treeH / 2);
+        layoutTreeLeft(leftRoot, 0, treeH / 2);
+        // Merge left children positions back
+        leftChildren.forEach((c, i) => { root.children.push(c); });
+      } else {
+        layoutTree(root, 0, treeH / 2);
+      }
+    } else {
+      layoutTree(root, 0, treeH / 2);
+    }
+    const all = flattenNodes(root);
+
+    const edgeList: { from: LayoutNode; to: LayoutNode }[] = [];
+    const collectEdges = (n: LayoutNode) => {
+      n.children.forEach((c) => {
+        edgeList.push({ from: n, to: c });
+        collectEdges(c);
+      });
+    };
+    collectEdges(root);
+
+    const pad = 80;
+    const rawBounds = computeLayoutBounds(all.map((n) => ({ x: n.x, y: n.y, width: n.width, height: n.height + 36 })), pad);
+    const viewBox = `${rawBounds.minX} ${rawBounds.minY} ${rawBounds.width} ${rawBounds.height}`;
+    const bounds = { minX: rawBounds.minX, minY: rawBounds.minY, width: rawBounds.width, height: rawBounds.height };
+
+    return { layoutNodes: all, edges: edgeList, viewBox, bounds };
+  }, [focusedNodeId, mapData, layoutMode]);
+
+  const nodeById = useMemo(() => {
+    const map = new Map<string, MindMapNode>();
+    if (!mapData) return map;
+    const walk = (node: MindMapNode) => {
+      map.set(node.id, node);
+      node.children?.forEach(walk);
+    };
+    walk(mapData.root);
+    return map;
+  }, [mapData]);
+
+  const [showMiniMap, setShowMiniMap] = useState(!isMobile);
+
+  useEffect(() => {
+    mapDataRef.current = mapData;
+  }, [mapData]);
+
+  useEffect(() => {
+    activeMapRef.current = activeMap;
+  }, [activeMap]);
+
+  useEffect(() => {
+    if (!canvasEl) return;
+    const updateSize = () => {
+      const rect = canvasEl.getBoundingClientRect();
+      setCanvasSize({ width: rect.width, height: rect.height });
+    };
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(canvasEl);
+    return () => observer.disconnect();
+  }, [canvasEl]);
+
+  const fitCurrentMap = useCallback((options: { userSet?: boolean; persist?: boolean } = {}) => {
+    if (layoutNodes.length === 0 || canvasSize.width <= 0 || canvasSize.height <= 0) return;
+    const viewport = fitMindMapToViewport(layoutNodes, canvasSize, {
+      padding: 120,
+      minZoom: 0.6,
+      maxZoom: 1,
+    });
+    applyViewport({ ...viewport, userSet: options.userSet ?? false }, { userSet: options.userSet ?? false, persist: options.persist });
+  }, [applyViewport, canvasSize, layoutNodes]);
+
+  useEffect(() => {
+    if (!activeMap?.id || pendingAutoFitMapIdRef.current !== activeMap.id) return;
+    if (layoutNodes.length === 0 || canvasSize.width <= 0 || canvasSize.height <= 0) return;
+
+    const frame = requestAnimationFrame(() => {
+      fitCurrentMap({ userSet: false, persist: false });
+      pendingAutoFitMapIdRef.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeMap?.id, canvasSize, fitCurrentMap, layoutNodes]);
+
+  useEffect(() => {
+    if (!mapData || mapData.viewport?.userSet || viewportUserSetRef.current) return;
+    const frame = requestAnimationFrame(() => fitCurrentMap({ userSet: false, persist: false }));
+    return () => cancelAnimationFrame(frame);
+  }, [canvasSize.width, canvasSize.height, fitCurrentMap, isFullscreen, mapData?.viewport?.userSet, showOutline]);
+
+  const toCanvasPoint = useCallback((clientX: number, clientY: number) => {
+    const rect = canvasEl?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }, [canvasEl]);
+
+  const createSelectionRect = useCallback((startClientX: number, startClientY: number, endClientX: number, endClientY: number): MindMapSelectionRect => {
+    const start = toCanvasPoint(startClientX, startClientY);
+    const current = toCanvasPoint(endClientX, endClientY);
+    return {
+      x: Math.min(start.x, current.x),
+      y: Math.min(start.y, current.y),
+      width: Math.abs(current.x - start.x),
+      height: Math.abs(current.y - start.y),
+    };
+  }, [toCanvasPoint]);
+
+  const hitTestSelectionByDom = useCallback((selectionClientRect: ClientRectLike) => {
+    if (!canvasEl) return [];
+    const elements = Array.from(canvasEl.querySelectorAll<HTMLElement>("[data-mindmap-node-id]"));
+    return hitTestSelectionElements(selectionClientRect, elements);
+  }, [canvasEl]);
+
+  const handleCanvasPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "touch") return;
+    if (editingNodeId) return;
+    if (e.button !== 0 && e.button !== 1) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-mindmap-floating-toolbar]")) return;
+    if (target.closest("[data-mindmap-node-resize-handle]")) return;
+    if (target.closest("input, textarea, [contenteditable='true']")) return;
+
+    const point = toCanvasPoint(e.clientX, e.clientY);
+    const shouldPan = e.button === 1 || isSpacePressed;
+    pointerStateRef.current = {
+      mode: shouldPan ? "pan" : "select",
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      panX: pan.x,
+      panY: pan.y,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.preventDefault();
+
+    if (shouldPan) {
+      setIsPanning(true);
+      setSelectionRect(null);
+      return;
+    }
+
+    setSelectedNodeIds([]);
+    setSelectedNodeId(null);
+    setSelectionRect({ x: point.x, y: point.y, width: 0, height: 0 });
+  }, [editingNodeId, isSpacePressed, pan, toCanvasPoint]);
+
+  const handleCanvasPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const pointer = pointerStateRef.current;
+    if (pointer.pointerId !== e.pointerId || pointer.mode === "none") return;
+
+    if (pointer.mode === "pan") {
+      const nextPan = {
+        x: pointer.panX + e.clientX - pointer.startX,
+        y: pointer.panY + e.clientY - pointer.startY,
+      };
+      if (panFrameRef.current !== null) cancelAnimationFrame(panFrameRef.current);
+      panFrameRef.current = requestAnimationFrame(() => {
+        setPan(nextPan);
+        panFrameRef.current = null;
+      });
+      return;
+    }
+
+    const visualRect = createSelectionRect(pointer.startX, pointer.startY, e.clientX, e.clientY);
+    const clientRect = createClientSelectionRect(pointer.startX, pointer.startY, e.clientX, e.clientY);
+    setSelectionRect(visualRect);
+    const ids = visualRect.width > 3 || visualRect.height > 3 ? hitTestSelectionByDom(clientRect) : [];
+    if (ids.length > 0 || visualRect.width > 3 || visualRect.height > 3) suppressCanvasClickRef.current = true;
+    setSelectedNodeIds(ids);
+    setSelectedNodeId(ids[ids.length - 1] || null);
+  }, [createSelectionRect, hitTestSelectionByDom]);
+
+  const handleCanvasPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const pointer = pointerStateRef.current;
+    if (pointer.pointerId !== e.pointerId) return;
+
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* pointer capture may already be released */
+    }
+
+    if (pointer.mode === "pan") {
+      setIsPanning(false);
+      const nextPan = {
+        x: pointer.panX + e.clientX - pointer.startX,
+        y: pointer.panY + e.clientY - pointer.startY,
+      };
+      applyViewport({ ...nextPan, zoom, userSet: true }, { userSet: true, persist: true });
+    } else if (pointer.mode === "select") {
+      const visualRect = createSelectionRect(pointer.startX, pointer.startY, e.clientX, e.clientY);
+      const clientRect = createClientSelectionRect(pointer.startX, pointer.startY, e.clientX, e.clientY);
+      const ids = visualRect.width > 3 || visualRect.height > 3 ? hitTestSelectionByDom(clientRect) : [];
+      if (visualRect.width > 3 || visualRect.height > 3) {
+        suppressCanvasClickRef.current = true;
+        setSelectedNodeIds(ids);
+        setSelectedNodeId(ids[ids.length - 1] || null);
+      }
+      setSelectionRect(null);
+    }
+
+    pointerStateRef.current = { mode: "none", pointerId: null, startX: 0, startY: 0, panX: 0, panY: 0 };
+  }, [applyViewport, createSelectionRect, hitTestSelectionByDom, zoom]);
+
+  // 列表右键菜单
+  const [listContextMenu, setListContextMenu] = useState<{ x: number; y: number; mapId: string; title: string } | null>(null);
+
+  const handleListContextMenu = useCallback((e: React.MouseEvent, item: MindMapListItem) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setListContextMenu({ x: e.clientX, y: e.clientY, mapId: item.id, title: item.title });
+  }, []);
+
+  // 点击其他地方关闭列表右键菜单
+  useEffect(() => {
+    if (!listContextMenu) return;
+    const close = () => setListContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("contextmenu", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("contextmenu", close, true);
+    };
+  }, [listContextMenu]);
+
+  // 加载指定导图数据
+  const loadMapData = useCallback(async (mapId: string): Promise<{ data: MindMapData; title: string } | null> => {
+    try {
+      const map = await api.getMindMap(mapId);
+      const parsed = JSON.parse(map.data) as MindMapData;
+      return { data: parsed, title: map.title };
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const handleListDownloadSVG = useCallback(async () => {
+    if (!listContextMenu) return;
+    const { mapId, title } = listContextMenu;
+    setListContextMenu(null);
+    const result = await loadMapData(mapId);
+    if (!result) return;
+    const svgResult = buildMindMapExportSvg(result.data);
+    if (!svgResult) return;
+    const blob = new Blob([svgResult.svgContent], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title || "mindmap"}.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [listContextMenu, loadMapData]);
+
+  const handleListDownloadPNG = useCallback(async () => {
+    if (!listContextMenu) return;
+    const { mapId, title } = listContextMenu;
+    setListContextMenu(null);
+    const result = await loadMapData(mapId);
+    if (!result) {
+      toast.error(EXPORT_CANVAS_CONTENT_ERROR);
+      return;
+    }
+    const svgResult = buildMindMapExportSvg(result.data);
+    if (!svgResult) {
+      toast.error(EXPORT_CANVAS_CONTENT_ERROR);
+      return;
+    }
+    const scale = 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = svgResult.width * scale;
+    canvas.height = svgResult.height * scale;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      toast.error(EXPORT_CANVAS_CONTENT_ERROR);
+      return;
+    }
+    const img = new window.Image();
+    const svgBlob = new Blob([svgResult.svgContent], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(svgBlob);
+    img.onload = () => {
+      try {
+        ctx.scale(scale, scale);
+        ctx.drawImage(img, 0, 0);
+        assertExportCanvasHasContent(canvas, "mindmap-png");
+        canvas.toBlob((blob) => {
+          if (!blob?.size) {
+            toast.error(EXPORT_CANVAS_CONTENT_ERROR);
+            return;
+          }
+          const pngUrl = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = pngUrl;
+          a.download = `${title || "mindmap"}.png`;
+          a.click();
+          URL.revokeObjectURL(pngUrl);
+        }, "image/png");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : EXPORT_CANVAS_CONTENT_ERROR);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      toast.error(EXPORT_CANVAS_CONTENT_ERROR);
+    };
+    img.src = url;
+  }, [listContextMenu, loadMapData]);
+
+  // 将 MindMapNode 转换为 xmind 的 content.json 格式
+  const buildXmindContent = useCallback((data: MindMapData, title: string) => {
+    const convertNode = (node: MindMapNode): Record<string, unknown> => {
+      const result: Record<string, unknown> = {
+        id: node.id,
+        title: node.text,
+      };
+      if (node.children && node.children.length > 0) {
+        result.children = {
+          attached: node.children.map(convertNode),
+        };
+      }
+      return result;
+    };
+
+    return [
+      {
+        id: "sheet-1",
+        title: title,
+        rootTopic: convertNode(data.root),
+      },
+    ];
+  }, []);
+
+  const handleListDownloadXmind = useCallback(async () => {
+    if (!listContextMenu) return;
+    const { mapId, title } = listContextMenu;
+    setListContextMenu(null);
+    const result = await loadMapData(mapId);
+    if (!result) return;
+
+    const content = buildXmindContent(result.data, title);
+    const contentJson = JSON.stringify(content);
+    const metadata = JSON.stringify({ creator: { name: "nowen-note", version: "1.0.0" } });
+    const manifest = JSON.stringify({ "file-entries": { "content.json": {}, "metadata.json": {} } });
+
+    // 使用简易 ZIP 打包（无压缩），xmind 本质是 ZIP
+    const encoder = new TextEncoder();
+    const files: { name: string; data: Uint8Array }[] = [
+      { name: "content.json", data: encoder.encode(contentJson) },
+      { name: "metadata.json", data: encoder.encode(metadata) },
+      { name: "manifest.json", data: encoder.encode(manifest) },
+    ];
+
+    // 构建 ZIP 格式
+    const parts: Uint8Array[] = [];
+    const centralDir: Uint8Array[] = [];
+    let offset = 0;
+
+    for (const file of files) {
+      const nameBytes = encoder.encode(file.name);
+      // Local file header
+      const header = new ArrayBuffer(30 + nameBytes.length);
+      const hView = new DataView(header);
+      hView.setUint32(0, 0x04034b50, true); // signature
+      hView.setUint16(4, 20, true); // version needed
+      hView.setUint16(6, 0, true); // flags
+      hView.setUint16(8, 0, true); // compression (store)
+      hView.setUint16(10, 0, true); // mod time
+      hView.setUint16(12, 0, true); // mod date
+      // CRC-32
+      const crc = crc32(file.data);
+      hView.setUint32(14, crc, true);
+      hView.setUint32(18, file.data.length, true); // compressed size
+      hView.setUint32(22, file.data.length, true); // uncompressed size
+      hView.setUint16(26, nameBytes.length, true); // name length
+      hView.setUint16(28, 0, true); // extra length
+      new Uint8Array(header).set(nameBytes, 30);
+
+      const headerBytes = new Uint8Array(header);
+      parts.push(headerBytes);
+      parts.push(file.data);
+
+      // Central directory entry
+      const cde = new ArrayBuffer(46 + nameBytes.length);
+      const cView = new DataView(cde);
+      cView.setUint32(0, 0x02014b50, true); // signature
+      cView.setUint16(4, 20, true); // version made by
+      cView.setUint16(6, 20, true); // version needed
+      cView.setUint16(8, 0, true); // flags
+      cView.setUint16(10, 0, true); // compression
+      cView.setUint16(12, 0, true); // mod time
+      cView.setUint16(14, 0, true); // mod date
+      cView.setUint32(16, crc, true);
+      cView.setUint32(20, file.data.length, true);
+      cView.setUint32(24, file.data.length, true);
+      cView.setUint16(28, nameBytes.length, true);
+      cView.setUint16(30, 0, true); // extra length
+      cView.setUint16(32, 0, true); // comment length
+      cView.setUint16(34, 0, true); // disk number
+      cView.setUint16(36, 0, true); // internal attrs
+      cView.setUint32(38, 0, true); // external attrs
+      cView.setUint32(42, offset, true); // local header offset
+      new Uint8Array(cde).set(nameBytes, 46);
+      centralDir.push(new Uint8Array(cde));
+
+      offset += headerBytes.length + file.data.length;
+    }
+
+    const centralDirOffset = offset;
+    let centralDirSize = 0;
+    centralDir.forEach((cd) => { parts.push(cd); centralDirSize += cd.length; });
+
+    // End of central directory
+    const eocd = new ArrayBuffer(22);
+    const eView = new DataView(eocd);
+    eView.setUint32(0, 0x06054b50, true);
+    eView.setUint16(4, 0, true);
+    eView.setUint16(6, 0, true);
+    eView.setUint16(8, files.length, true);
+    eView.setUint16(10, files.length, true);
+    eView.setUint32(12, centralDirSize, true);
+    eView.setUint32(16, centralDirOffset, true);
+    eView.setUint16(20, 0, true);
+    parts.push(new Uint8Array(eocd));
+
+    const totalLen = parts.reduce((s, p) => s + p.length, 0);
+    const zipData = new Uint8Array(totalLen);
+    let pos = 0;
+    parts.forEach((p) => { zipData.set(p, pos); pos += p.length; });
+
+    const blob = new Blob([zipData], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title || "mindmap"}.xmind`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [listContextMenu, loadMapData, buildXmindContent]);
+
+  const requestEmbeddedClose = useCallback(() => {
+    if (!onRequestClose) return;
+    const hasUnsaved =
+      isSaving ||
+      embeddedSaveRunningRef.current ||
+      embeddedPendingSaveRef.current !== null ||
+      embeddedSaveConflictRef.current;
+    if (hasUnsaved && !window.confirm("思维导图还有未完成的保存或冲突处理，确定关闭编辑窗口吗？")) {
+      return;
+    }
+    onRequestClose();
+  }, [isSaving, onRequestClose]);
+
+  return (
+    <div className={cn(
+      isFullscreen
+        ? "fixed inset-0 z-[80] flex flex-col bg-app-bg"
+        : "flex h-full w-full overflow-hidden"
+    )}>
+      {!isFullscreen && !embeddedMode && !documentMode && !activeMap && (
+        <MindMapOverview
+          maps={maps}
+          treeNodes={treeNodes}
+          loading={isLoading}
+          onOpen={(id) => { void handleSelect(id); }}
+          onCreate={handleCreate}
+          onToggleStar={(id) => { void handleToggleStar(id); }}
+          onDelete={(id) => { void handleDeleteMap(id); }}
+          onContextMenu={handleListContextMenu}
+        />
+      )}
+      {/* Template selection modal */}
+      {showTemplates && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowTemplates(false)}>
+          <div className="bg-app-surface rounded-[12px] shadow-lg shadow-black/[0.08] border border-app-border p-5 w-80 max-w-[90vw]" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-sm font-bold text-tx-primary mb-3">{t("mindMap.chooseTemplate")}</h3>
+            <div className="space-y-1">
+              {MINDMAP_TEMPLATES.map((tpl, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => handleCreateWithTemplate(idx)}
+                  className="flex items-center gap-3 w-full px-3 py-2.5 rounded-[10px] text-left hover:bg-app-hover transition-colors duration-150 ease-out"
+                >
+                  <span className="text-xl">{tpl.icon}</span>
+                  <span className="text-sm text-tx-primary">{tpl.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Center: Mind Map Canvas */}
+      <div className={cn("flex-1 flex flex-col overflow-hidden transition-colors duration-150 ease-out", !activeMap && !documentMode && !embeddedMode && "hidden")} ref={containerRef} style={{ background: MT.canvasBg }}>
+        {activeMap && mapData ? (
+          <>
+            {/* Toolbar */}
+            <div className="px-2 sm:px-4 py-2 border-b border-app-border/40 flex items-center justify-between bg-app-surface/30 gap-1">
+              <div className="flex items-center gap-2 min-w-0">
+                {focusedNodeId && (
+                  <button
+                    onClick={() => setFocusedNodeId(null)}
+                    className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 transition-colors duration-150 ease-out flex-shrink-0"
+                  >
+                    <Scan size={12} />
+                    {t("mindMap.showAll")}
+                  </button>
+                )}
+                {!embeddedMode && !documentMode && (
+                  <button
+                    onClick={() => pushMindMapAppPath(null)}
+                    className="inline-flex items-center gap-1 rounded-md p-1.5 text-xs text-tx-secondary hover:bg-app-hover transition-colors duration-150 ease-out flex-shrink-0"
+                    aria-label="返回全部脑图"
+                  >
+                    <ChevronLeft size={16} /><span className="hidden sm:inline">全部脑图</span>
+                  </button>
+                )}
+                <h1 className="text-sm font-semibold text-tx-primary truncate max-w-[120px] sm:max-w-[300px]">
+                  {activeMap.title}
+                </h1>
+                {!embeddedMode && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(buildMindMapDeepLinkUrl(activeMap.id));
+                        toast.success("已复制思维导图链接");
+                      } catch {
+                        toast.error("复制链接失败");
+                      }
+                    }}
+                    className="hidden sm:inline-flex rounded-md p-1 text-tx-tertiary hover:bg-app-hover hover:text-tx-secondary"
+                    title="复制思维导图链接"
+                    aria-label="复制思维导图链接"
+                  >
+                    <Copy size={13} />
+                  </button>
+                )}
+                {isSaving ? (
+                  <span className="flex items-center gap-1 text-xs text-tx-tertiary flex-shrink-0">
+                    <Loader2 size={12} className="animate-spin" />
+                    <span className="hidden sm:inline">{t("mindMap.saving")}</span>
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1 text-xs text-green-500 flex-shrink-0">
+                    <Check size={12} />
+                    <span className="hidden sm:inline">{t("mindMap.saved")}</span>
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1">
+                {/* Edit: Undo / Redo */}
+                <button onClick={handleUndo} disabled={!canUndo}
+                  className={cn(MT.toolbarBtn, canUndo ? "" : MT.toolbarBtnDisabled)}
+                  title={t("mindMap.undo")}><Undo2 size={16} /></button>
+                {/* Redo */}
+                <button onClick={handleRedo} disabled={!canRedo}
+                  className={cn(MT.toolbarBtn, canRedo ? "" : MT.toolbarBtnDisabled)}
+                  title={t("mindMap.redo")}><Redo2 size={16} /></button>
+                <div className="w-px h-4 bg-app-border mx-0.5" />
+                {/* View: Outline / Layout / Zoom / Fullscreen / MiniMap */}
+                <button onClick={() => setShowOutline((v) => !v)}
+                  className={cn(MT.toolbarBtn, showOutline ? MT.toolbarBtnActive : "")}
+                  title={t("mindMap.outline")}><PanelLeft size={16} /></button>
+                <button
+                  onClick={() => {
+                    const newMode: "right" | "left-right" = layoutMode === "right" ? "left-right" : "right";
+                    setLayoutMode(newMode);
+                    if (mapData) {
+                      const newData = { ...mapData, layout: newMode };
+                      setMapData(newData);
+                      triggerSave(newData);
+                    }
+                  }}
+                  className={cn(MT.toolbarBtn, layoutMode === "left-right" ? MT.toolbarBtnActive : "")}
+                  title={layoutMode === "right" ? t("mindMap.layoutRight") : t("mindMap.layoutBoth")}
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <circle cx="8" cy="8" r="3" />
+                    <path d="M5 8H2M11 8h3" />
+                    <path d="M2 5v6M14 5v6" />
+                  </svg>
+                </button>
+                <div className="w-px h-4 bg-app-border mx-0.5" />
+                <button
+                  onClick={handleZoomOut}
+                  className={MT.toolbarBtn}
+                  title={t("mindMap.zoomOut")}
+                >
+                  <ZoomOut size={16} />
+                </button>
+                <span className="text-xs text-tx-tertiary w-12 text-center tabular-nums hidden sm:inline-block font-medium">
+                  {Math.round(zoom * 100)}%
+                </span>
+                <button
+                  onClick={handleZoomIn}
+                  className={MT.toolbarBtn}
+                  title={t("mindMap.zoomIn")}
+                >
+                  <ZoomIn size={16} />
+                </button>
+                <button
+                  onClick={handleZoomReset}
+                  className="p-1.5 rounded-md hover:bg-app-hover text-tx-secondary transition-colors duration-150 ease-out"
+                  title={t("mindMap.fitView")}
+                >
+                  <Scan size={16} />
+                </button>
+                <div className="w-px h-4 bg-app-border mx-0.5" />
+                <button
+                  onClick={() => setIsFullscreen(v => !v)}
+                  className={MT.toolbarBtn}
+                  title={isFullscreen ? t("mindMap.exitFullscreen") : t("mindMap.fullscreen")}
+                >
+                  {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                </button>
+                <button
+                  onClick={() => setShowMiniMap((v) => !v)}
+                  className={cn(
+                    "p-1.5 rounded-md transition-colors duration-150 ease-out",
+                    showMiniMap
+                      ? "bg-app-active text-accent-primary"
+                      : "hover:bg-app-hover text-tx-secondary"
+                  )}
+                  title={t("mindMap.miniMap")}
+                >
+                  <MapIcon size={16} />
+                </button>
+                {drawingRelation && (
+                  <span className="text-xs text-amber-500 animate-pulse ml-1">{t("mindMap.drawingRelation")}</span>
+                )}
+                <button
+                  onClick={handleExportMarkdown}
+                  className={MT.toolbarBtn}
+                  title={t("mindMap.exportMarkdown")}
+                >
+                  <FileText size={16} />
+                </button>
+                <button
+                  onClick={handleImportMarkdown}
+                  className={MT.toolbarBtn}
+                  title={t("mindMap.importMarkdown")}
+                >
+                  <ArrowDownToLine size={16} />
+                </button>
+                <button
+                  onClick={() => { setShowSearch(v => !v); setTimeout(() => searchInputRef.current?.focus(), 50); }}
+                  className={cn(MT.toolbarBtn, showSearch ? MT.toolbarBtnActive : "")}
+                >
+                  <SearchIcon size={16} />
+                </button>
+                {(embeddedMode || documentMode) && onRequestClose && (
+                  <>
+                    <div className="w-px h-4 bg-app-border mx-0.5" />
+                    <button
+                      onClick={requestEmbeddedClose}
+                      className={MT.toolbarBtn}
+                      title={embeddedMode ? "关闭文档内编辑" : "关闭思维导图"}
+                      aria-label={embeddedMode ? "关闭文档内思维导图编辑" : "关闭思维导图"}
+                    >
+                      <X size={16} />
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+            {saveConflict && (
+              <div
+                className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs"
+                role="alert"
+                data-mindmap-save-conflict="true"
+              >
+                <div className="flex min-w-0 items-center gap-2 text-amber-700 dark:text-amber-300">
+                  <AlertTriangle size={15} className="shrink-0" />
+                  <span>源导图已在其他窗口更新。为避免覆盖他人修改，自动保存已暂停。</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() => void reloadConflictVersion()}
+                    className="rounded-md border border-app-border bg-app-surface px-2.5 py-1 font-medium text-tx-primary hover:bg-app-hover disabled:opacity-50"
+                  >
+                    载入最新版
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() => void overwriteConflictVersion()}
+                    className="rounded-md bg-amber-600 px-2.5 py-1 font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    保留我的版本
+                  </button>
+                </div>
+              </div>
+            )}
+            {showSearch && (
+              <div className="px-2 sm:px-4 py-1.5 border-b border-app-border/40 bg-app-surface/20 flex items-center gap-2">
+                <SearchIcon size={14} className="text-tx-tertiary flex-shrink-0" />
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      if (e.shiftKey) setSearchIndex(i => searchResults.length > 0 ? (i - 1 + searchResults.length) % searchResults.length : -1);
+                      else setSearchIndex(i => searchResults.length > 0 ? (i + 1) % searchResults.length : -1);
+                    }
+                    if (e.key === 'Escape') { setShowSearch(false); setSearchQuery(""); }
+                  }}
+                  placeholder={t("mindMap.searchNodes")}
+                  className="flex-1 bg-transparent text-sm text-tx-primary placeholder:text-tx-tertiary outline-none"
+                />
+                <span className="text-xs text-tx-tertiary whitespace-nowrap">
+                  {searchResults.length > 0 ? `${searchIndex + 1} / ${searchResults.length}` : searchQuery ? t("mindMap.noResults") : ""}
+                </span>
+                <button onClick={() => setSearchIndex(i => searchResults.length > 0 ? (i - 1 + searchResults.length) % searchResults.length : -1)} className="p-1 rounded hover:bg-app-hover text-tx-secondary disabled:opacity-30" disabled={searchResults.length === 0}><ChevronUp size={14} /></button>
+                <button onClick={() => setSearchIndex(i => searchResults.length > 0 ? (i + 1) % searchResults.length : -1)} className="p-1 rounded hover:bg-app-hover text-tx-secondary disabled:opacity-30" disabled={searchResults.length === 0}><ChevronDown size={14} /></button>
+                <button onClick={() => { setShowSearch(false); setSearchQuery(""); }} className="p-1 rounded hover:bg-app-hover text-tx-secondary"><span className="text-xs">✕</span></button>
+              </div>
+            )}
+
+            <div className="flex-1 flex overflow-hidden">
+              {showOutline && (
+                <div className="w-[240px] min-w-[200px] border-r border-app-border/40 bg-app-surface/30 shrink-0 overflow-hidden">
+                  <OutlinePanel
+                    mapData={mapData!}
+                    selectedNodeId={selectedNodeId}
+                    onSelectNode={(id) => { setSelectedNodeId(id); setEditingNodeId(null); }}
+                    onAddChild={handleAddChild}
+                    onEdit={(id, text) => { setEditingNodeId(id); setEditValue(text); }}
+                    onToggleCollapse={handleToggleCollapse}
+                    editNodeId={editingNodeId}
+                    editValue={editValue}
+                    onEditChange={setEditValue}
+                    onEditSubmit={handleEditSubmit}
+                    t={t}
+                  />
+                </div>
+              )}
+            <div
+              className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing relative"
+              style={{ userSelect: "none" }}
+            >
+              <div
+                ref={setCanvasNode}
+                className="absolute inset-0"
+                style={{
+                  backgroundImage: `radial-gradient(circle, var(--mm-canvas-dot, rgba(0,0,0,0.06)) 1px, transparent 1px)`,
+                  backgroundSize: "20px 20px",
+                  userSelect: "none",
+                  touchAction: "none",
+                  cursor: isPanning ? "grabbing" : isSpacePressed ? "grab" : "crosshair",
+                }}
+                onPointerDown={handleCanvasPointerDown}
+                onPointerMove={handleCanvasPointerMove}
+                onPointerUp={handleCanvasPointerUp}
+                onPointerCancel={handleCanvasPointerUp}
+
+                onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onClick={(e) => {
+                  if (suppressCanvasClickRef.current) {
+                    suppressCanvasClickRef.current = false;
+                    return;
+                  }
+                  if (!e.ctrlKey && !e.metaKey) setSelectedNodeIds([]);
+                  setSelectedNodeId(null);
+                  setEditingNodeId(null);
+                  setDragNodeId(null);
+                  setDropTarget(null);
+                }}
+              >
+                <svg
+                  ref={svgRef}
+                  width="100%"
+                  height="100%"
+                  data-mindmap-canvas-svg="true"
+                  className="block overflow-visible"
+                >
+                <g transform={`translate(${pan.x} ${pan.y}) scale(${zoom})`}>
+                {/* Edges */}
+                {edges.map((e, i) => (
+                  <Edge key={`${e.from.id}-${e.to.id}-${i}`} from={e.from} to={e.to} />
+                ))}
+                {/* Relation lines */}
+                {mapData?.relations?.map((rel) => {
+                  const fromNode = layoutNodes.find(n => n.id === rel.fromId);
+                  const toNode = layoutNodes.find(n => n.id === rel.toId);
+                  if (!fromNode || !toNode) return null;
+                  const fx = fromNode.x + fromNode.width / 2;
+                  const fy = fromNode.y + fromNode.height / 2;
+                  const tx = toNode.x + toNode.width / 2;
+                  const ty = toNode.y + toNode.height / 2;
+                  const mx = (fx + tx) / 2;
+                  const my = (fy + ty) / 2 - 40;
+                  return (
+                    <g key={rel.id}>
+                      <path
+                        d={`M${fx},${fy} Q${mx},${my} ${tx},${ty}`}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth={2}
+                        strokeDasharray="6 3"
+                        markerEnd="url(#arrowhead)"
+                      />
+                      {rel.label && <text x={mx} y={my - 6} textAnchor="middle" fontSize={11} fill="#f59e0b">{rel.label}</text>}
+                    </g>
+                  );
+                })}
+                {/* Arrowhead marker definition */}
+                <defs>
+                  <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#f59e0b" />
+                  </marker>
+                </defs>
+                {/* Boundary rectangles */}
+                {mapData?.boundaries?.map((bnd) => {
+                  const nodes = bnd.nodeIds
+                    .map(id => layoutNodes.find(n => n.id === id))
+                    .filter(Boolean) as LayoutNode[];
+                  if (nodes.length < 2) return null;
+                  const pad = 16;
+                  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                  nodes.forEach(n => {
+                    minX = Math.min(minX, n.x - pad);
+                    minY = Math.min(minY, n.y - pad);
+                    maxX = Math.max(maxX, n.x + n.width + pad);
+                    maxY = Math.max(maxY, n.y + n.height + pad);
+                  });
+                  return (
+                    <g key={bnd.id}>
+                      <rect
+                        x={minX} y={minY}
+                        width={maxX - minX} height={maxY - minY}
+                        rx={8} fill={bnd.color + "10"} stroke={bnd.color || "#6366f1"}
+                        strokeWidth={2} strokeDasharray="8 4"
+                      />
+                      {bnd.label && <text x={minX + 8} y={minY - 4} fontSize={11} fill={bnd.color || "#6366f1"}>{bnd.label}</text>}
+                    </g>
+                  );
+                })}
+
+                {/* Nodes */}
+                {((() => { const ids = selectedNodeIds.length > 0 ? selectedNodeIds : (selectedNodeId ? [selectedNodeId] : []); return ids.length > 0 ? [...layoutNodes.filter(n => !ids.includes(n.id)), ...layoutNodes.filter(n => ids.includes(n.id))] : layoutNodes; })()).map((n) => (
+                  <NodeBox
+                    key={n.id}
+                    node={n}
+                    isSelected={selectedNodeIds.length > 0 ? selectedNodeIds.includes(n.id) : selectedNodeId === n.id}
+                    isSearchMatch={searchResults.includes(n.id)}
+                    isSearchActive={searchResults.length > 0 && searchIndex >= 0 && searchResults[searchIndex] === n.id}
+                    onDragStart={n.depth === 0 ? undefined : (e) => {
+                      e.stopPropagation();
+                      if (!selectedNodeIds.includes(n.id)) {
+                        setSelectedNodeIds([n.id]);
+                        setSelectedNodeId(n.id);
+                      }
+                      setDragNodeId(n.id);
+                      e.dataTransfer.effectAllowed = "move";
+                      e.dataTransfer.setData("text/plain", n.id);
+                    }}
+                    onDragOver={(e) => {
+                      const targetIsSelected = !!dragNodeId
+                        && selectedNodeIds.length > 1
+                        && selectedNodeIds.includes(dragNodeId)
+                        && selectedNodeIds.includes(n.id);
+                      if (!dragNodeId || dragNodeId === n.id || targetIsSelected) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      e.dataTransfer.dropEffect = "move";
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const placement = n.depth === 0
+                        ? "inside"
+                        : resolveMindMapDropPlacement(e.clientY, rect.top, rect.height);
+                      setDropTarget((current) => (
+                        current?.nodeId === n.id && current.placement === placement
+                          ? current
+                          : { nodeId: n.id, placement }
+                      ));
+                    }}
+                    onDragLeave={() => {
+                      setDropTarget((current) => current?.nodeId === n.id ? null : current);
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (dragNodeId && dragNodeId !== n.id) {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const placement = n.depth === 0
+                          ? "inside"
+                          : resolveMindMapDropPlacement(e.clientY, rect.top, rect.height);
+                        handleMoveNodes(dragNodeId, n.id, placement);
+                      }
+                      setDragNodeId(null);
+                      setDropTarget(null);
+                    }}
+                    onDragEnd={() => {
+                      setDragNodeId(null);
+                      setDropTarget(null);
+                    }}
+                    isDragging={dragNodeId === n.id}
+                    onTouchDragStart={n.depth === 0 ? undefined : () => beginTouchNodeDrag(n.id)}
+                    onTouchDragMove={n.depth === 0 ? undefined : (point) => moveTouchNodeDrag(n.id, point)}
+                    onTouchDragEnd={n.depth === 0 ? undefined : () => endTouchNodeDrag(n.id)}
+                    isDragTarget={dropTarget?.nodeId === n.id}
+                    dragPlacement={dropTarget?.nodeId === n.id ? dropTarget.placement : null}
+                    isEditing={editingNodeId === n.id}
+                    editValue={editValue}
+                    onSelect={(e?: React.MouseEvent) => {
+                      if (drawingRelation) { handleRelationClick(n.id); return; }
+                      if (e && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+                        setSelectedNodeIds((ids) => {
+                          const next = ids.includes(n.id) ? ids.filter((id) => id !== n.id) : [...ids, n.id];
+                          setSelectedNodeId(next[next.length - 1] || null);
+                          return next;
+                        });
+                      } else {
+                        setSelectedNodeIds([n.id]);
+                        setSelectedNodeId(n.id);
+                      }
+                    }}
+                    onDoubleClick={() => {
+                      setEditingNodeId(n.id);
+                      setEditValue(n.text);
+                    }}
+                    onEditChange={setEditValue}
+                    onEditSubmit={handleEditSubmit}
+                    onToggleCollapse={() => handleToggleCollapse(n.id)}
+                    isMobile={isMobile}
+                    onContextMenu={(e) => e.preventDefault()}
+                    markerIcons={<MarkerIcons markers={nodeById.get(n.id)?.markers} />}
+                    nodeData={nodeById.get(n.id)}
+                    onResizeStart={(e) => handleNodeResizeStart(n.id, n.width, e)}
+                  />
+                ))}
+                </g>
+              </svg>
+
+                {selectionRect && (
+                  <div
+                    className="pointer-events-none absolute border border-blue-500/70 bg-blue-500/10 rounded-sm"
+                    style={{
+                      left: selectionRect.x,
+                      top: selectionRect.y,
+                      width: selectionRect.width,
+                      height: selectionRect.height,
+                    }}
+                  />
+                )}
+
+                {/* Floating toolbar: HTML absolute overlay */}
+                {(() => {
+                  const toolbarNodeId = selectedNodeIds.length > 1 ? null : selectedNodeIds[0] || selectedNodeId;
+                  if (!toolbarNodeId || editingNodeId === toolbarNodeId) return null;
+                  const node = layoutNodes.find(n => n.id === toolbarNodeId);
+                  if (!node) return null;
+                  return (
+                    <FloatingToolbar
+                      position={(() => {
+                        const container = canvasEl;
+                        if (!container) return { x: 0, y: 0 };
+                        const rect = container.getBoundingClientRect();
+                        let x = pan.x + (node.x + node.width / 2) * zoom;
+                        let y = pan.y + (node.y + node.height + 4) * zoom;
+                        const toolbarWidth = 320;
+                        const toolbarHeight = 36;
+                        const pad = 8;
+                        x = Math.max(pad, Math.min(x, rect.width - toolbarWidth - pad));
+                        y = Math.max(pad, Math.min(y, rect.height - toolbarHeight - pad));
+                        return { x, y };
+                      })()}
+                      isRoot={node.depth === 0} isMobile={isMobile}
+                      onAddChild={() => handleAddChild(node.id)}
+                      onAddSibling={() => handleAddSibling(node.id)}
+                      onEdit={() => { setEditingNodeId(node.id); const n = findNode(mapData!.root, node.id); setEditValue(n?.text || ""); }}
+                      onDelete={() => handleDeleteNode(node.id)}
+                      onAddMarker={handleAddMarker}
+                      onSetLink={handleSetLink}
+                      onSetNote={handleSetNote}
+                      onSetColor={handleSetColor}
+                      currentStyle={nodeById.get(toolbarNodeId)?.style}
+                      onApplyTheme={handleApplyTheme}
+                      onStartRelation={() => { setDrawingRelation(true); setRelationStart(toolbarNodeId); toast.success(t("mindMap.relationStart")); }}
+                      onCreateBoundary={handleCreateBoundary}
+                      onFocusNode={() => setFocusedNodeId(toolbarNodeId)}
+                      onCopy={() => handleCopyNode(toolbarNodeId)}
+                      onCut={() => handleCutNode(toolbarNodeId)}
+                      onPaste={handlePasteNode}
+                      t={t}
+                    />
+                  );
+                })()}
+
+            </div>
+
+              {/* MiniMap 小地图：放在 canvasRef 外面，固定在视口右下角，不随 pan 移动 */}
+              {showMiniMap && layoutNodes.length > 0 && (
+                <div
+                  className="absolute right-2 bottom-2 sm:right-3 sm:bottom-3 z-20 bg-white/90 dark:bg-zinc-800/90 backdrop-blur-md border border-black/[0.08] dark:border-white/[0.1] rounded-[10px] shadow-lg shadow-black/[0.06] overflow-hidden"
+                  style={{ width: isMobile ? 140 : 180, height: isMobile ? 90 : 120 }}
+                >
+                  <svg
+                    width="100%"
+                    height="100%"
+                    viewBox={viewBox}
+                    preserveAspectRatio="xMidYMid meet"
+                    className="cursor-pointer"
+                    onClick={(e) => {
+                      const svg = e.currentTarget;
+                      const rect = svg.getBoundingClientRect();
+                      const svgX = ((e.clientX - rect.left) / rect.width) * bounds.width + bounds.minX;
+                      const svgY = ((e.clientY - rect.top) / rect.height) * bounds.height + bounds.minY;
+                      if (canvasEl) {
+                        const cr = canvasEl.getBoundingClientRect();
+                        applyViewport({
+                          x: cr.width / 2 - svgX * zoom,
+                          y: cr.height / 2 - svgY * zoom,
+                          zoom,
+                          userSet: true,
+                        }, { userSet: true, persist: true });
+                      }
+                    }}
+                  >
+                    {/* 连线 */}
+                    {edges.map((e, i) => {
+                      const x1 = e.from.x + e.from.width;
+                      const y1 = e.from.y + e.from.height / 2;
+                      const x2 = e.to.x;
+                      const y2 = e.to.y + e.to.height / 2;
+                      return (
+                        <line
+                          key={`mini-e-${i}`}
+                          x1={x1} y1={y1} x2={x2} y2={y2}
+                          stroke={MT.edgeStroke}
+                          strokeWidth={2}
+                          className=""
+                        />
+                      );
+                    })}
+                    {/* 节点 */}
+                    {layoutNodes.map((n) => {
+                      const color = getNodeColor(n.depth);
+                      return (
+                        <rect
+                          key={`mini-n-${n.id}`}
+                          x={n.x} y={n.y}
+                          width={n.width} height={n.height}
+                          rx={4}
+                          fill={color.bg}
+                          stroke={color.border}
+                          strokeWidth={2}
+                        />
+                      );
+                    })}
+                    {/* 视口指示框 */}
+                    {canvasEl && (() => {
+                      const cr = canvasEl.getBoundingClientRect();
+                      const vpX = -pan.x / zoom;
+                      const vpY = -pan.y / zoom;
+                      const vpW = cr.width / zoom;
+                      const vpH = cr.height / zoom;
+                      return (
+                        <rect
+                          x={vpX} y={vpY}
+                          width={vpW} height={vpH}
+                          fill="rgba(99,102,241,0.06)"
+                          stroke="rgba(99,102,241,0.6)"
+                          strokeWidth={2}
+                          rx={3}
+                        />
+                      );
+                    })()}
+                  </svg>
+                </div>
+              )}
+            </div>
+            </div>
+            {!isMobile && (
+            <div className="px-4 py-1.5 border-t border-app-border/40 bg-app-surface/20 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-tx-tertiary">
+              <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Tab</kbd> {t("mindMap.shortcutAdd")}</span>
+              <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Enter</kbd> {t("mindMap.shortcutSibling")}</span>
+              <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Shift+Tab</kbd> {t("mindMap.shortcutPromote")}</span>
+              <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">F2</kbd> {t("mindMap.shortcutEdit")}</span>
+              <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Del</kbd> {t("mindMap.shortcutDelete")}</span>
+              <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Space</kbd> {t("mindMap.shortcutCollapse")}</span>
+                <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Ctrl+Z</kbd> {t("mindMap.undo")}</span>
+                <span><kbd className="px-1 py-0.5 rounded border border-app-border bg-app-bg text-[10px]">Ctrl+Y</kbd> {t("mindMap.redo")}</span>
+              <span>{t("mindMap.dragToMove")}</span>
+            </div>
+            )}
+          </>
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center text-tx-tertiary relative">
+            <BrainCircuit size={48} className="mb-3 opacity-20" />
+            <span className="text-sm">{documentMode ? t("common.loading") : t("mindMap.selectOrCreate")}</span>
+            {!documentMode && (
+              <button
+                onClick={() => handleCreate()}
+                className="mt-4 flex items-center gap-2 rounded-[10px] bg-accent-primary px-4 py-2 text-sm font-medium text-tx-inverse transition-opacity duration-150 ease-out hover:opacity-90"
+              >
+                <Plus size={16} />
+                {t("mindMap.create")}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 列表右键菜单 */}
+      {listContextMenu && (
+        <MindMapContextMenuOverlay
+          menu={listContextMenu}
+          onClose={() => setListContextMenu(null)}
+          onDownloadPNG={handleListDownloadPNG}
+          onDownloadSVG={handleListDownloadSVG}
+          onDownloadXmind={handleListDownloadXmind}
+          t={t}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ===== 列表右键菜单（带位置修正） ===== */
+function MindMapContextMenuOverlay({
+  menu,
+  onClose,
+  onDownloadPNG,
+  onDownloadSVG,
+  onDownloadXmind,
+  t,
+}: {
+  menu: { x: number; y: number; mapId: string; title: string };
+  onClose: () => void;
+  onDownloadPNG: () => void;
+  onDownloadSVG: () => void;
+  onDownloadXmind: () => void;
+  t: (key: string) => string;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ x: menu.x, y: menu.y });
+
+  // 位置边界修正
+  useEffect(() => {
+    requestAnimationFrame(() => {
+      const el = menuRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let newX = menu.x;
+      let newY = menu.y;
+      if (newX + rect.width > vw - 8) newX = vw - rect.width - 8;
+      if (newY + rect.height > vh - 8) newY = vh - rect.height - 8;
+      if (newX < 8) newX = 8;
+      if (newY < 8) newY = 8;
+      setPos({ x: newX, y: newY });
+    });
+  }, [menu.x, menu.y]);
+
+  return (
+    <div
+      ref={menuRef}
+      className={`fixed z-50 min-w-[180px] py-1 ${MT.menuCls} ${MT.menuBgCls} animate-in fade-in zoom-in-95 duration-100`}
+      style={{ left: pos.x, top: pos.y }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <button
+        className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm text-tx-primary ${MT.menuHover} transition-colors duration-150 ease-out`}
+        onClick={onDownloadPNG}
+      >
+        <Image size={15} className="text-accent-primary" />
+        {t("mindMap.downloadPNG")}
+      </button>
+      <button
+        className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm text-tx-primary ${MT.menuHover} transition-colors duration-150 ease-out`}
+        onClick={onDownloadSVG}
+      >
+        <FileImage size={15} className="text-emerald-500" />
+        {t("mindMap.downloadSVG")}
+      </button>
+      <div className="h-px bg-black/[0.06] dark:bg-white/[0.08] my-1" />
+      <button
+        className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm text-tx-primary ${MT.menuHover} transition-colors duration-150 ease-out`}
+        onClick={onDownloadXmind}
+      >
+        <FileDown size={15} className="text-orange-500" />
+        {t("mindMap.downloadXmind")}
+      </button>
+    </div>
+  );
+}

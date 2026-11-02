@@ -1,0 +1,761 @@
+import { Hono } from "hono";
+import bcrypt from "bcryptjs";
+import { createHash, randomUUID } from "node:crypto";
+
+import { getDb } from "../db/schema.js";
+import { MINDMAP_LEGACY_NOTEBOOK_PREFIX } from "../db/knowledgeTreeMindmapFolderMigration.js";
+import { getUserWorkspaceRole, hasRole, isFeatureEnabled, isSystemAdmin, resolveWorkspaceFeatures } from "../middleware/acl.js";
+import { broadcastNotesDeleted } from "../services/realtime.js";
+import { notifySyncChanged } from "../sync/notify";
+import { ensureKnowledgeTreePasswordTable } from "../db/knowledgeTreePasswordMigration.js";
+import { resolvePasswordAuthorizedNotes, resolveUnlockedFolderNodeIds, signFolderUnlockToken } from "../lib/knowledgeTreePasswordAccess.js";
+import {
+  clearKnowledgeNodeRole,
+  hasKnowledgeCapability,
+  listKnowledgeNodeRoles,
+  parseKnowledgeRolePreset,
+  resolveKnowledgeNodeAccess,
+  resolveKnowledgePermissionSubject,
+  setKnowledgeNodeRole,
+} from "../services/knowledgeCapabilities.js";
+import {
+  createKnowledgeChild,
+  deleteKnowledgeNode,
+  deleteKnowledgeNodesBatch,
+  KnowledgeTreeError,
+  listKnowledgeTree,
+  listSharedKnowledgeTree,
+  listKnowledgeTreeHistory,
+  moveKnowledgeNode,
+  moveKnowledgeNodesBatch,
+  reorderKnowledgeNodes,
+  restoreKnowledgeNode,
+} from "../services/knowledgeTree.js";
+
+const app = new Hono();
+
+// REST tree writes also enter the durable V2 feed. Wake subscribed devices only
+// after a successful request has committed; Pull retains authorization/filtering.
+app.use("*", async (c, next) => {
+  if (!["POST","PUT","PATCH","DELETE"].includes(c.req.method)) return next();
+  const db = getDb();
+  const before = Number((db.prepare("SELECT MAX(sequence) AS sequence FROM sync_changes_v2").get() as {sequence:number|null}).sequence || 0);
+  await next();
+  if (c.res.status < 200 || c.res.status >= 300) return;
+  const changed = db.prepare(`SELECT DISTINCT userId,workspaceId FROM sync_changes_v2
+    WHERE sequence > ? AND entityType='knowledge_tree_node'`).all(before) as Array<{userId:string;workspaceId:string|null}>;
+  const sent = new Set<string>();
+  for (const row of changed) {
+    const key = row.workspaceId ? `workspace:${row.workspaceId}` : `personal:${row.userId}`;
+    if (sent.has(key)) continue;
+    sent.add(key);
+    notifySyncChanged(db,row.userId,row.workspaceId ? key : "personal");
+  }
+});
+
+function userIdOf(c: any): string {
+  return c.req.header("X-User-Id") || "";
+}
+
+function workspaceIdOf(c: any): string | null {
+  const value = c.req.query("workspaceId");
+  return !value || value === "personal" ? null : value;
+}
+
+function mapError(c: any, error: unknown): Response {
+  if (error instanceof KnowledgeTreeError) {
+    return c.json({ error: error.message, code: error.code, ...error.details }, error.status);
+  }
+  if (error instanceof Error && /KNOWLEDGE_TREE_/.test(error.message)) {
+    return c.json({ error: "目录结构不合法", code: error.message }, 409);
+  }
+  console.error("[knowledge-tree] request failed:", error);
+  return c.json({ error: "知识树操作失败", code: "KNOWLEDGE_TREE_FAILED" }, 500);
+}
+
+/**
+ * Optional optimistic preconditions for MCP writes. Existing UI callers without
+ * preview fields retain their legacy behavior; MCP always supplies them.
+ * The synchronous service mutations run immediately after this comparison.
+ */
+function verifyTreePreconditions(
+  c: any,
+  nodeId: string,
+  body: Record<string, unknown>,
+  subtree = false,
+): Response | null {
+  if (!["expectedUpdatedAt", "expectedTitle", "expectedParentId", "expectedChildCount",
+        "expectedSubtreeRevision"].some((key) => Object.prototype.hasOwnProperty.call(body, key))) {
+    return null;
+  }
+  const required = ["expectedUpdatedAt", "expectedTitle", "expectedParentId", "expectedChildCount"];
+  if (required.some((key) => !(key in body)) || (subtree && !body.expectedSubtreeRevision)) {
+    return c.json({ error: "缺少完整的目录预览版本", code: "MCP_PREVIEW_REQUIRED" }, 409);
+  }
+  const nodes = listKnowledgeTree({ userId: userIdOf(c), workspaceId: workspaceIdOf(c), includeDeleted: true });
+  const node = nodes.find((item) => item.id === nodeId);
+  if (!node || node.updatedAt !== body.expectedUpdatedAt || node.title !== body.expectedTitle
+    || node.parentId !== body.expectedParentId || node.childCount !== body.expectedChildCount) {
+    return c.json({ error: "目录状态发生变化，请重新预览", code: "MCP_TREE_VERSION_CONFLICT" }, 409);
+  }
+  if (subtree) {
+    const byId = new Map(nodes.map((item) => [item.id, item]));
+    const visited = new Set<string>([nodeId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const entry of nodes) {
+        if (entry.parentId && visited.has(entry.parentId) && !visited.has(entry.id)) {
+          visited.add(entry.id);
+          changed = true;
+        }
+      }
+    }
+    const digest = createHash("sha256").update(JSON.stringify(Array.from(visited).sort().map((id) => {
+      const entry = byId.get(id)!;
+      return [entry.id, entry.parentId, entry.resourceType, entry.resourceId,
+        entry.title, entry.updatedAt, entry.isDeleted, entry.childCount];
+    }))).digest("hex");
+    if (digest !== body.expectedSubtreeRevision) {
+      return c.json({ error: "子目录内容发生变化，请重新预览", code: "MCP_TREE_VERSION_CONFLICT" }, 409);
+    }
+  }
+  return null;
+}
+
+function broadcastDeletedKnowledgeNotes(affectedNodeIds: string[], actorUserId: string): void {
+  if (affectedNodeIds.length === 0) return;
+  try {
+    const db = getDb();
+    const affectedNotes: Array<{ resourceId: string; workspaceId: string | null }> = [];
+    for (let offset = 0; offset < affectedNodeIds.length; offset += 500) {
+      const chunk = affectedNodeIds.slice(offset, offset + 500);
+      const placeholders = chunk.map(() => "?").join(",");
+      affectedNotes.push(...db.prepare(`
+        SELECT resourceId, workspaceId FROM knowledge_tree_nodes
+        WHERE resourceType = 'note' AND id IN (${placeholders})
+      `).all(...chunk) as Array<{ resourceId: string; workspaceId: string | null }>);
+    }
+
+    const notesByWorkspace = new Map<string | null, string[]>();
+    for (const note of affectedNotes) {
+      const noteIds = notesByWorkspace.get(note.workspaceId) || [];
+      noteIds.push(note.resourceId);
+      notesByWorkspace.set(note.workspaceId, noteIds);
+    }
+    for (const [workspaceId, noteIds] of notesByWorkspace) {
+      broadcastNotesDeleted(Array.from(new Set(noteIds.filter(Boolean))), {
+        actorUserId,
+        ...(workspaceId ? { workspaceId } : {}),
+        trashed: true,
+      });
+    }
+  } catch (error) {
+    // 删除事务已经提交，实时通知失败只能记录，不能把成功删除误报成请求失败。
+    console.error("[knowledge-tree] deleted-note broadcast failed:", error);
+  }
+}
+
+app.get("/roles", (c) => c.json({
+  roles: [
+    { id: "readonly", label: "只读成员", capabilities: ["canView", "canDownload"] },
+    { id: "editor", label: "编辑成员", capabilities: ["canView", "canComment", "canCreate", "canEdit", "canDownload"] },
+    { id: "maintainer", label: "维护成员", capabilities: ["canView", "canComment", "canCreate", "canEdit", "canDelete", "canMove", "canDownload"] },
+    { id: "admin", label: "管理员", capabilities: ["canView", "canComment", "canCreate", "canEdit", "canDelete", "canMove", "canDownload", "canReshare", "canManageMembers"] },
+  ],
+}));
+
+app.get("/", (c) => {
+  try {
+    const db = getDb();
+    const userId = userIdOf(c);
+    const workspaceId = workspaceIdOf(c);
+    const nodes = listKnowledgeTree({
+      userId,
+      workspaceId,
+      includeDeleted: c.req.query("includeDeleted") === "1",
+      db,
+    });
+    const unlocked = resolveUnlockedFolderNodeIds(db, userId, c.req.header("X-Folder-Unlock-Tokens"));
+    const authorized = resolvePasswordAuthorizedNotes(db,
+      workspaceId ? `workspace:${workspaceId}` : `personal:${userId}`, unlocked);
+    c.header("Cache-Control", "private, no-store");
+    return c.json({
+      nodes,
+      passwordAuthorizedNotes: nodes.filter((node) => node.resourceType === "note" && authorized.has(node.resourceId))
+        .map((node) => ({ noteId: node.resourceId, folderIds: authorized.get(node.resourceId)! })),
+    });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.get("/shared-with-me", (c) => {
+  try {
+    return c.json({
+      nodes: listSharedKnowledgeTree({
+        userId: userIdOf(c),
+        workspaceId: workspaceIdOf(c),
+      }),
+    });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+function normalizeKnowledgeImportPath(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((segment) => typeof segment === "string"
+      ? segment
+        .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, " ")
+        .replace(/\s+/g, " ")
+        .replace(/^[\s.]+|[\s.]+$/g, "")
+        .slice(0, 120)
+        .trim()
+      : "")
+    .filter(Boolean)
+    .slice(0, 32);
+}
+
+function ensureKnowledgeImportNotebookPath(
+  actorUserId: string,
+  workspaceId: string | null,
+  segments: string[],
+): { notebookId: string | null; treeNodeId: string | null } {
+  const db = getDb();
+  let parentNotebookId: string | null = null;
+  let parentTreeNodeId: string | null = null;
+
+  for (const segment of segments) {
+    if (parentTreeNodeId) {
+      const access = resolveKnowledgeNodeAccess(parentTreeNodeId, actorUserId, db);
+      if (!hasKnowledgeCapability(access, "canCreate")) {
+        throw new KnowledgeTreeError(
+          "KNOWLEDGE_CAPABILITY_FORBIDDEN",
+          403,
+          "没有在目标目录创建文件的权限",
+          { required: "canCreate" },
+        );
+      }
+    }
+
+    const existing = (workspaceId
+      ? db.prepare(`
+          SELECT id FROM notebooks
+          WHERE workspaceId = ? AND parentId IS ? AND name = ? AND isDeleted = 0
+          ORDER BY createdAt, id LIMIT 1
+        `).get(workspaceId, parentNotebookId, segment)
+      : db.prepare(`
+          SELECT id FROM notebooks
+          WHERE userId = ? AND workspaceId IS NULL AND parentId IS ? AND name = ? AND isDeleted = 0
+          ORDER BY createdAt, id LIMIT 1
+        `).get(actorUserId, parentNotebookId, segment)
+    ) as { id: string } | undefined;
+
+    if (existing) {
+      parentNotebookId = existing.id;
+      parentTreeNodeId = `notebook:${existing.id}`;
+      continue;
+    }
+
+    const notebookId = randomUUID();
+    const orderRow = (parentTreeNodeId
+      ? db.prepare("SELECT COALESCE(MAX(sortOrder), -1) AS value FROM knowledge_tree_nodes WHERE parentId = ? AND isDeleted = 0")
+          .get(parentTreeNodeId)
+      : db.prepare("SELECT COALESCE(MAX(sortOrder), -1) AS value FROM knowledge_tree_nodes WHERE scopeKey = ? AND parentId IS NULL AND isDeleted = 0")
+          .get(workspaceId ? `workspace:${workspaceId}` : `personal:${actorUserId}`)
+    ) as { value: number } | undefined;
+    const order = Number(orderRow?.value ?? -1) + 1;
+
+    db.prepare(`
+      INSERT INTO notebooks (id, userId, workspaceId, parentId, name, icon, sortOrder)
+      VALUES (?, ?, ?, ?, ?, '📁', ?)
+    `).run(notebookId, actorUserId, workspaceId, parentNotebookId, segment, order);
+    parentNotebookId = notebookId;
+    parentTreeNodeId = `notebook:${notebookId}`;
+  }
+
+  return { notebookId: parentNotebookId, treeNodeId: parentTreeNodeId };
+}
+
+app.post("/files/link", async (c) => {
+  try {
+    const actorUserId = userIdOf(c);
+    if (!actorUserId) return c.json({ error: "未授权" }, 401);
+    const workspaceId = workspaceIdOf(c);
+    if (workspaceId
+      && !isSystemAdmin(actorUserId)
+      && !hasRole(getUserWorkspaceRole(workspaceId, actorUserId), "editor")) {
+      return c.json({ error: "没有在当前工作区导入文件的权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN" }, 403);
+    }
+
+    const body = await c.req.json().catch(() => ({})) as {
+      fileId?: unknown;
+      notebookPath?: unknown;
+    };
+    const fileId = typeof body.fileId === "string" ? body.fileId.trim() : "";
+    if (!fileId) return c.json({ error: "fileId 必填", code: "KNOWLEDGE_FILE_ID_REQUIRED" }, 400);
+
+    const db = getDb();
+    const attachment = db.prepare(`
+      SELECT id, userId, workspaceId, filename
+      FROM attachments WHERE id = ?
+    `).get(fileId) as {
+      id: string;
+      userId: string;
+      workspaceId: string | null;
+      filename: string;
+    } | undefined;
+    if (!attachment
+      || (attachment.workspaceId || null) !== workspaceId
+      || (!workspaceId && attachment.userId !== actorUserId)) {
+      return c.json({ error: "文件不存在或不属于当前空间", code: "KNOWLEDGE_FILE_SCOPE_MISMATCH" }, 404);
+    }
+
+    const path = normalizeKnowledgeImportPath(body.notebookPath);
+    const target = ensureKnowledgeImportNotebookPath(actorUserId, workspaceId, path);
+    if (target.treeNodeId) {
+      const access = resolveKnowledgeNodeAccess(target.treeNodeId, actorUserId, db);
+      if (!hasKnowledgeCapability(access, "canCreate")) {
+        return c.json({ error: "没有在目标目录创建文件的权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN" }, 403);
+      }
+    }
+
+    const scopeKey = workspaceId ? `workspace:${workspaceId}` : `personal:${actorUserId}`;
+    const existing = db.prepare(`
+      SELECT id, scopeKey FROM knowledge_tree_nodes
+      WHERE resourceType = 'file' AND resourceId = ?
+      LIMIT 1
+    `).get(fileId) as { id: string; scopeKey: string } | undefined;
+
+    let nodeId: string;
+    if (existing) {
+      if (existing.scopeKey !== scopeKey) {
+        return c.json({ error: "文件目录作用域不一致", code: "KNOWLEDGE_FILE_SCOPE_MISMATCH" }, 409);
+      }
+      nodeId = existing.id;
+      db.prepare(`
+        UPDATE knowledge_tree_nodes
+        SET parentId = ?, isDeleted = 0, deletedAt = NULL, updatedAt = datetime('now')
+        WHERE id = ?
+      `).run(target.treeNodeId, nodeId);
+    } else {
+      nodeId = `file:${fileId}`;
+      const sortOrderRow = (target.treeNodeId
+        ? db.prepare("SELECT COALESCE(MAX(sortOrder), -1) AS value FROM knowledge_tree_nodes WHERE parentId = ? AND isDeleted = 0")
+            .get(target.treeNodeId)
+        : db.prepare("SELECT COALESCE(MAX(sortOrder), -1) AS value FROM knowledge_tree_nodes WHERE scopeKey = ? AND parentId IS NULL AND isDeleted = 0")
+            .get(scopeKey)
+      ) as { value: number } | undefined;
+      const sortOrder = Number(sortOrderRow?.value ?? -1) + 1;
+      db.prepare(`
+        INSERT INTO knowledge_tree_nodes (
+          id, userId, workspaceId, scopeKey, parentId, nodeType, resourceType,
+          resourceId, sortOrder, isExpanded, isDeleted
+        ) VALUES (?, ?, ?, ?, ?, 'file', 'file', ?, ?, 1, 0)
+      `).run(nodeId, attachment.userId, workspaceId, scopeKey, target.treeNodeId, fileId, sortOrder);
+    }
+
+    const refreshed = listKnowledgeTree({ userId: actorUserId, workspaceId })
+      .find((node) => node.id === nodeId);
+    return c.json(refreshed || {
+      id: nodeId,
+      resourceType: "file",
+      resourceId: fileId,
+      title: attachment.filename,
+    }, existing ? 200 : 201);
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.post("/nodes", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const nodeType = body.nodeType;
+    if (typeof body.parentId === "string" && body.parentId) {
+      const conflict = verifyTreePreconditions(c, body.parentId, body);
+      if (conflict) return conflict;
+    }
+    if (!["folder", "note", "markdown", "word", "mindmap", "sheet"].includes(nodeType)) {
+      return c.json({ error: "不支持的节点类型", code: "KNOWLEDGE_NODE_TYPE_UNSUPPORTED" }, 400);
+    }
+    const parentId = typeof body.parentId === "string" && body.parentId ? body.parentId : null;
+    if (nodeType === "mindmap") {
+      const parent = parentId
+        ? getDb().prepare("SELECT workspaceId FROM knowledge_tree_nodes WHERE id = ?").get(parentId) as { workspaceId: string | null } | undefined
+        : undefined;
+      const targetWorkspaceId = parent ? parent.workspaceId : workspaceIdOf(c);
+      if (targetWorkspaceId && !isFeatureEnabled(resolveWorkspaceFeatures(targetWorkspaceId), "mindmaps")) {
+        return c.json({ error: "该功能在当前工作区已被管理员关闭", code: "FEATURE_DISABLED", feature: "mindmaps" }, 403);
+      }
+    }
+    const node = createKnowledgeChild({
+      actorUserId: userIdOf(c),
+      workspaceId: workspaceIdOf(c),
+      parentId,
+      nodeType,
+      title: typeof body.title === "string" ? body.title : "",
+      sheetData: body.sheetData,
+      contentFormat: body.contentFormat === "plaintext" ? "plaintext" : undefined,
+    });
+    return c.json(node, 201);
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.patch("/nodes/:nodeId", async (c) => {
+  try {
+    const db = getDb();
+    const nodeId = c.req.param("nodeId");
+    const access = resolveKnowledgeNodeAccess(nodeId, userIdOf(c), db);
+    const body = await c.req.json().catch(() => ({}));
+    const title = typeof body.title === "string" ? body.title.trim() : undefined;
+    const conflict = verifyTreePreconditions(c, nodeId, body);
+    if (conflict) return conflict;
+    const isExpanded = typeof body.isExpanded === "boolean" || body.isExpanded === 0 || body.isExpanded === 1
+      ? Number(Boolean(body.isExpanded))
+      : undefined;
+    if (title !== undefined && !hasKnowledgeCapability(access, "canEdit")) {
+      return c.json({ error: "没有重命名权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN", required: "canEdit" }, 403);
+    }
+    if (isExpanded !== undefined && !access.capabilities.canView) {
+      return c.json({ error: "权限不足", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN", required: "canView" }, 403);
+    }
+    const node = db.prepare("SELECT resourceType, resourceId FROM knowledge_tree_nodes WHERE id = ? AND isDeleted = 0")
+      .get(nodeId) as { resourceType: string; resourceId: string } | undefined;
+    if (!node) return c.json({ error: "内容节点不存在", code: "KNOWLEDGE_NODE_NOT_FOUND" }, 404);
+    db.transaction(() => {
+      if (title !== undefined) {
+        if (!title) throw new KnowledgeTreeError("KNOWLEDGE_TITLE_REQUIRED", 400, "名称不能为空");
+        if (node.resourceType === "notebook") {
+          db.prepare("UPDATE notebooks SET name = ?, updatedAt = datetime('now') WHERE id = ?").run(title, node.resourceId);
+          if (node.resourceId.startsWith(MINDMAP_LEGACY_NOTEBOOK_PREFIX)) {
+            db.prepare("UPDATE mindmap_folders SET name = ?, updatedAt = datetime('now') WHERE id = ?")
+              .run(title, node.resourceId.slice(MINDMAP_LEGACY_NOTEBOOK_PREFIX.length));
+          }
+        } else if (node.resourceType === "note") {
+          db.prepare("UPDATE notes SET title = ?, version = version + 1, updatedAt = datetime('now') WHERE id = ?").run(title, node.resourceId);
+        } else if (node.resourceType === "mindmap") {
+          db.prepare("UPDATE mindmaps SET title = ?, updatedAt = datetime('now') WHERE id = ?").run(title, node.resourceId);
+        } else if (node.resourceType === "file") {
+          if (title.length > 255 || /[\\/\u0000-\u001f]/.test(title)) {
+            throw new KnowledgeTreeError("KNOWLEDGE_FILE_NAME_INVALID", 400, "文件名包含非法字符或过长");
+          }
+          db.prepare("UPDATE attachments SET filename = ? WHERE id = ?").run(title, node.resourceId);
+        }
+      }
+      if (isExpanded !== undefined) {
+        db.prepare("UPDATE knowledge_tree_nodes SET isExpanded = ?, updatedAt = datetime('now') WHERE id = ?")
+          .run(isExpanded, nodeId);
+        if (node.resourceType === "notebook") {
+          db.prepare("UPDATE notebooks SET isExpanded = ? WHERE id = ?").run(isExpanded, node.resourceId);
+        }
+      }
+    })();
+    const refreshed = listKnowledgeTree({ userId: userIdOf(c), workspaceId: workspaceIdOf(c) })
+      .find((entry) => entry.id === nodeId);
+    return c.json(refreshed || { success: true });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.put("/nodes/:nodeId/move", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const conflict = verifyTreePreconditions(c, c.req.param("nodeId"), body, true);
+    if (conflict) return conflict;
+    const node = moveKnowledgeNode({
+      actorUserId: userIdOf(c),
+      nodeId: c.req.param("nodeId"),
+      parentId: typeof body.parentId === "string" && body.parentId ? body.parentId : null,
+      sortOrder: typeof body.sortOrder === "number" ? body.sortOrder : undefined,
+    });
+    return c.json(node);
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.put("/batch/move", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    if (body.parentId !== null && (typeof body.parentId !== "string" || !body.parentId.trim())) {
+      return c.json({ error: "parentId 必须是非空字符串或 null", code: "KNOWLEDGE_BATCH_PARENT_INVALID" }, 400);
+    }
+    const parentId = body.parentId === null ? null : body.parentId.trim();
+    return c.json(moveKnowledgeNodesBatch({
+      actorUserId: userIdOf(c),
+      nodeIds: body.nodeIds,
+      parentId,
+    }));
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.put("/reorder", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    if (!Array.isArray(body.items)) return c.json({ error: "items is required" }, 400);
+    return c.json(reorderKnowledgeNodes({ actorUserId: userIdOf(c), items: body.items }));
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.delete("/nodes/:nodeId", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const conflict = verifyTreePreconditions(c, c.req.param("nodeId"), body, true);
+    if (conflict) return conflict;
+    const mode = c.req.query("mode") === "promote" ? "promote" : "subtree";
+    const actorUserId = userIdOf(c);
+    const nodeId = c.req.param("nodeId");
+    const db = getDb();
+    const result = deleteKnowledgeNode({
+      actorUserId,
+      nodeId,
+      mode,
+      db,
+    });
+
+    // DELETE /knowledge-tree returns tree-node ids. Resolve the affected
+    // note resource ids after the soft delete (tree rows intentionally
+    // remain as tombstones) and reuse the existing privacy-safe batch
+    // realtime event: the actor receives exact ids, workspace peers only
+    // receive a generic invalidation signal.
+    broadcastDeletedKnowledgeNotes(result.affectedNodeIds, actorUserId);
+
+    return c.json(result);
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.post("/batch/delete", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const actorUserId = userIdOf(c);
+    const db = getDb();
+    const result = deleteKnowledgeNodesBatch({ actorUserId, nodeIds: body.nodeIds, db });
+
+    broadcastDeletedKnowledgeNotes(result.affectedNodeIds, actorUserId);
+
+    return c.json(result);
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.post("/nodes/:nodeId/restore", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const conflict = verifyTreePreconditions(c, c.req.param("nodeId"), body, true);
+    if (conflict) return conflict;
+    return c.json(restoreKnowledgeNode({
+      actorUserId: userIdOf(c),
+      nodeId: c.req.param("nodeId"),
+      includeSubtree: body.includeSubtree !== false,
+    }));
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+function notebookPasswordTarget(nodeId: string, userId: string) {
+  const db = getDb();
+  ensureKnowledgeTreePasswordTable(db);
+  const access = resolveKnowledgeNodeAccess(nodeId, userId, db);
+  const node = db.prepare(`
+    SELECT resourceId FROM knowledge_tree_nodes
+    WHERE id = ? AND resourceType = 'notebook' AND isDeleted = 0
+  `).get(nodeId) as { resourceId: string } | undefined;
+  if (!node) throw new KnowledgeTreeError("KNOWLEDGE_FOLDER_NOT_FOUND", 404, "文件夹不存在");
+  return { db, access, notebookId: node.resourceId };
+}
+
+function passwordDigest(password: string): string {
+  return createHash("sha256").update(password, "utf8").digest("base64");
+}
+
+app.post("/nodes/:nodeId/unlock", async (c) => {
+  try {
+    const target = notebookPasswordTarget(c.req.param("nodeId"), userIdOf(c));
+    if (!target.access.capabilities.canView) {
+      return c.json({ error: "没有查看权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN" }, 403);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const password = typeof body.password === "string" ? body.password : "";
+    const row = target.db.prepare("SELECT passwordHash, passwordVersion FROM notebook_passwords WHERE notebookId = ?")
+      .get(target.notebookId) as { passwordHash: string; passwordVersion: number } | undefined;
+    if (!row) {
+      return c.json({
+        success: true,
+        isPasswordProtected: false,
+        unlockToken: signFolderUnlockToken({
+          userId: userIdOf(c),
+          nodeId: c.req.param("nodeId"),
+          notebookId: target.notebookId,
+          passwordVersion: 0,
+        }),
+      });
+    }
+    if (!password || !(await bcrypt.compare(passwordDigest(password), row.passwordHash))) {
+      return c.json({ error: "密码错误", code: "FOLDER_PASSWORD_INVALID" }, 403);
+    }
+    return c.json({
+      success: true,
+      isPasswordProtected: true,
+      unlockToken: signFolderUnlockToken({
+        userId: userIdOf(c),
+        nodeId: c.req.param("nodeId"),
+        notebookId: target.notebookId,
+        passwordVersion: row.passwordVersion,
+      }),
+    });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.put("/nodes/:nodeId/password", async (c) => {
+  try {
+    const target = notebookPasswordTarget(c.req.param("nodeId"), userIdOf(c));
+    if (!target.access.capabilities.canManageMembers) {
+      return c.json({ error: "没有密码管理权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN" }, 403);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
+    const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
+    if (newPassword.length < 4 || newPassword.length > 64 || !newPassword.trim()) {
+      return c.json({ error: "密码长度需为 4–64 个字符", code: "FOLDER_PASSWORD_INVALID_LENGTH" }, 400);
+    }
+    const current = target.db.prepare("SELECT passwordHash, passwordVersion FROM notebook_passwords WHERE notebookId = ?")
+      .get(target.notebookId) as { passwordHash: string; passwordVersion: number } | undefined;
+    if (current && (!currentPassword || !(await bcrypt.compare(passwordDigest(currentPassword), current.passwordHash)))) {
+      return c.json({ error: "当前密码错误", code: "FOLDER_PASSWORD_CURRENT_INVALID" }, 403);
+    }
+    const passwordHash = await bcrypt.hash(passwordDigest(newPassword), 10);
+    const nextVersion = (current?.passwordVersion || 0) + 1;
+    target.db.transaction(() => {
+      target.db.prepare(`
+        INSERT INTO notebook_passwords (notebookId, passwordHash, passwordVersion, updatedAt)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(notebookId) DO UPDATE SET
+          passwordHash = excluded.passwordHash,
+          passwordVersion = excluded.passwordVersion,
+          updatedAt = datetime('now')
+      `).run(target.notebookId, passwordHash, nextVersion);
+      target.db.prepare("UPDATE knowledge_tree_nodes SET isExpanded = 0, updatedAt = datetime('now') WHERE id = ?")
+        .run(c.req.param("nodeId"));
+      target.db.prepare("UPDATE notebooks SET isExpanded = 0, updatedAt = datetime('now') WHERE id = ?")
+        .run(target.notebookId);
+    })();
+    return c.json({ success: true, isPasswordProtected: true });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.delete("/nodes/:nodeId/password", async (c) => {
+  try {
+    const target = notebookPasswordTarget(c.req.param("nodeId"), userIdOf(c));
+    if (!target.access.capabilities.canManageMembers) {
+      return c.json({ error: "没有密码管理权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN" }, 403);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
+    const current = target.db.prepare("SELECT passwordHash FROM notebook_passwords WHERE notebookId = ?")
+      .get(target.notebookId) as { passwordHash: string } | undefined;
+    if (!current) {
+      return c.json({ success: true, isPasswordProtected: false });
+    }
+    if (!currentPassword || !(await bcrypt.compare(passwordDigest(currentPassword), current.passwordHash))) {
+      return c.json({ error: "当前密码错误", code: "FOLDER_PASSWORD_CURRENT_INVALID" }, 403);
+    }
+    const removed = target.db.prepare(`
+      DELETE FROM notebook_passwords
+      WHERE notebookId = ? AND passwordHash = ?
+    `).run(target.notebookId, current.passwordHash);
+    if (removed.changes === 0) {
+      return c.json({
+        error: "文件夹密码已变更，请重新输入当前密码",
+        code: "FOLDER_PASSWORD_CHANGED",
+      }, 409);
+    }
+    return c.json({ success: true, isPasswordProtected: false });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.get("/nodes/:nodeId/permissions", (c) => {
+  try {
+    const nodeId = c.req.param("nodeId");
+    const access = resolveKnowledgeNodeAccess(nodeId, userIdOf(c));
+    if (!access.capabilities.canManageMembers) {
+      return c.json({ error: "没有成员管理权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN", required: "canManageMembers" }, 403);
+    }
+    return c.json({ ...listKnowledgeNodeRoles(nodeId), currentUserAccess: access });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.put("/nodes/:nodeId/permissions", async (c) => {
+  try {
+    const nodeId = c.req.param("nodeId");
+    const actorUserId = userIdOf(c);
+    const access = resolveKnowledgeNodeAccess(nodeId, actorUserId);
+    if (!access.capabilities.canManageMembers) {
+      return c.json({ error: "没有成员管理权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN", required: "canManageMembers" }, 403);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const preset = parseKnowledgeRolePreset(body.rolePreset);
+    if (!preset) return c.json({ error: "无效角色预设", code: "KNOWLEDGE_ROLE_INVALID" }, 400);
+    const subject = resolveKnowledgePermissionSubject(String(body.subject || body.userId || ""));
+    if (!subject) return c.json({ error: "用户不存在", code: "KNOWLEDGE_PERMISSION_USER_NOT_FOUND" }, 404);
+    const row = setKnowledgeNodeRole({
+      nodeId,
+      targetUserId: subject.id,
+      rolePreset: preset,
+      actorUserId,
+    });
+    return c.json({ ...row, user: subject, effective: resolveKnowledgeNodeAccess(nodeId, subject.id) });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.delete("/nodes/:nodeId/permissions/:userId", (c) => {
+  try {
+    const nodeId = c.req.param("nodeId");
+    const actorUserId = userIdOf(c);
+    const access = resolveKnowledgeNodeAccess(nodeId, actorUserId);
+    if (!access.capabilities.canManageMembers) {
+      return c.json({ error: "没有成员管理权限", code: "KNOWLEDGE_CAPABILITY_FORBIDDEN", required: "canManageMembers" }, 403);
+    }
+    const targetUserId = c.req.param("userId");
+    return c.json({
+      success: true,
+      removed: clearKnowledgeNodeRole({ nodeId, targetUserId, actorUserId }),
+      effective: resolveKnowledgeNodeAccess(nodeId, targetUserId),
+    });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+app.get("/nodes/:nodeId/history", (c) => {
+  try {
+    return c.json({ history: listKnowledgeTreeHistory(c.req.param("nodeId"), userIdOf(c)) });
+  } catch (error) {
+    return mapError(c, error);
+  }
+});
+
+export default app;

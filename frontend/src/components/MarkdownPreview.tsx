@@ -1,0 +1,613 @@
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import { getGfmTaskChecked, wrapGfmTaskInlineContent } from "@/lib/gfmTaskChecked";
+import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import { AlertTriangle, BadgeAlert, ExternalLink, Info, Lightbulb, ShieldAlert } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/utils";
+import { remarkSiyuanCallouts, type SiyuanCalloutType } from "@/lib/markdownCallouts";
+import {
+  buildMarkdownPreviewHeadingIndex,
+  headingDataAttrs,
+  scrollMarkdownPreviewToPosition,
+} from "@/lib/markdownPreviewOutline";
+import { preprocessMarkdownVideos } from "@/lib/markdownVideoSyntax";
+import { MarkdownVideoPreview } from "@/components/MarkdownVideoPreview";
+import { MotionPhotoOverlay } from "@/components/MotionPhotoOverlay";
+import { downloadAttachment } from "@/lib/downloadFile";
+import FullscreenImageViewer, { type FullscreenImageItem } from "@/components/FullscreenImageViewer";
+import { MarkdownCodeBlock, isMarkdownBlockCode } from "@/components/MarkdownCodeBlock";
+import { MathView } from "@/components/MathView";
+import { NoteLinkPreviewAnchor } from "@/components/NoteLinkPreview";
+import { BlockEmbedCard } from "@/components/BlockEmbedExtension";
+import MindMapEmbedCard, { parseMindMapEmbedHref } from "@/components/MindMapEmbedCard";
+import { preprocessInternalNoteLinks } from "@/lib/noteLinkSyntax";
+import { projectMarkdownForUser } from "@/lib/markdownUserContent";
+import { AttachmentNoteContext, useAttachmentImageRenderSource } from "@/hooks/useAttachmentImageRenderSource";
+import { useAttachmentVideoRenderSource } from "@/hooks/useAttachmentVideoRenderSource";
+import {
+  MARKDOWN_SEGMENTED_PREVIEW_THRESHOLD,
+  splitMarkdownPreview,
+  type MarkdownPreviewSegment,
+} from "@/lib/markdownPreviewSegments";
+
+import VoiceMemoAudio from "@/components/VoiceMemoAudio";
+import VoiceTranscription from "@/components/VoiceTranscription";
+
+interface MarkdownPreviewProps {
+  markdown: string;
+  noteId?: string;
+  onInsertVoiceTranscript?: (text: string) => void;
+  className?: string;
+  compact?: boolean;
+  containerRef?: React.Ref<HTMLDivElement>;
+  onTaskCheckboxChange?: (taskIndex: number, checked: boolean) => void;
+  onFormatCodeBlock?: (source: string, offset: number) => Promise<void>;
+  onEditEncryptedBlock?: (source: string, rendered: string, offset: number) => void;
+}
+
+const RAW_HTML_RE = /<\/?[a-z][^>]*>/i;
+
+function preprocessMarkdownMath(markdown: string): string {
+  const fencedCode: string[] = [];
+  let text = markdown.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, (match) => {
+    const index = fencedCode.push(match) - 1;
+    return `\u0000NOWEN_MATH_CODE_${index}\u0000`;
+  });
+
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_match, source) => {
+    const encoded = encodeURIComponent(String(source).trim());
+    return `\n\n<div data-nowen-math-source="${encoded}" data-nowen-math-display="1"></div>\n\n`;
+  });
+
+  text = text.replace(
+    /(^|[^\\$\w])\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$(?=$|[^\w$])/g,
+    (_match, prefix, source) => {
+      const encoded = encodeURIComponent(String(source));
+      return `${prefix}<span data-nowen-math-source="${encoded}" data-nowen-math-display="0"></span>`;
+    },
+  );
+
+  return text.replace(/\u0000NOWEN_MATH_CODE_(\d+)\u0000/g, (_match, index) => {
+    return fencedCode[Number(index)] || "";
+  });
+}
+
+function getMathSource(props: Record<string, unknown>): string | null {
+  const encoded = props["data-nowen-math-source"] ?? props.dataNowenMathSource;
+  if (typeof encoded !== "string") return null;
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return null;
+  }
+}
+
+export const safeHtmlSchema = {
+  ...defaultSchema,
+  tagNames: Array.from(new Set([
+    ...(defaultSchema.tagNames || []),
+    "iframe",
+    "details",
+    "summary",
+    "mark",
+    "kbd",
+    "u",
+    "sup",
+    "sub",
+    "video",
+    "audio",
+    "source",
+  ])),
+  attributes: {
+    ...(defaultSchema.attributes || {}),
+    "*": [
+      ...((defaultSchema.attributes || {})["*"] || []),
+      "dataNowenMathSource",
+      "dataNowenMathDisplay",
+      "dataNowenTitleMode",
+      "dataNowenBlockEmbed",
+      "dataCalloutType",
+      "dataCalloutTitle",
+      "dataCalloutFold",
+      "data-callout-type",
+      "data-callout-title",
+      "data-callout-fold",
+    ],
+    iframe: ["src", "title", "width", "height", "loading", "allow", "allowFullScreen", "referrerPolicy"],
+    video: ["src", "controls", "poster", "preload", "width", "height"],
+    audio: ["src", "controls", "preload"],
+    source: ["src", "type"],
+    details: ["open"],
+    ul: ["className"],
+    li: ["className"],
+    input: ["type", "checked", "disabled"],
+    code: ["className"],
+  },
+  protocols: {
+    ...(defaultSchema.protocols || {}),
+    href: ["http", "https", "mailto", "tel", "note"],
+    src: ["http", "https", "data", "blob"],
+  },
+};
+
+function decodeHtmlAmpersands(value: string): string {
+  let decoded = value;
+  for (let pass = 0; pass < 3; pass += 1) {
+    const next = decoded.replace(/&(?:amp|#0*38|#x0*26);/gi, "&");
+    if (next === decoded) break;
+    decoded = next;
+  }
+  return decoded;
+}
+
+export function normalizeEmbeddableUrl(src?: string): { url: string; sameOrigin: boolean } | null {
+  if (!src) return null;
+  try {
+    // Raw HTML is parsed once by rehype before this component receives `src`.
+    // Older SiYuan imports may still contain a second escaped layer (`&amp;`).
+    const parsed = new URL(decodeHtmlAmpersands(src), window.location.href);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return { url: parsed.toString(), sameOrigin: parsed.origin === window.location.origin };
+  } catch {
+    return null;
+  }
+}
+
+function PreviewIframe({ src, title }: { src?: string; title?: string }) {
+  const resolved = normalizeEmbeddableUrl(src);
+  if (!resolved) {
+    return (
+      <div className="my-4 flex items-center gap-2 rounded-xl border border-amber-300/60 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
+        <AlertTriangle size={16} className="shrink-0" />
+        无法预览不安全或无效的 iframe 地址
+      </div>
+    );
+  }
+
+  const sandbox = resolved.sameOrigin
+    ? "allow-scripts allow-forms allow-popups allow-presentation"
+    : "allow-scripts allow-same-origin allow-forms allow-popups allow-presentation";
+
+  return (
+    <div className="my-4 overflow-hidden rounded-xl border border-app-border bg-black/5 shadow-sm dark:bg-white/5">
+      <iframe
+        src={resolved.url}
+        title={title || "Embedded content"}
+        loading="lazy"
+        sandbox={sandbox}
+        referrerPolicy="strict-origin-when-cross-origin"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
+        allowFullScreen
+        className="block min-h-[320px] w-full bg-white sm:min-h-[420px]"
+      />
+      <a
+        href={resolved.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="flex items-center justify-end gap-1 border-t border-app-border px-3 py-2 text-[11px] text-tx-tertiary hover:text-accent-primary"
+      >
+        在新窗口打开 <ExternalLink size={11} />
+      </a>
+    </div>
+  );
+}
+
+function PreviewImage({ src, alt }: { src?: string; alt?: string }) {
+  const { t } = useTranslation();
+  const [viewer, setViewer] = useState<{ images: FullscreenImageItem[]; initialIndex: number } | null>(null);
+  const imageRender = useAttachmentImageRenderSource(src);
+  const resolvedSrc = imageRender.renderSrc;
+
+  useEffect(() => {
+    setViewer(null);
+  }, [resolvedSrc]);
+
+  const openViewer = (image: HTMLImageElement) => {
+    const root = image.closest(".nowen-md-preview");
+    const elements = Array.from(root?.querySelectorAll<HTMLImageElement>("img") || []);
+    const images = elements
+      .map<FullscreenImageItem>((item) => ({
+        src: item.currentSrc || item.src || item.getAttribute("src") || "",
+        alt: item.alt || "",
+      }))
+      .filter((item) => !!item.src);
+    setViewer({
+      images: images.length ? images : [{ src: resolvedSrc, alt: alt || "" }],
+      initialIndex: Math.max(0, elements.indexOf(image)),
+    });
+  };
+
+  if (!src) return null;
+  if (imageRender.error) {
+    return <span className="inline-flex items-center gap-2 rounded-lg bg-app-hover px-3 py-2 text-xs text-tx-tertiary">⚠ {t("markdown.preview.imageLoadFailed")} <button type="button" className="underline" onClick={() => { void downloadAttachment(src, alt || "photo"); }}>下载原件</button></span>;
+  }
+  return (
+    <>
+      <span className="relative my-4 inline-block max-w-full">
+      <img
+        key={imageRender.renderKey}
+        src={resolvedSrc || undefined}
+        alt={alt || ""}
+        loading="lazy"
+        className="block max-h-[520px] max-w-full cursor-pointer rounded-xl border border-app-border object-contain shadow-sm transition-opacity hover:opacity-90"
+        onClick={(event) => openViewer(event.currentTarget)}
+        onLoad={imageRender.onLoad}
+        onError={imageRender.onError}
+      />
+      {!!resolvedSrc && <MotionPhotoOverlay source={src} />}
+      </span>
+      <FullscreenImageViewer
+        open={!!viewer}
+        images={viewer?.images}
+        initialIndex={viewer?.initialIndex || 0}
+        onClose={() => setViewer(null)}
+      />
+    </>
+  );
+}
+
+function PreviewRawVideo({ src, poster }: { src?: string; poster?: string }) {
+  const media = useAttachmentVideoRenderSource(src);
+  const cover = useAttachmentImageRenderSource(poster, { enabled: !!poster });
+  return <video key={media.renderKey} src={media.renderSrc || undefined}
+    poster={cover.renderSrc || undefined} controls playsInline preload="metadata"
+    className="my-4 max-h-[520px] w-full rounded-xl border border-app-border bg-black" />;
+}
+
+function PreviewMediaImage({ src, alt }: { src?: string; alt?: string }) {
+  const normalizedAlt = alt || "";
+  if (normalizedAlt.startsWith("nowen-video:")) {
+    return <MarkdownVideoPreview src={src || ""} title={normalizedAlt.slice("nowen-video:".length)} />;
+  }
+  return <PreviewImage src={src} alt={alt} />;
+}
+
+function PreviewLink({ href, children, onInternalAnchorClick, ...props }: {
+  href?: string;
+  children?: React.ReactNode;
+  onInternalAnchorClick?: (fragment: string) => void;
+  [key: string]: any;
+}) {
+  if (href?.startsWith("note:")) {
+    const mode = props["data-nowen-title-mode"] || props.dataNowenTitleMode;
+    return <NoteLinkPreviewAnchor href={href} titleMode={mode === "alias" ? "alias" : "auto"}>{children}</NoteLinkPreviewAnchor>;
+  }
+  if (href?.startsWith("#")) {
+    return (
+      <a
+        href={href}
+        className="text-accent-primary underline-offset-2 hover:underline"
+        onClick={(event) => {
+          if (!onInternalAnchorClick) return;
+          event.preventDefault();
+          onInternalAnchorClick(href.slice(1));
+        }}
+      >
+        {children}
+      </a>
+    );
+  }
+  return <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent-primary underline-offset-2 hover:underline">{children}</a>;
+}
+
+const calloutStyles: Record<SiyuanCalloutType, { icon: React.ComponentType<any>; className: string }> = {
+  note: { icon: Info, className: "border-blue-400/70 bg-blue-500/10 text-blue-600 dark:text-blue-300" },
+  tip: { icon: Lightbulb, className: "border-emerald-400/70 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" },
+  important: { icon: BadgeAlert, className: "border-violet-400/70 bg-violet-500/10 text-violet-600 dark:text-violet-300" },
+  warning: { icon: AlertTriangle, className: "border-amber-400/80 bg-amber-500/10 text-amber-600 dark:text-amber-300" },
+  caution: { icon: ShieldAlert, className: "border-red-400/80 bg-red-500/10 text-red-600 dark:text-red-300" },
+};
+
+function CalloutBlockquote({ node, children, sourceOffset = 0 }: { node?: any; children?: React.ReactNode; sourceOffset?: number }) {
+  const type = (node?.properties?.["data-callout-type"] ?? node?.properties?.dataCalloutType) as SiyuanCalloutType | undefined;
+  const title = (node?.properties?.["data-callout-title"] ?? node?.properties?.dataCalloutTitle) as string | undefined;
+  const style = type ? calloutStyles[type] : undefined;
+  if (!type || !title || !style) {
+    return <blockquote {...headingDataAttrs(node, sourceOffset)} className="my-4 rounded-r-lg border-l-4 border-accent-primary/40 bg-app-hover/40 px-4 py-2 italic text-tx-secondary">{children}</blockquote>;
+  }
+  const Icon = style.icon;
+  return (
+    <blockquote {...headingDataAttrs(node, sourceOffset)} className={cn("my-4 rounded-r-lg border-l-4 px-4 py-3", style.className)}>
+      <div className="flex items-center gap-2 text-sm font-semibold"><Icon size={16} className="shrink-0" /><span>{title}</span></div>
+      <div className="mt-2 text-tx-primary [&>p:first-child]:mt-0 [&>p:last-child]:mb-0">{children}</div>
+    </blockquote>
+  );
+}
+
+function createComponents(
+  onTaskCheckboxChange?: (taskIndex: number, checked: boolean) => void,
+  sourceOffset = 0,
+  taskOffset = 0,
+  headingIds?: ReadonlyMap<number, string>,
+  headingPositions?: ReadonlyMap<number, number>,
+  onInternalAnchorClick?: (fragment: string) => void,
+  onFormatCodeBlock?: (offset: number) => Promise<void>,
+  onInsertVoiceTranscript?: (text: string) => void,
+  onEditEncryptedBlock?: (offset: number) => void,
+): Record<string, React.FC<any>> {
+  const attrs = (node: any) => headingDataAttrs(node, sourceOffset);
+  const headingAttrs = (node: any) => headingDataAttrs(node, sourceOffset, headingIds, headingPositions);
+  return {
+    h1: ({ node, children }) => <h1 {...headingAttrs(node)} className="mb-4 mt-2 text-3xl font-bold leading-tight text-tx-primary">{children}</h1>,
+    h2: ({ node, children }) => <h2 {...headingAttrs(node)} className="mb-3 mt-6 border-b border-app-border pb-2 text-2xl font-bold leading-snug text-tx-primary">{children}</h2>,
+    h3: ({ node, children }) => <h3 {...headingAttrs(node)} className="mb-2 mt-5 text-xl font-semibold text-tx-primary">{children}</h3>,
+    h4: ({ node, children }) => <h4 {...headingAttrs(node)} className="mb-2 mt-4 text-lg font-semibold text-tx-primary">{children}</h4>,
+    h5: ({ node, children }) => <h5 {...headingAttrs(node)} className="mb-1.5 mt-3 text-base font-semibold text-tx-primary">{children}</h5>,
+    h6: ({ node, children }) => <h6 {...headingAttrs(node)} className="mb-1.5 mt-3 text-sm font-semibold text-tx-secondary">{children}</h6>,
+    p: ({ node, children }) => {
+      const checked = getGfmTaskChecked(node);
+      const parts = checked === null ? null : React.Children.toArray(children);
+      // Isolate task text from the checkbox, including when the paragraph is flex.
+      return (
+        <p {...attrs(node)} className="my-3 leading-7 text-tx-primary">
+          {parts ? <>{parts[0]}<span className="nowen-task-item-text min-w-0 flex-1">{parts.slice(1)}</span></> : children}
+        </p>
+      );
+    },
+    ul: ({ node, children, className }) => {
+      const isTaskList = /(?:^|\s)contains-task-list(?:\s|$)/.test(className || "");
+      return (
+        <ul
+          {...attrs(node)}
+          className={cn(
+            "my-3 space-y-1 text-tx-primary",
+            isTaskList ? "list-none pl-0" : "list-disc pl-6",
+            className,
+          )}
+        >
+          {children}
+        </ul>
+      );
+    },
+    // Markdown can contain independent ordered lists separated by attachments or paragraphs.
+    // react-markdown supplies the HTML start attribute for each list (e.g. 7. / 8. / 9.).
+    // Preserve it so the browser does not restart every list at 1.
+    ol: ({ node, children, className, start }) => <ol {...attrs(node)} start={start} className={cn("my-3 list-decimal space-y-1 pl-6 text-tx-primary", className)}>{children}</ol>,
+    li: ({ node, children, className }) => {
+      const isTask = /(?:^|\s)task-list-item(?:\s|$)/.test(className || "");
+      const checked = isTask ? getGfmTaskChecked(node) : null;
+      return (
+        <li
+          {...attrs(node)}
+          data-checked={checked === null ? undefined : String(checked)}
+          className={cn(
+            "leading-7",
+            isTask
+              ? "list-none pl-0 [&>p]:my-1 [&>p]:flex [&>p]:items-start [&>p]:gap-2 [&>ul]:ml-6"
+              : "pl-1",
+            className,
+          )}
+        >
+          {isTask ? wrapGfmTaskInlineContent(children) : children}
+        </li>
+      );
+    },
+    strong: ({ children }) => <strong className="font-semibold text-tx-primary">{children}</strong>,
+    em: ({ children }) => <em className="italic">{children}</em>,
+    a: (props) => <PreviewLink {...props} onInternalAnchorClick={onInternalAnchorClick} />,
+    img: PreviewMediaImage,
+    iframe: PreviewIframe,
+    video: ({ src, poster, node }) => {
+      const sourceNode = node?.children?.find((child: import("hast").ElementContent) => child.type === "element" && child.tagName === "source");
+      const source = String(src || (sourceNode?.type === "element" ? sourceNode.properties?.src : "") || "");
+      return <PreviewRawVideo src={source} poster={typeof poster === "string" ? poster : undefined} />;
+    },
+    audio: ({ src, node }) => {
+      const sourceNode = node?.children?.find((child: import("hast").ElementContent) => child.type === "element" && child.tagName === "source");
+      const source = String(src || (sourceNode?.type === "element" ? sourceNode.properties?.src : "") || "");
+      return <div className="my-4"><VoiceMemoAudio src={source} />{onInsertVoiceTranscript && <VoiceTranscription key={source} src={source} onInsert={onInsertVoiceTranscript} />}</div>;
+    },
+    details: ({ node, children, open }) => <details {...attrs(node)} open={open} className="my-4 rounded-lg border border-app-border bg-app-surface px-4 py-2">{children}</details>,
+    summary: ({ children }) => <summary className="cursor-pointer py-1 font-medium text-tx-primary">{children}</summary>,
+    mark: ({ children }) => <mark className="rounded bg-yellow-200/80 px-0.5 text-inherit dark:bg-yellow-500/30">{children}</mark>,
+    kbd: ({ children }) => <kbd className="rounded border border-app-border bg-app-hover px-1.5 py-0.5 font-mono text-xs shadow-sm">{children}</kbd>,
+    u: ({ children }) => <u className="underline underline-offset-2">{children}</u>,
+    span: ({ children, ...props }) => {
+      const source = getMathSource(props);
+      return source === null ? <span {...props}>{children}</span> : <MathView source={source} />;
+    },
+    div: ({ children, ...props }) => {
+      const source = getMathSource(props);
+      const embedHref = props["data-nowen-block-embed"] ?? props.dataNowenBlockEmbed;
+      if (typeof embedHref === "string" && parseMindMapEmbedHref(embedHref)) {
+        return <div className="my-4"><MindMapEmbedCard href={embedHref} /></div>;
+      }
+      if (typeof embedHref === "string" && embedHref.startsWith("note:")) {
+        return <div className="my-4"><BlockEmbedCard href={embedHref} /></div>;
+      }
+      return source === null
+        ? <div {...props}>{children}</div>
+        : <MathView source={source} display />;
+    },
+    code: ({ node, className, children }) => {
+      const raw = String(children ?? "");
+      const isBlock = isMarkdownBlockCode(className) || raw.endsWith("\n");
+      return isBlock
+        ? <MarkdownCodeBlock className={className} onFormat={onFormatCodeBlock && typeof node?.position?.start?.offset === "number"
+          ? () => onFormatCodeBlock(sourceOffset + node.position.start.offset) : undefined}
+          onEditEncryptedBlock={onEditEncryptedBlock && typeof node?.position?.start?.offset === "number"
+            ? () => onEditEncryptedBlock(sourceOffset + node.position.start.offset) : undefined}>{children}</MarkdownCodeBlock>
+        : <code className="rounded bg-app-hover px-1.5 py-0.5 font-mono text-[13px] text-accent-primary">{children}</code>;
+    },
+    pre: ({ node, children }) => <div {...attrs(node)}>{children}</div>,
+    blockquote: ({ node, children }) => <CalloutBlockquote node={node} sourceOffset={sourceOffset}>{children}</CalloutBlockquote>,
+    table: ({ node, children }) => <div {...attrs(node)} className="my-4 overflow-x-auto [content-visibility:auto] [contain-intrinsic-size:auto_240px]"><table className="w-full border-collapse text-sm">{children}</table></div>,
+    thead: ({ children }) => <thead className="bg-app-hover">{children}</thead>,
+    th: ({ children }) => <th className="border border-app-border px-3 py-2 text-left font-semibold text-tx-primary">{children}</th>,
+    td: ({ children }) => <td className="border border-app-border px-3 py-2 text-tx-primary">{children}</td>,
+    hr: ({ node }) => <hr {...attrs(node)} className="my-6 border-app-border" />,
+    del: ({ children }) => <del className="text-tx-tertiary line-through">{children}</del>,
+    input: ({ checked, type }: { checked?: boolean; type?: string }) => {
+      if (type !== "checkbox") return <input type={type} />;
+      return (
+        <input
+          type="checkbox"
+          checked={!!checked}
+          readOnly={!onTaskCheckboxChange}
+          onChange={(event) => {
+            const root = event.currentTarget.closest("[data-markdown-segment]") || event.currentTarget.closest(".nowen-md-preview");
+            const inputs = Array.from(root?.querySelectorAll<HTMLInputElement>("input[type='checkbox']") || []);
+            const index = inputs.indexOf(event.currentTarget);
+            if (index >= 0) onTaskCheckboxChange?.(taskOffset + index, event.currentTarget.checked);
+          }}
+          className={cn("mt-[0.38rem] h-4 w-4 shrink-0 accent-accent-primary", onTaskCheckboxChange && "cursor-pointer")}
+        />
+      );
+    },
+  };
+}
+
+function MarkdownSegment({ segment, onTaskCheckboxChange, headingIds, headingPositions, onInternalAnchorClick, onFormatCodeBlock, onInsertVoiceTranscript, onEditEncryptedBlock }: {
+  segment: MarkdownPreviewSegment;
+  onInsertVoiceTranscript?: (text: string) => void;
+  onTaskCheckboxChange?: (taskIndex: number, checked: boolean) => void;
+  headingIds: ReadonlyMap<number, string>;
+  headingPositions: ReadonlyMap<number, number>;
+  onInternalAnchorClick: (fragment: string) => void;
+  onFormatCodeBlock?: (offset: number) => Promise<void>;
+  onEditEncryptedBlock?: (offset: number) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const [mounted, setMounted] = useState(() => segment.start === 0 || typeof IntersectionObserver === "undefined");
+  const [estimatedHeight, setEstimatedHeight] = useState(480);
+  useEffect(() => {
+    if (!hostRef.current || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries.some((entry) => entry.isIntersecting);
+      setMounted(visible);
+    }, { rootMargin: "1000px 0px" });
+    observer.observe(hostRef.current);
+    return () => observer.disconnect();
+  }, [segment.id]);
+  useLayoutEffect(() => {
+    if (!mounted || !hostRef.current) return;
+    const height = Math.ceil(hostRef.current.getBoundingClientRect().height);
+    if (height > 0) setEstimatedHeight(height);
+  }, [mounted, segment.markdown]);
+  const components = useMemo(
+    () => createComponents(onTaskCheckboxChange, segment.start, segment.taskOffset, headingIds, headingPositions, onInternalAnchorClick, onFormatCodeBlock, onInsertVoiceTranscript, onEditEncryptedBlock),
+    [headingIds, headingPositions, onInternalAnchorClick, onTaskCheckboxChange, onFormatCodeBlock, onInsertVoiceTranscript, onEditEncryptedBlock, segment.start, segment.taskOffset],
+  );
+  const rehypePlugins: any[] = RAW_HTML_RE.test(segment.markdown)
+    ? [rehypeRaw, [rehypeSanitize, safeHtmlSchema]]
+    : [];
+  return (
+    <div
+      ref={hostRef}
+      data-markdown-segment={segment.id}
+      data-md-pos={segment.start}
+      data-md-segment-start={segment.start}
+      data-md-segment-end={segment.end}
+      className="[content-visibility:auto]"
+      style={{ containIntrinsicSize: `auto ${estimatedHeight}px` }}
+    >
+      {mounted ? (
+        <ReactMarkdown remarkPlugins={[remarkGfm, remarkSiyuanCallouts]} rehypePlugins={rehypePlugins} components={components}>
+          {segment.markdown}
+        </ReactMarkdown>
+      ) : <div aria-hidden="true" style={{ minHeight: estimatedHeight }} />}
+    </div>
+  );
+}
+
+export function MarkdownPreview({ markdown, noteId, className, compact, containerRef, onTaskCheckboxChange, onFormatCodeBlock, onInsertVoiceTranscript, onEditEncryptedBlock }: MarkdownPreviewProps) {
+  const { t } = useTranslation();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const renderedMarkdown = useMemo(() => preprocessInternalNoteLinks(preprocessMarkdownMath(preprocessMarkdownVideos(projectMarkdownForUser(markdown || "")
+    .replace(/[​-‍﻿]/g, "")
+    .replace(/[ 　]/g, " ")))), [markdown]);
+  const headingIndex = useMemo(() => buildMarkdownPreviewHeadingIndex(renderedMarkdown), [renderedMarkdown]);
+  const sourceHeadingIndex = useMemo(() => buildMarkdownPreviewHeadingIndex(markdown || ""), [markdown]);
+  const headingIds = useMemo(
+    () => new Map(headingIndex.map((heading) => [heading.pos, heading.id])),
+    [headingIndex],
+  );
+  const headingPositions = useMemo(
+    () => new Map(headingIndex.map((heading, index) => [
+      heading.pos,
+      sourceHeadingIndex[index]?.pos ?? heading.pos,
+    ])),
+    [headingIndex, sourceHeadingIndex],
+  );
+  const headingsById = useMemo(
+    () => new Map(headingIndex.map((heading, index) => [heading.id, {
+      ...heading,
+      pos: sourceHeadingIndex[index]?.pos ?? heading.pos,
+    }])),
+    [headingIndex, sourceHeadingIndex],
+  );
+  const handleInternalAnchorClick = useCallback((fragment: string) => {
+    let id = fragment;
+    try {
+      id = decodeURIComponent(fragment);
+    } catch {
+      // 无效转义保持原值，仍允许匹配原始标题 ID。
+    }
+    const heading = headingsById.get(id);
+    if (rootRef.current && heading) scrollMarkdownPreviewToPosition(rootRef.current, heading.pos);
+  }, [headingsById]);
+  const setContainerRef = useCallback((node: HTMLDivElement | null) => {
+    rootRef.current = node;
+    if (typeof containerRef === "function") containerRef(node);
+    else if (containerRef) (containerRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
+  }, [containerRef]);
+  const containsRawHtml = RAW_HTML_RE.test(renderedMarkdown);
+  const handleFormatCodeBlock = useMemo(() => onFormatCodeBlock ? async (offset: number) => {
+    const { resolveMarkdownCodeBlockSource } = await import("@/lib/markdownCodeBlockFormatting");
+    await onFormatCodeBlock(markdown, resolveMarkdownCodeBlockSource(markdown, renderedMarkdown, offset));
+  } : undefined, [markdown, renderedMarkdown, onFormatCodeBlock]);
+  const handleEncryptedBlockEdit = useCallback((offset: number) => onEditEncryptedBlock!(markdown, renderedMarkdown, offset), [markdown, renderedMarkdown, onEditEncryptedBlock]);
+  const components = useMemo(
+    () => createComponents(onTaskCheckboxChange, 0, 0, headingIds, headingPositions, handleInternalAnchorClick, handleFormatCodeBlock, onInsertVoiceTranscript, onEditEncryptedBlock ? handleEncryptedBlockEdit : undefined),
+    [handleInternalAnchorClick, headingIds, headingPositions, onTaskCheckboxChange, handleFormatCodeBlock, onInsertVoiceTranscript, onEditEncryptedBlock, handleEncryptedBlockEdit],
+  );
+  const rehypePlugins: any[] = containsRawHtml ? [rehypeRaw, [rehypeSanitize, safeHtmlSchema]] : [];
+  const segments = useMemo(
+    () => renderedMarkdown.length >= MARKDOWN_SEGMENTED_PREVIEW_THRESHOLD
+      ? splitMarkdownPreview(renderedMarkdown)
+      : null,
+    [renderedMarkdown],
+  );
+
+  if (!markdown || !markdown.trim()) {
+    return <div ref={setContainerRef} className={cn("flex h-full items-center justify-center text-sm text-tx-tertiary", className)}>{t("markdown.preview.empty")}</div>;
+  }
+
+  return (
+    <AttachmentNoteContext.Provider value={noteId || null}>
+    <div
+      ref={setContainerRef}
+      className={cn(
+        "nowen-md-preview overflow-y-auto leading-7 text-tx-primary",
+        compact ? "p-4 md:p-6" : "mx-auto max-w-[860px] p-4 md:p-6",
+        className,
+      )}
+    >
+      {segments ? segments.map((segment) => (
+        <MarkdownSegment
+          key={segment.id}
+          segment={segment}
+          onTaskCheckboxChange={onTaskCheckboxChange}
+          headingIds={headingIds}
+          headingPositions={headingPositions}
+          onInternalAnchorClick={handleInternalAnchorClick}
+          onFormatCodeBlock={handleFormatCodeBlock}
+          onEditEncryptedBlock={onEditEncryptedBlock ? handleEncryptedBlockEdit : undefined}
+          onInsertVoiceTranscript={onInsertVoiceTranscript}
+        />
+      )) : (
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkSiyuanCallouts]}
+          rehypePlugins={rehypePlugins}
+          components={components}
+        >
+          {renderedMarkdown}
+        </ReactMarkdown>
+      )}
+    </div>
+    </AttachmentNoteContext.Provider>
+  );
+}

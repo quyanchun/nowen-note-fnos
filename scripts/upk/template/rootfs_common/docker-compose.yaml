@@ -1,0 +1,13 @@
+services:
+  nowen-note:
+    image: {{IMAGE}}
+    container_name: nowen-note
+    restart: always
+    network_mode: host
+    volumes:
+      - ${DATA_PATH}:/app/data
+    environment:
+      - NODE_ENV=production
+      - DB_PATH=/app/data/nowen-note.db
+      - PORT=3001
+      - TZ=${TZ}

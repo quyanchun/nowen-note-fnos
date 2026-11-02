@@ -1,0 +1,355 @@
+import type Database from "better-sqlite3";
+
+import { getDb } from "../db/schema.js";
+import { ensureKnowledgeTreeTables } from "../db/knowledgeTreeMigration.js";
+import { memberQueryService } from "../queries/memberQueryService.js";
+import { findNearestRestrictedKnowledgePolicy } from "./knowledgeAccessPolicy.js";
+import { findNearestKnowledgeDenial } from "./knowledgeDenyPolicy.js";
+import {
+  KNOWLEDGE_ROLE_PRESETS,
+  type EffectiveKnowledgeAccess,
+  type KnowledgeCapabilities,
+  type KnowledgeRolePreset,
+} from "./knowledgeCapabilitiesCore.js";
+
+type TreeNodeRow = {
+  id: string;
+  userId: string;
+  workspaceId: string | null;
+  parentId: string | null;
+  resourceType: "notebook" | "note" | "mindmap" | "file";
+  resourceId: string;
+  isDeleted: number;
+};
+
+type ResourceIdentity = {
+  userId: string;
+  workspaceId: string | null;
+};
+
+type AclRow = {
+  nodeId: string;
+  rolePreset: KnowledgeRolePreset;
+  canView: number;
+  canComment: number;
+  canCreate: number;
+  canEdit: number;
+  canDelete: number;
+  canMove: number;
+  canDownload: number;
+  canReshare: number;
+  canManageMembers: number;
+  depth: number;
+};
+
+type KnowledgeAccessResolveOptions = {
+  /**
+   * Evaluate the ACL attached to a soft-deleted knowledge-tree node.
+   *
+   * This is intentionally opt-in. Normal reads/edits must keep tombstones hidden;
+   * only recycle-bin listing, restore and permanent-delete flows should enable it.
+   */
+  includeDeleted?: boolean;
+};
+
+const NONE: KnowledgeCapabilities = {
+  canView: false,
+  canComment: false,
+  canCreate: false,
+  canEdit: false,
+  canDelete: false,
+  canMove: false,
+  canDownload: false,
+  canReshare: false,
+  canManageMembers: false,
+};
+
+const warnedOwnershipMismatches = new Set<string>();
+
+function clone(value: KnowledgeCapabilities): KnowledgeCapabilities {
+  return { ...value };
+}
+
+function noAccess(nodeId: string, sourceNodeId: string | null = null): EffectiveKnowledgeAccess {
+  return {
+    nodeId,
+    rolePreset: "none",
+    capabilities: clone(NONE),
+    source: "none",
+    sourceNodeId,
+  };
+}
+
+function readNode(db: Database.Database, nodeId: string): TreeNodeRow | null {
+  return (db.prepare(`
+    SELECT id, userId, workspaceId, parentId, resourceType, resourceId, isDeleted
+    FROM knowledge_tree_nodes WHERE id = ?
+  `).get(nodeId) as TreeNodeRow | undefined) || null;
+}
+
+/**
+ * The unified tree mirrors ownership fields for fast listing, but the business resource remains
+ * the canonical source of ownership. Historical migrations / ownership transfers can leave an
+ * otherwise visible tree row with a stale userId. If permission resolution trusts only that mirror,
+ * the real personal owner can lose canManageMembers as soon as a restricted ACL is created.
+ *
+ * Prefer the canonical resource identity whenever it still exists. This also prevents the inverse
+ * security bug: a stale tree userId must never turn a collaborator into the owner of someone else's
+ * note/folder.
+ */
+function readCanonicalResourceIdentity(
+  db: Database.Database,
+  node: TreeNodeRow,
+): ResourceIdentity | null {
+  try {
+    if (node.resourceType === "notebook") {
+      return (db.prepare("SELECT userId, workspaceId FROM notebooks WHERE id = ?")
+        .get(node.resourceId) as ResourceIdentity | undefined) || null;
+    }
+    if (node.resourceType === "note") {
+      return (db.prepare("SELECT userId, workspaceId FROM notes WHERE id = ?")
+        .get(node.resourceId) as ResourceIdentity | undefined) || null;
+    }
+    if (node.resourceType === "mindmap") {
+      return (db.prepare("SELECT userId, workspaceId FROM mindmaps WHERE id = ?")
+        .get(node.resourceId) as ResourceIdentity | undefined) || null;
+    }
+    if (node.resourceType === "file") {
+      return (db.prepare("SELECT userId, workspaceId FROM attachments WHERE id = ?")
+        .get(node.resourceId) as ResourceIdentity | undefined) || null;
+    }
+  } catch (error) {
+    // Older databases can briefly resolve access while optional resource tables are still being
+    // initialized. Falling back to the tree mirror preserves startup compatibility.
+    console.warn(`[knowledge-access] canonical ownership lookup failed for ${node.id}:`, error);
+  }
+  return null;
+}
+
+function effectiveResourceIdentity(db: Database.Database, node: TreeNodeRow): ResourceIdentity {
+  const canonical = readCanonicalResourceIdentity(db, node);
+  if (!canonical) return { userId: node.userId, workspaceId: node.workspaceId };
+
+  if (canonical.userId !== node.userId || canonical.workspaceId !== node.workspaceId) {
+    const warningKey = `${node.id}:${node.userId}:${node.workspaceId || "personal"}:${canonical.userId}:${canonical.workspaceId || "personal"}`;
+    if (!warnedOwnershipMismatches.has(warningKey)) {
+      warnedOwnershipMismatches.add(warningKey);
+      console.warn("[knowledge-access] tree ownership mirror differs from canonical resource", {
+        nodeId: node.id,
+        resourceType: node.resourceType,
+        resourceId: node.resourceId,
+        treeUserId: node.userId,
+        treeWorkspaceId: node.workspaceId,
+        canonicalUserId: canonical.userId,
+        canonicalWorkspaceId: canonical.workspaceId,
+      });
+    }
+  }
+
+  return canonical;
+}
+
+function nearestExplicitAcl(db: Database.Database, nodeId: string, userId: string): AclRow | null {
+  return (db.prepare(`
+    WITH RECURSIVE ancestors(id, parentId, depth) AS (
+      SELECT id, parentId, 0 FROM knowledge_tree_nodes WHERE id = ?
+      UNION ALL
+      SELECT parent.id, parent.parentId, ancestors.depth + 1
+      FROM knowledge_tree_nodes parent
+      JOIN ancestors ON parent.id = ancestors.parentId
+    )
+    SELECT acl.nodeId, acl.rolePreset,
+           acl.canView, acl.canComment, acl.canCreate, acl.canEdit,
+           acl.canDelete, acl.canMove, acl.canDownload, acl.canReshare,
+           acl.canManageMembers, ancestors.depth
+    FROM ancestors
+    JOIN knowledge_tree_acl acl ON acl.nodeId = ancestors.id AND acl.userId = ?
+    ORDER BY ancestors.depth ASC
+    LIMIT 1
+  `).get(nodeId, userId) as AclRow | undefined) || null;
+}
+
+function rowCapabilities(row: AclRow): KnowledgeCapabilities {
+  return {
+    canView: row.canView !== 0,
+    canComment: row.canComment !== 0,
+    canCreate: row.canCreate !== 0,
+    canEdit: row.canEdit !== 0,
+    canDelete: row.canDelete !== 0,
+    canMove: row.canMove !== 0,
+    canDownload: row.canDownload !== 0,
+    canReshare: row.canReshare !== 0,
+    canManageMembers: row.canManageMembers !== 0,
+  };
+}
+
+function legacyPermission(
+  permission: string | null | undefined,
+): Pick<EffectiveKnowledgeAccess, "rolePreset" | "capabilities"> {
+  if (permission === "manage" || permission === "admin" || permission === "owner") {
+    return { rolePreset: "admin", capabilities: clone(KNOWLEDGE_ROLE_PRESETS.admin) };
+  }
+  if (permission === "write" || permission === "editor") {
+    return { rolePreset: "editor", capabilities: clone(KNOWLEDGE_ROLE_PRESETS.editor) };
+  }
+  if (permission === "comment" || permission === "commenter") {
+    return {
+      rolePreset: "commenter",
+      capabilities: { ...KNOWLEDGE_ROLE_PRESETS.readonly, canComment: true },
+    };
+  }
+  if (permission === "read" || permission === "viewer") {
+    return { rolePreset: "readonly", capabilities: clone(KNOWLEDGE_ROLE_PRESETS.readonly) };
+  }
+  return { rolePreset: "none", capabilities: clone(NONE) };
+}
+
+function workspaceOwnerId(db: Database.Database, workspaceId: string): string | null {
+  return ((db.prepare("SELECT ownerId FROM workspaces WHERE id = ?").get(workspaceId) as
+    | { ownerId: string }
+    | undefined)?.ownerId) || null;
+}
+
+function legacyAccess(
+  db: Database.Database,
+  node: TreeNodeRow,
+  userId: string,
+  effectiveWorkspaceId: string | null = node.workspaceId,
+) {
+  if (node.resourceType === "notebook") {
+    const member = memberQueryService.getNotebookMemberAccess(node.resourceId, userId);
+    if (member) return legacyPermission(member.role);
+  } else if (node.resourceType === "note") {
+    const member = memberQueryService.getNoteNotebookMemberAccess(node.resourceId, userId);
+    if (member) return legacyPermission(member.role);
+    const noteAcl = db.prepare("SELECT permission FROM note_acl WHERE noteId = ? AND userId = ?")
+      .get(node.resourceId, userId) as { permission: string } | undefined;
+    if (noteAcl) return legacyPermission(noteAcl.permission);
+  }
+
+  if (!effectiveWorkspaceId) return legacyPermission(null);
+  const workspaceRole = db.prepare(
+    "SELECT role FROM workspace_members WHERE workspaceId = ? AND userId = ?",
+  ).get(effectiveWorkspaceId, userId) as { role: string } | undefined;
+  return legacyPermission(workspaceRole?.role);
+}
+
+/**
+ * Effective access rules:
+ * 1. Personal owner / workspace owner always keeps admin access. Ownership is resolved from the
+ *    canonical resource first and only falls back to the tree mirror when the resource is absent.
+ * 2. The nearest explicit allow/deny wins; a child allow can re-open access below
+ *    a denied parent, while a deny on the same node wins over an allow.
+ * 3. An eligible allow must still be on or below the nearest restricted boundary.
+ * 4. If a restricted boundary exists and no eligible allow is found, workspace
+ *    membership must not fall back to read access.
+ * 5. Without a restricted boundary, legacy workspace/notebook permissions remain.
+ *
+ * Soft-deleted nodes are denied by default. Recycle-bin lifecycle code can opt in
+ * to evaluating the same ownership/ACL/deny/restricted rules against the tombstone
+ * via includeDeleted; this does not make the resource visible to ordinary reads.
+ */
+export function resolveKnowledgeNodeAccess(
+  nodeId: string,
+  userId: string,
+  db: Database.Database = getDb(),
+  options: KnowledgeAccessResolveOptions = {},
+): EffectiveKnowledgeAccess {
+  ensureKnowledgeTreeTables(db);
+  const node = readNode(db, nodeId);
+  if (!node || (node.isDeleted && !options.includeDeleted)) return noAccess(nodeId);
+
+  const identity = effectiveResourceIdentity(db, node);
+  const ownsPersonalNode = !identity.workspaceId && identity.userId === userId;
+  const ownsWorkspace = !!identity.workspaceId && workspaceOwnerId(db, identity.workspaceId) === userId;
+  const workspaceRole = identity.workspaceId
+    ? db.prepare("SELECT role FROM workspace_members WHERE workspaceId = ? AND userId = ?")
+        .get(identity.workspaceId, userId) as { role: string } | undefined
+    : undefined;
+  const administersWorkspace = workspaceRole?.role === "owner" || workspaceRole?.role === "admin";
+  if (ownsPersonalNode || ownsWorkspace || administersWorkspace) {
+    return {
+      nodeId,
+      rolePreset: "admin",
+      capabilities: clone(KNOWLEDGE_ROLE_PRESETS.admin),
+      source: "owner",
+      sourceNodeId: node.id,
+    };
+  }
+
+  const explicit = nearestExplicitAcl(db, nodeId, userId);
+  const denial = findNearestKnowledgeDenial(nodeId, userId, db);
+  if (denial && (!explicit || denial.depth <= explicit.depth)) {
+    return noAccess(nodeId, denial.nodeId);
+  }
+
+  const restricted = findNearestRestrictedKnowledgePolicy(nodeId, db);
+  const explicitIsInsideBoundary = Boolean(
+    explicit && (!restricted || explicit.depth <= restricted.depth),
+  );
+
+  if (explicit && explicitIsInsideBoundary) {
+    return {
+      nodeId,
+      rolePreset: explicit.rolePreset,
+      capabilities: rowCapabilities(explicit),
+      source: explicit.depth === 0 ? "direct" : "inherited",
+      sourceNodeId: explicit.nodeId,
+    };
+  }
+
+  if (restricted) return noAccess(nodeId, restricted.nodeId);
+
+  const legacy = legacyAccess(db, node, userId, identity.workspaceId);
+  return {
+    nodeId,
+    ...legacy,
+    source: legacy.rolePreset === "none" ? "none" : "legacy",
+    sourceNodeId: null,
+  };
+}
+
+function resourceNode(
+  db: Database.Database,
+  resourceType: TreeNodeRow["resourceType"],
+  resourceId: string,
+): TreeNodeRow | null {
+  return (db.prepare(`
+    SELECT id, userId, workspaceId, parentId, resourceType, resourceId, isDeleted
+    FROM knowledge_tree_nodes
+    WHERE resourceType = ? AND resourceId = ?
+    ORDER BY isDeleted ASC, updatedAt DESC
+    LIMIT 1
+  `).get(resourceType, resourceId) as TreeNodeRow | undefined) || null;
+}
+
+export function resolveResourceKnowledgeAccess(
+  resourceType: TreeNodeRow["resourceType"],
+  resourceId: string,
+  userId: string,
+  db: Database.Database = getDb(),
+): EffectiveKnowledgeAccess {
+  ensureKnowledgeTreeTables(db);
+  const node = resourceNode(db, resourceType, resourceId);
+  return node ? resolveKnowledgeNodeAccess(node.id, userId, db) : noAccess("");
+}
+
+/**
+ * Resolve permissions for a resource that is already soft deleted.
+ *
+ * Keep this separate from resolveResourceKnowledgeAccess so ordinary callers can
+ * never accidentally surface tombstones. Use only for recycle-bin lifecycle
+ * operations where the user still has to pass the original ACL checks.
+ */
+export function resolveResourceKnowledgeAccessForTombstone(
+  resourceType: TreeNodeRow["resourceType"],
+  resourceId: string,
+  userId: string,
+  db: Database.Database = getDb(),
+): EffectiveKnowledgeAccess {
+  ensureKnowledgeTreeTables(db);
+  const node = resourceNode(db, resourceType, resourceId);
+  return node
+    ? resolveKnowledgeNodeAccess(node.id, userId, db, { includeDeleted: true })
+    : noAccess("");
+}

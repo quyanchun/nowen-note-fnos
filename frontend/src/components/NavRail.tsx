@@ -1,0 +1,450 @@
+import { isMacDesktopWorkspace, workspaceNavigationTab } from "@/lib/workspaceNavigation";
+import { HomeButton } from "@/components/AppHeader";
+import React, { useCallback, useEffect, useState } from "react";
+import {
+  BrainCircuit,
+  CircleDot,
+  Bell,
+  CloudOff,
+  FolderOpen,
+  Files,
+  ListTodo,
+  Link2,
+  LogIn,
+  LogOut,
+  NotebookPen,
+  PanelLeftClose,
+  Settings,
+  Sparkles,
+  Star,
+  Trash2,
+  UsersRound,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { useApp, useAppActions } from "@/store/AppContext";
+import { api, broadcastLogout, clearServerUrl, getCurrentWorkspace, getServerUrl } from "@/lib/api";
+import { ViewMode, WorkspaceFeatures } from "@/types";
+import { cn } from "@/lib/utils";
+import { openWorkspaceIssue, OPEN_NOTIFICATIONS_EVENT, parseIssueAppPath } from "@/lib/workspaceIssueNavigation";
+import { resolveCurrentAppPathname } from "@/lib/appPathNavigation";
+import { pushAppPathState } from "@/lib/appPathNavigation";
+import { getCurrentMindMapAppRoute, pushMindMapAppPath } from "@/lib/mindMapDeepLink";
+import { useRailMode } from "@/hooks/useRailMode";
+import { KNOWLEDGE_TREE_CLEAR_SEARCH_EVENT, type KnowledgeTreeClearSearchDetail } from "@/lib/knowledgeTreeCreateVisibility";
+import { useSidebarTextStyle } from "@/hooks/useSidebarTextStyle";
+import { useMobileRailHidden } from "@/hooks/useMobileRailHidden";
+import { useUserPreferences } from "@/hooks/useUserPreferences";
+import {
+  NAVIGATION_MODULE_IDS,
+  isNavigationModuleVisible,
+  normalizeNavigationModuleOrder,
+  type NavigationModuleId,
+} from "@/lib/navigationVisibility";
+import {
+  clearDesktopLocalAuth,
+  getAppInfo,
+  getDiagnosticsInfo,
+  isDesktop as isDesktopApp,
+  switchDesktopToFull,
+  type AppInfo,
+} from "@/lib/desktopBridge";
+import { clearLocalIdMap, clearQueue, getQueueLength } from "@/lib/offlineQueue";
+import { AccountLoginHistoryDialog } from "@/components/AccountLoginHistory";
+import { isAccountLoginHistorySupported } from "@/lib/accountLoginHistory";
+import {
+  enterMobileLocalMode,
+  isAndroidNativeRuntime,
+  isMobileLocalMode,
+  requestMobileAccountLogin,
+} from "@/lib/mobileLocalMode";
+
+type NavGroup = "workspace" | "modules" | "tools";
+
+interface NavConfigItem {
+  icon: React.ReactNode;
+  labelKey: string;
+  mode: ViewMode;
+  feature?: keyof WorkspaceFeatures;
+  group: NavGroup;
+}
+
+const RAIL_ICON_SIZE = 18;
+
+
+// Keep the return to all notes fixed and available independently of optional modules.
+const ALL_NOTES_ITEM: NavConfigItem = {
+  icon: <Files size={RAIL_ICON_SIZE} />, labelKey: "sidebar.allNotes", mode: "all", group: "workspace",
+};
+
+const NAV_CONFIG: NavConfigItem[] = [
+  { icon: <Star size={RAIL_ICON_SIZE} />, labelKey: "sidebar.favorites", mode: "favorites", feature: "favorites", group: "workspace" },
+  { icon: <FolderOpen size={RAIL_ICON_SIZE} />, labelKey: "sidebar.fileManager", mode: "files", feature: "files", group: "workspace" },
+  { icon: <Trash2 size={RAIL_ICON_SIZE} />, labelKey: "sidebar.trash", mode: "trash", group: "workspace" },
+  { icon: <NotebookPen size={RAIL_ICON_SIZE} />, labelKey: "sidebar.diary", mode: "diary", feature: "diaries", group: "modules" },
+  { icon: <ListTodo size={RAIL_ICON_SIZE} />, labelKey: "sidebar.tasks", mode: "tasks", feature: "tasks", group: "modules" },
+  { icon: <BrainCircuit size={RAIL_ICON_SIZE} />, labelKey: "sidebar.mindMaps", mode: "mindmaps", feature: "mindmaps", group: "modules" },
+  { icon: <Sparkles size={RAIL_ICON_SIZE} />, labelKey: "sidebar.aiChat", mode: "ai-chat", group: "tools" },
+  { icon: <Link2 size={RAIL_ICON_SIZE} />, labelKey: "sidebar.shareManagement", mode: "shares", group: "tools" },
+];
+
+export default function NavRail({ variant = "desktop", notificationCount = 0 }: { variant?: "desktop" | "mobile"; notificationCount?: number } = {}) {
+  const { t } = useTranslation();
+  const { state } = useApp();
+  const actions = useAppActions();
+  const { prefs: userPrefs } = useUserPreferences();
+  const [railMode] = useRailMode();
+  const [sidebarTextStyle] = useSidebarTextStyle();
+  const classicText = sidebarTextStyle === "classic";
+  const [, setMobileRailHidden] = useMobileRailHidden();
+  const effectiveMode = variant === "mobile" ? "label" : railMode;
+  const showLabel = effectiveMode === "label";
+  const isMobile = variant === "mobile";
+  const macMenu = !isMobile && isMacDesktopWorkspace();
+  const unifiedNavigation = !isMobile;
+  const localDeviceMode = isMobileLocalMode();
+
+  const [workspaceId, setWorkspaceId] = useState(getCurrentWorkspace);
+  const [features, setFeatures] = useState<WorkspaceFeatures | null>(null);
+  const [loginHistoryOpen, setLoginHistoryOpen] = useState(false);
+  const [desktopInfo, setDesktopInfo] = useState<AppInfo | null>(null);
+
+  useEffect(() => {
+    const load = () => {
+      const ws = getCurrentWorkspace();
+      setWorkspaceId(ws);
+      if (!ws || ws === "personal") {
+        setFeatures(null);
+        return;
+      }
+      api.getWorkspaceFeatures(ws).then(setFeatures).catch(() => setFeatures(null));
+    };
+    load();
+    window.addEventListener("nowen:workspace-changed", load);
+    window.addEventListener("nowen:workspace-features-changed", load);
+    return () => {
+      window.removeEventListener("nowen:workspace-changed", load);
+      window.removeEventListener("nowen:workspace-features-changed", load);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    let cancelled = false;
+    getAppInfo()
+      .then((info) => {
+        if (!cancelled) setDesktopInfo(info ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setDesktopInfo(null);
+      });
+    getDiagnosticsInfo()
+      .then((diag) => {
+        if (!cancelled && diag) setDesktopInfo((previous) => (previous ? { ...previous, ...diag } : previous));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const normalizeUrl = (url: string) => url.replace(/\/+$/, "").toLowerCase();
+  const isLoopbackUrl = (url: string) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "::1";
+    } catch {
+      return false;
+    }
+  };
+
+  const serverUrl = getServerUrl();
+  const currentOrigin = typeof window !== "undefined" && window.location.origin.startsWith("http") ? window.location.origin : "";
+  const usingDesktopLiteMode = desktopInfo?.mode === "lite";
+  const desktopLocalUrl = desktopInfo?.backendPort ? `http://127.0.0.1:${desktopInfo.backendPort}` : "";
+  const usingCurrentLocalBackend = !!serverUrl && !!desktopLocalUrl && normalizeUrl(serverUrl) === normalizeUrl(desktopLocalUrl);
+  const usingRemoteServer =
+    !!serverUrl
+    && !usingCurrentLocalBackend
+    && (usingDesktopLiteMode || !isLoopbackUrl(serverUrl) || (!!currentOrigin && normalizeUrl(serverUrl) !== normalizeUrl(currentOrigin)));
+  const canSwitchBackToLocal = isDesktopApp() && (usingRemoteServer || usingDesktopLiteMode);
+
+  const availableItems = features ? NAV_CONFIG.filter((item) => !item.feature || features[item.feature] !== false) : NAV_CONFIG;
+  const capabilityItems = localDeviceMode ? NAV_CONFIG : availableItems;
+  const configurableItemById = new Map<NavigationModuleId, NavConfigItem>();
+  for (const item of capabilityItems) {
+    if (NAVIGATION_MODULE_IDS.includes(item.mode as NavigationModuleId)) {
+      configurableItemById.set(item.mode as NavigationModuleId, item);
+    }
+  }
+  const orderedNavigationModuleIds = normalizeNavigationModuleOrder(userPrefs.navigationModuleOrder)
+    .filter((id) => isNavigationModuleVisible(id, userPrefs.hiddenNavigationModules));
+  const trashItem = capabilityItems.find((item) => item.mode === "trash") || null;
+
+  const handleClick = useCallback((mode: ViewMode) => {
+    if (localDeviceMode && (mode === "ai-chat" || mode === "shares")) {
+      requestMobileAccountLogin();
+      window.location.reload();
+      return;
+    }
+
+    if (mode === "issues") {
+      openWorkspaceIssue(null);
+    } else if (parseIssueAppPath(resolveCurrentAppPathname()).matched) {
+      pushAppPathState("/");
+    }
+
+    if (mode === "mindmaps") {
+      // 点击模块入口回到 /mindmaps 列表；具体导图选择后再进入 /mindmaps/:id。
+      pushMindMapAppPath(null);
+    } else if (getCurrentMindMapAppRoute().matched) {
+      // 用户主动离开脑图模块时保留一条可 Back 返回的历史记录。
+      pushAppPathState("/");
+    }
+
+    actions.setViewMode(unifiedNavigation && mode === "all" ? "notebook" : mode);
+    actions.setSelectedNotebook(null);
+    if (unifiedNavigation && workspaceNavigationTab(mode) && state.sidebarCollapsed) actions.toggleSidebar();
+    if (mode === "all") {
+      actions.clearSelectedTags();
+      actions.setSearchQuery("");
+      window.dispatchEvent(new CustomEvent<KnowledgeTreeClearSearchDetail>(KNOWLEDGE_TREE_CLEAR_SEARCH_EVENT, { detail: { clearOnly: true } }));
+      actions.setMobileView("list");
+      actions.setEditorFullscreen(false);
+      if (!isMobile && state.noteListCollapsed) actions.toggleNoteListCollapsed();
+    }
+    if (isMobile) actions.setMobileSidebar(false);
+  }, [actions, isMobile, localDeviceMode, state.noteListCollapsed, state.sidebarCollapsed, unifiedNavigation]);
+
+  const handleSwitchToLocal = useCallback(async () => {
+    if (isAndroidNativeRuntime()) {
+      enterMobileLocalMode();
+      window.location.reload();
+      return;
+    }
+    if (!canSwitchBackToLocal) return;
+
+    const queuedCount = getQueueLength();
+    if (queuedCount > 0) {
+      const confirmed = window.confirm(
+        t(
+          "sidebar.switchToLocalConfirmWithQueue",
+          "切回本地离线模式？当前云端账号还有未同步操作，切换后这些待同步操作会被丢弃，云端数据不会被删除。",
+        ),
+      );
+      if (!confirmed) return;
+    }
+
+    const result = await switchDesktopToFull();
+    if (result?.ok !== false) return;
+
+      clearQueue();
+      clearLocalIdMap();
+      await broadcastLogout("switch_to_local");
+      try {
+        clearServerUrl();
+        localStorage.removeItem("nowen-prefer-cloud");
+      localStorage.removeItem("nowen-offline-queue");
+      localStorage.removeItem("nowen-offline-id-map");
+    } catch {
+      // ignore storage failures
+    }
+    window.location.reload();
+  }, [canSwitchBackToLocal, t]);
+
+  const handleLogout = useCallback(async () => {
+    if (isAndroidNativeRuntime()) requestMobileAccountLogin();
+    if (isDesktopApp() && !canSwitchBackToLocal) {
+      const paused = await clearDesktopLocalAuth().catch(() => ({ ok: false }));
+      if (paused?.ok === false) return;
+      try {
+        localStorage.setItem("nowen-prefer-cloud", "1");
+      } catch {
+        // ignore storage failures
+      }
+      await broadcastLogout("desktop_logout_session");
+    } else {
+      await broadcastLogout("user_logout");
+    }
+    window.location.reload();
+  }, [canSwitchBackToLocal]);
+
+  const handleAccountLogin = useCallback(() => {
+    requestMobileAccountLogin();
+    window.location.reload();
+  }, []);
+
+  const railWidthClass = macMenu ? "w-[70px]" : showLabel ? "w-16" : "w-12";
+  const itemBaseClass = macMenu
+    ? "relative w-16 py-1.5 rounded-lg flex flex-col items-center justify-center gap-0.5 transition-colors"
+    : showLabel
+    ? "relative w-14 py-1.5 rounded-lg flex flex-col items-center justify-center gap-0.5 transition-colors"
+    : "relative w-10 h-10 rounded-lg flex items-center justify-center transition-colors";
+
+  const renderItem = (item: NavConfigItem) => {
+    const active = unifiedNavigation && item.mode === "all"
+      ? workspaceNavigationTab(state.viewMode) !== null
+      : state.viewMode === item.mode && (item.mode !== "all" || (
+        state.selectedNotebookId === null && state.selectedTagIds.length === 0 && !state.searchQuery.trim()
+      ));
+    const label = item.mode === "diary"
+      ? t("sidebar.dailyRecords", { defaultValue: "每日记录" })
+      : t(item.labelKey);
+    return (
+      <button
+        key={item.mode}
+        data-mobile-drawer-rail-item=""
+        onClick={() => handleClick(item.mode)}
+        title={showLabel ? undefined : label}
+        aria-label={label}
+        aria-current={active ? "page" : undefined}
+        className={cn(
+          itemBaseClass,
+          active ? "bg-accent-primary/12 text-accent-primary" : `${classicText ? "text-tx-tertiary" : "text-tx-secondary"} hover:bg-app-hover hover:text-tx-primary`,
+          item.mode === "trash" && !active && "opacity-70 hover:opacity-100",
+        )}
+      >
+        {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-[2px] rounded-full bg-accent-primary" aria-hidden />}
+        {item.icon}
+        {showLabel && <span className={cn("mt-0.5 max-w-full truncate px-1", classicText ? "text-[10px] leading-none" : isMobile ? "text-[10px] leading-tight" : "text-[11px] font-medium leading-tight")}>{label}</span>}
+      </button>
+    );
+  };
+
+  const renderNotificationItem = () => {
+    if (localDeviceMode) return null;
+    const label = t("sidebar.notifications");
+    return (
+      <button
+        key="notifications"
+        data-mobile-drawer-rail-item=""
+        onClick={() => {
+          actions.setMobileSidebar(false);
+          window.dispatchEvent(new Event(OPEN_NOTIFICATIONS_EVENT));
+        }}
+        aria-label={label}
+        title={showLabel ? undefined : label}
+        className={cn(itemBaseClass, "relative text-tx-tertiary hover:bg-app-hover hover:text-tx-primary")}
+      >
+        <Bell size={RAIL_ICON_SIZE} />
+        {notificationCount > 0 && (
+          <span className="absolute right-0 top-0 rounded-full bg-accent-primary px-1 text-[9px] text-white">
+            {notificationCount > 99 ? "99+" : notificationCount}
+          </span>
+        )}
+        {showLabel && <span className="mt-0.5 max-w-full truncate px-1 text-[10px]">{label}</span>}
+      </button>
+    );
+  };
+
+  return (
+    <div
+      className={cn(
+        isMobile ? "flex md:hidden h-full" : "hidden md:flex h-full",
+        "nav-rail vibrancy-sidebar bg-app-sidebar border-r border-app-border flex-col items-center shrink-0 transition-[width] duration-150",
+        railWidthClass,
+      )}
+      style={{ paddingTop: "calc(var(--safe-area-top) + 4px)", paddingBottom: "8px" }}
+    >
+      {isMobile ? (
+        <button
+          type="button"
+          data-mobile-rail-hide=""
+          onClick={() => setMobileRailHidden(true)}
+          title={t("sidebar.hideMobileRail")}
+          aria-label={t("sidebar.hideMobileRail")}
+          className="h-10 w-10 shrink-0 rounded-lg flex items-center justify-center text-tx-tertiary hover:bg-app-hover hover:text-tx-primary transition-colors"
+        >
+          <PanelLeftClose size={16} />
+        </button>
+      ) : (
+        <HomeButton compact />
+      )}
+
+      <div className={cn("my-2 border-t border-app-border/60", showLabel ? "w-8" : "w-6")} aria-hidden />
+
+      <div className="flex-1 min-h-0 w-full overflow-y-auto no-scrollbar flex flex-col items-center gap-1 px-1">
+        {!localDeviceMode && workspaceId !== "personal" && <button onClick={() => handleClick("issues")} aria-label={t("sidebar.issues")} title={t("sidebar.issues")} className={cn(itemBaseClass, state.viewMode === "issues" ? "text-accent-primary bg-app-hover" : "text-tx-tertiary hover:bg-app-hover")}><CircleDot size={RAIL_ICON_SIZE} />{showLabel && <span className="mt-0.5 text-[10px]">{t("sidebar.issues")}</span>}</button>}
+        {renderItem(ALL_NOTES_ITEM)}
+        {orderedNavigationModuleIds.map((id) => {
+          if (unifiedNavigation && id === "favorites") return null;
+          if (id === "notifications") return renderNotificationItem();
+          const item = configurableItemById.get(id);
+          return item ? renderItem(item) : null;
+        })}
+        {trashItem && (
+          <>
+            <div className={cn("my-1 border-t border-app-border/60", showLabel ? "w-8" : "w-6")} aria-hidden />
+            {renderItem(trashItem)}
+          </>
+        )}
+      </div>
+
+      <div className={cn("my-2 border-t border-app-border/60", showLabel ? "w-8" : "w-6")} aria-hidden />
+
+      {!isMobile && !macMenu && <div data-note-workspace-layout-anchor="" className="h-10 w-10 shrink-0" />}
+
+      <button
+        data-mobile-drawer-rail-item=""
+        onClick={() => window.dispatchEvent(new CustomEvent("nowen:open-settings"))}
+        title={showLabel ? undefined : t("sidebar.settings")}
+        aria-label={t("sidebar.settings")}
+        className={cn(itemBaseClass, "text-tx-tertiary hover:bg-app-hover hover:text-tx-primary")}
+      >
+        <Settings size={16} />
+        {showLabel && <span className={cn("mt-0.5 max-w-full truncate px-1", classicText ? "text-[10px] leading-none" : isMobile ? "text-[10px] leading-tight" : "text-[11px] font-medium leading-tight")}>{t("sidebar.settings")}</span>}
+      </button>
+
+      {!localDeviceMode && isAccountLoginHistorySupported() && (
+        <button
+          data-mobile-drawer-rail-item=""
+          onClick={() => setLoginHistoryOpen(true)}
+          title={showLabel ? undefined : t("auth.loginHistory.title")}
+          aria-label={t("auth.loginHistory.title")}
+          className={cn(itemBaseClass, "text-tx-tertiary hover:bg-app-hover hover:text-accent-primary")}
+        >
+          <UsersRound size={16} />
+          {showLabel && <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">{t("auth.loginHistory.shortTitle")}</span>}
+        </button>
+      )}
+
+      {(canSwitchBackToLocal || (isAndroidNativeRuntime() && !localDeviceMode)) && (
+        <button
+          data-mobile-drawer-rail-item=""
+          onClick={handleSwitchToLocal}
+          title={showLabel ? undefined : t("sidebar.switchToLocal", "切回本地离线模式")}
+          aria-label={t("sidebar.switchToLocal", "切回本地离线模式")}
+          className={cn(itemBaseClass, "text-tx-tertiary hover:bg-app-hover hover:text-accent-primary")}
+        >
+          <CloudOff size={16} />
+          {showLabel && <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">{t("sidebar.switchToLocalShort", "本地")}</span>}
+        </button>
+      )}
+
+      {localDeviceMode ? (
+        <button
+          data-mobile-drawer-rail-item=""
+          onClick={handleAccountLogin}
+          title={showLabel ? undefined : t("sidebar.loginAndSync")}
+          aria-label={t("sidebar.loginAndSync")}
+          className={cn(itemBaseClass, "text-tx-tertiary hover:bg-app-hover hover:text-accent-primary")}
+        >
+          <LogIn size={16} />
+          {showLabel && <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">{t("sidebar.loginAndSync")}</span>}
+        </button>
+      ) : (
+        <button
+          data-mobile-drawer-rail-item=""
+          onClick={handleLogout}
+          title={showLabel ? undefined : t("sidebar.logout")}
+          aria-label={t("sidebar.logout")}
+          className={cn(itemBaseClass, "text-tx-tertiary hover:text-accent-danger hover:bg-accent-danger/10")}
+        >
+          <LogOut size={16} />
+          {showLabel && <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">{t("sidebar.logout")}</span>}
+        </button>
+      )}
+
+      <AccountLoginHistoryDialog open={loginHistoryOpen} onClose={() => setLoginHistoryOpen(false)} />
+    </div>
+  );
+}

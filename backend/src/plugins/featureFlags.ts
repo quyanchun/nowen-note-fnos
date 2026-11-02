@@ -1,0 +1,37 @@
+import type { ExtensionPlatformFeatureFlags } from "./types.js";
+
+const TRUE_VALUES = new Set(["1", "true", "yes", "on", "enabled"]);
+
+function envFlag(name: string): boolean {
+  return TRUE_VALUES.has(String(process.env[name] || "").trim().toLowerCase());
+}
+
+/**
+ * V2.1 capabilities remain opt-in and retain their >=1.6.0 compatibility contract.
+ * Feature flags do not override the actual host version.
+ */
+export function getExtensionPlatformFeatureFlags(): Readonly<ExtensionPlatformFeatureFlags> {
+  const extensionsV21 = envFlag("NOWEN_EXTENSIONS_V21");
+  const uiExtensions = extensionsV21 && envFlag("NOWEN_UI_EXTENSIONS");
+  const uiLayoutEditor = uiExtensions && envFlag("NOWEN_UI_LAYOUT_EDITOR");
+  const fileProcessingExtensions = extensionsV21 && envFlag("NOWEN_FILE_PROCESSING_EXTENSIONS");
+  return Object.freeze({
+    extensionsV21,
+    pluginStudio: extensionsV21 && envFlag("NOWEN_PLUGIN_STUDIO"),
+    uiExtensions,
+    uiLayoutEditor,
+    sandboxedPluginUi: uiLayoutEditor && envFlag("NOWEN_SANDBOXED_PLUGIN_UI"),
+    fileProcessingExtensions,
+    experimentalDocumentTypes: fileProcessingExtensions && envFlag("NOWEN_EXPERIMENTAL_DOCUMENT_TYPES"),
+  });
+}
+
+export function isExtensionV21Enabled(): boolean {
+  return getExtensionPlatformFeatureFlags().extensionsV21;
+}
+
+export function assertExtensionV21Enabled(capability = "Plugin API V2.1"): void {
+  if (!isExtensionV21Enabled()) {
+    throw Object.assign(new Error(`${capability} 当前未启用`), { code: "PLUGIN_V21_FEATURE_DISABLED" });
+  }
+}

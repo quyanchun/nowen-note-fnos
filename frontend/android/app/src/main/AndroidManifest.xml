@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation"
+            android:name=".MainActivity"
+            android:label="@string/title_activity_main"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:launchMode="singleTask"
+            android:exported="true"
+            android:windowSoftInputMode="adjustNothing">
+
+            <!--
+              windowSoftInputMode="adjustNothing" 关键说明（解决"键盘弹起后输入框
+              下方一大片白色空白"的根因）：
+
+              背景：
+                - Capacitor 配置 `Keyboard.resize: "none"` 只控制插件**报给 JS 的
+                  resize 事件**（即不调整 WebView 视口大小），但**无法阻止 Android
+                  系统级的 windowSoftInputMode 行为**。
+                - Activity 默认 `adjustResize`（或 `adjustPan`）会让系统在键盘弹起时
+                  **从底部压缩 Activity 内容区**。Capacitor 的 WebView 跟着 Activity
+                  frame 一起被压扁，但 **CSS 视口仍按全屏算**（100dvh / 100vh 不变）。
+                - WebView 的 native frame ≠ CSS viewport，被压上来的那段区域露出
+                  Activity 的 windowBackground = 白色（AppTheme 是 Light 主题）。
+                  → 视觉表现：登录卡片 / 编辑器下方一大片白色一直延伸到键盘顶端。
+
+              修复：
+                设 `adjustNothing` 让系统完全不动 Activity，键盘纯绘制在最上层，
+                WebView 始终全屏。前端通过 Capacitor `Keyboard.addListener`
+                （见 `useKeyboardLayout` hook）拿到精确键盘高度，自己 padding
+                把内容推到键盘上方 —— 这是 Capacitor 官方与 `resize:"none"`
+                配套的标准方案。
+            -->
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 微信、QQ、浏览器及文件管理器的系统“分享”入口。 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- 多选图片 / 多文件分享。 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- 文件管理器“用其他应用打开”：接收带 MIME 的 content:// URI。 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- 兼容未声明 MIME 的 content:// 打开请求。 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+            </intent-filter>
+
+            <!-- 兼容少量旧文件管理器仍发送 file:// URI。 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- 兼容未声明 MIME 的旧 file:// 打开请求。 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="file" />
+            </intent-filter>
+
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"></meta-data>
+        </provider>
+    </application>
+
+    <!-- Permissions -->
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 仅在用户开始录音时由 WebView 请求麦克风权限。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Android 13+ notification runtime permission. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android 12+ exact task alarms. Users may still disable exact alarms in system settings. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- 局域网服务发现（mDNS / NSD）相关：
+         - ACCESS_NETWORK_STATE：检测是否已联网，避免在无网时空跑发现
+         - ACCESS_WIFI_STATE：取 Wi-Fi 信息 / 申请 multicast lock 必备
+         - CHANGE_WIFI_MULTICAST_STATE：mDNS 强依赖；不申请 multicast lock，
+           NsdManager 表面在跑但**收不到任何**服务广播 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- 快速登录（生物识别）相关权限：
+         - USE_BIOMETRIC：Android 9+ 标准生物识别权限（指纹 / 人脸 / 虹膜统一入口）
+         - USE_FINGERPRINT：兼容 Android 8 及以下旧设备的指纹 API；新系统自动 noop -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+</manifest>

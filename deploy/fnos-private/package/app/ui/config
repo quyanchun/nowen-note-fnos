@@ -1,0 +1,17 @@
+{
+  ".url": {
+    "nowen-note-private.Application": {
+      "title": "Nowen Note fnOS",
+      "icon": "images/icon_{0}.png",
+      "type": "url",
+      "protocol": "",
+      "gatewayPrefix": "/app/nowen-note-private",
+      "gatewaySocket": "app.sock",
+      "url": "/app/nowen-note-private/",
+      "allUsers": false,
+      "control": {
+        "accessPerm": "editable"
+      }
+    }
+  }
+}

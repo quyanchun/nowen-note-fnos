@@ -1,0 +1,44 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import Database from "better-sqlite3";
+import { Hono } from "hono";
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),"nowen-asset-identities-"));
+process.env.DB_PATH=path.join(dir,"nas.db");process.env.ELECTRON_USER_DATA=dir;process.env.NOWEN_LOCAL_FIRST_SYNC_V2="1";
+test("NAS and desktop asset owners differ but remain bound to their Profile through pull, push and conflict (DCC-006)",async()=>{
+  const {getDb,closeDb}=await import("../src/db/schema");
+  const {createProfile,switchActiveProfile}=await import("../src/sync/profile");
+  const {ensureDevice}=await import("../src/sync/device");
+  const {markKnowledgeTreeSyncReady}=await import("../src/sync/knowledgeTreeReadiness");
+  const {SyncEngine}=await import("../src/sync/engine");
+  const {SyncRemoteClient}=await import("../src/sync/remote");
+  const {rebindAssetMetadata}=await import("../src/sync/assetOrganization");
+  const {default:routes}=await import("../src/routes/sync-v2");
+  const nas=getDb();await nas.backup(path.join(dir,"desktop.db"));
+  const desktop=new Database(path.join(dir,"desktop.db"));desktop.pragma("foreign_keys=ON");
+  nas.prepare("INSERT INTO users(id,username,passwordHash) VALUES ('nas-owner','nas','x')").run();
+  desktop.prepare("INSERT INTO users(id,username,passwordHash) VALUES ('desktop-owner','desktop','x')").run();
+  nas.prepare("INSERT INTO attachment_folders(id,userId,name) VALUES ('nas-folder','nas-owner','NAS folder')").run();
+  const profile=createProfile(desktop,{name:"NAS",serverUrl:"http://nas.test",remoteUserId:"nas-owner"});switchActiveProfile(desktop,profile.id);
+  desktop.prepare("UPDATE sync_profiles SET bootstrapStatus='ready' WHERE id=?").run(profile.id);
+  const device=ensureDevice(desktop,{profileId:profile.id});markKnowledgeTreeSyncReady(desktop,profile.id);
+  desktop.prepare("INSERT INTO attachment_folders(id,userId,name) VALUES ('desktop-folder','desktop-owner','Desktop folder')").run();
+  const app=new Hono();app.use('*',async(c,next)=>{c.req.raw.headers.set("X-User-Id","nas-owner");await next();});app.route('/api/sync/v2',routes);
+  const client=new SyncRemoteClient({serverUrl:"http://nas.test",token:"fixture"},{fetchImpl:async(url,init)=>app.request(url,init)});
+  const engine=new SyncEngine({db:desktop,profileId:profile.id,deviceId:device.id,userId:"desktop-owner",client,intervalMs:0,scheduler:{setTimeout:()=>0,clearTimeout:()=>{}}});
+  try {
+    let status=await engine.syncOnce();assert.equal(status.lastError,null,JSON.stringify(status));
+    assert.equal((desktop.prepare("SELECT userId FROM attachment_folders WHERE id='nas-folder'").get() as any).userId,"desktop-owner");
+    assert.equal((nas.prepare("SELECT userId FROM attachment_folders WHERE id='desktop-folder'").get() as any).userId,"nas-owner");
+    desktop.prepare("UPDATE attachment_folders SET name='local edit' WHERE id='desktop-folder'").run();
+    nas.prepare("UPDATE attachment_folders SET name='remote edit' WHERE id='desktop-folder'").run();
+    status=await engine.syncOnce();assert.equal(status.lastError,null,JSON.stringify(status));
+    const conflict=desktop.prepare("SELECT localPayload,remotePayload FROM sync_conflicts WHERE entityId='folder:desktop-folder' AND status='unresolved'").get() as any;
+    assert.ok(conflict);assert.equal(JSON.parse(conflict.localPayload).userId,"desktop-owner");assert.equal(JSON.parse(conflict.remotePayload).userId,"desktop-owner");
+    const original=JSON.parse(conflict.remotePayload);
+    assert.throws(()=>rebindAssetMetadata(original.id,{...original,userId:"other-account"},"nas-owner","desktop-owner"),(error:any)=>error.code==="INVALID_PAYLOAD");
+    assert.equal(JSON.parse(conflict.remotePayload).userId,"desktop-owner");
+  } finally {engine.stop();desktop.close();closeDb();fs.rmSync(dir,{recursive:true,force:true});}
+});

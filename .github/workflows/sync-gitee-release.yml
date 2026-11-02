@@ -1,0 +1,208 @@
+# Sync GitHub Release → Gitee Release（仅小文件，国内加速兜底）
+#
+# 触发：GitHub 上发布 release 时（release: published / edited）。
+# 目的：把 .exe / .apk / .zip / .deb 这类 ≤ 95MB 的小文件镜像到 Gitee，
+#       让国内用户在 GitHub 直连慢、ghproxy 公共代理挂掉时仍有可用下载渠道。
+#
+# 不同步的内容（故意排除）：
+#   - .fpk / .upk / .dmg / .AppImage / .rpm 等大文件：Gitee 单文件上限 100MB，
+#     传上去会失败或被截断，与其失败不如直接跳过。
+#   - blockmap / yml / latest*.yml：electron-builder 的更新元数据，对终端用户无意义。
+#
+# 失败处理：每个文件用 `|| true` 兜底，单个文件失败不影响整批；
+#          整个 workflow 失败也不阻塞主发布流程（这是发布后异步同步任务）。
+#
+# 必需的 Repository Secrets：
+#   GITEE_TOKEN  — Gitee 个人访问令牌（projects + user_info 权限）
+#   GITEE_OWNER  — Gitee 用户名（如 cropflre）
+#   GITEE_REPO   — Gitee 仓库名（如 nowen-note）
+
+name: Sync Release to Gitee
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要同步的 tag（如 v1.1.7），留空则用最新 release'
+        required: false
+        type: string
+
+# 同一个 tag 只允许一个同步任务在跑，避免重入打架
+concurrency:
+  group: gitee-sync-${{ github.event.release.tag_name || github.event.inputs.tag || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 没配 GITEE_TOKEN 时不跑，避免 fork / 新仓库报错
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.draft == false }}
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve target tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG=$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "[sync] target tag = $TAG"
+
+      - name: Check Gitee secrets
+        id: check
+        run: |
+          if [ -z "${{ secrets.GITEE_TOKEN }}" ] || [ -z "${{ secrets.GITEE_OWNER }}" ] || [ -z "${{ secrets.GITEE_REPO }}" ]; then
+            echo "[sync] Gitee secrets 未配置（GITEE_TOKEN/GITEE_OWNER/GITEE_REPO），跳过同步"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release assets from GitHub
+        if: steps.check.outputs.skip == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          # 只下载白名单后缀；--clobber 允许重跑覆盖
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --dir assets \
+            --pattern '*.exe' \
+            --pattern '*.apk' \
+            --pattern '*.zip' \
+            --pattern '*.deb' \
+            --clobber || true
+          echo "[sync] downloaded files:"
+          ls -lh assets/ || true
+
+      - name: Filter assets by size (≤ 95MB)
+        if: steps.check.outputs.skip == '0'
+        id: filter
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          # Gitee 实测上限 100MB，留 5MB 缓冲；超限的直接跳过
+          MAX_BYTES=$((95 * 1024 * 1024))
+          shopt -s nullglob
+          for f in assets/*; do
+            # 排除一些 electron-builder 的元数据文件
+            base=$(basename "$f")
+            case "$base" in
+              *.blockmap|latest*.yml|*.yml) continue ;;
+            esac
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt "$MAX_BYTES" ]; then
+              echo "[sync] skip oversized: $base ($(numfmt --to=iec $size) > 95MB)"
+              continue
+            fi
+            cp "$f" "upload/$base"
+            echo "[sync] keep: $base ($(numfmt --to=iec $size))"
+          done
+          count=$(ls upload/ 2>/dev/null | wc -l || echo 0)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "[sync] $count file(s) ready for Gitee upload"
+
+      - name: Ensure Gitee release exists
+        if: steps.check.outputs.skip == '0' && steps.filter.outputs.count != '0'
+        id: gitee_release
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1. 试着按 tag 拿 Gitee release
+          API="https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/tags/$TAG"
+          resp=$(curl -sS -w "\n%{http_code}" -H "Content-Type: application/json" \
+            "$API?access_token=$GITEE_TOKEN")
+          body=$(echo "$resp" | head -n -1)
+          code=$(echo "$resp" | tail -n 1)
+
+          if [ "$code" = "200" ]; then
+            ID=$(echo "$body" | jq -r .id)
+            echo "[gitee] release exists, id=$ID"
+          else
+            # 2. 不存在则创建。release notes 简化为指向 GitHub 的链接，避免 markdown 里特殊字符兼容问题
+            BODY="此 Release 为 GitHub 镜像副本，仅同步小于 95MB 的客户端安装包。\n完整内容请见 GitHub: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+            payload=$(jq -n \
+              --arg tag "$TAG" \
+              --arg name "$TAG" \
+              --arg body "$BODY" \
+              --arg target "main" \
+              '{tag_name:$tag, name:$name, body:$body, target_commitish:$target, prerelease:false}')
+            create_resp=$(curl -sS -w "\n%{http_code}" -X POST \
+              -H "Content-Type: application/json" \
+              -d "$(echo "$payload" | jq --arg t "$GITEE_TOKEN" '. + {access_token:$t}')" \
+              "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases")
+            create_body=$(echo "$create_resp" | head -n -1)
+            create_code=$(echo "$create_resp" | tail -n 1)
+            if [ "$create_code" != "201" ] && [ "$create_code" != "200" ]; then
+              echo "[gitee] create release failed: code=$create_code"
+              echo "$create_body"
+              exit 1
+            fi
+            ID=$(echo "$create_body" | jq -r .id)
+            echo "[gitee] release created, id=$ID"
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to Gitee
+        if: steps.check.outputs.skip == '0' && steps.filter.outputs.count != '0'
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+          RELEASE_ID: ${{ steps.gitee_release.outputs.id }}
+        run: |
+          set -uo pipefail   # 不用 -e：单个文件失败也继续传下一个
+          fail=0
+          ok=0
+          shopt -s nullglob
+          for f in upload/*; do
+            base=$(basename "$f")
+            echo "[gitee] uploading: $base"
+            http=$(curl -sS -o /tmp/gitee_resp.json -w "%{http_code}" \
+              -X POST \
+              -F "access_token=$GITEE_TOKEN" \
+              -F "file=@$f" \
+              "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files")
+            if [ "$http" = "201" ] || [ "$http" = "200" ]; then
+              ok=$((ok+1))
+              echo "[gitee]   ✓ $base"
+            else
+              fail=$((fail+1))
+              echo "[gitee]   ✗ $base (http=$http)"
+              cat /tmp/gitee_resp.json || true
+              echo
+            fi
+            # Gitee 限速：60 req/min，sleep 1.2s 留余量
+            sleep 1.2
+          done
+          echo "[gitee] done: ok=$ok fail=$fail"
+          # 全部失败才报错；部分成功仍视为成功
+          if [ "$ok" = "0" ] && [ "$fail" -gt "0" ]; then
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Gitee Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- tag: ${{ steps.tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- skipped (no secrets): ${{ steps.check.outputs.skip }}" >> $GITHUB_STEP_SUMMARY
+          echo "- files queued: ${{ steps.filter.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- gitee release id: ${{ steps.gitee_release.outputs.id }}" >> $GITHUB_STEP_SUMMARY

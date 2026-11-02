@@ -1,0 +1,114 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  NOTE_WORKSPACE_LAYOUT_CHANGED_EVENT,
+  NOTE_WORKSPACE_LAYOUT_STORAGE_KEY,
+  THREE_COLUMN_MIN_VIEWPORT_WIDTH,
+  detectNoteWorkspaceSurface,
+  getAutomaticCollapseReason,
+  loadNoteWorkspaceLayoutMode,
+  persistNoteWorkspaceLayoutMode,
+  resolveNoteWorkspaceVisibility,
+  supportsWideNoteWorkspaceLayout,
+  usesThreeColumnFolderNavigation,
+  type NoteWorkspaceLayoutMode,
+} from "@/lib/noteWorkspaceLayout";
+
+describe("note workspace layout", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("supports wide layouts by capability instead of excluding every native device", () => {
+    const webWindow = {} as Window;
+    const desktopWindow = {
+      nowenDesktop: { isDesktop: true },
+    } as unknown as Window;
+    const nativeWindow = {
+      Capacitor: {
+        isNativePlatform: () => true,
+        getPlatform: () => "android",
+      },
+    } as unknown as Window;
+
+    expect(detectNoteWorkspaceSurface(webWindow)).toBe("web");
+    expect(detectNoteWorkspaceSurface(desktopWindow)).toBe("desktop");
+    expect(detectNoteWorkspaceSurface(nativeWindow)).toBe("native-mobile");
+    expect(supportsWideNoteWorkspaceLayout("web", 680)).toBe(true);
+    expect(supportsWideNoteWorkspaceLayout("desktop", 680)).toBe(true);
+    expect(supportsWideNoteWorkspaceLayout("native-mobile", 680)).toBe(false);
+    expect(supportsWideNoteWorkspaceLayout("native-mobile", 840)).toBe(true);
+  });
+
+  it("keeps the legacy folder behavior below the shared desktop breakpoint", () => {
+      const width = window.innerWidth;
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 600 });
+      expect(usesThreeColumnFolderNavigation({ mode: "three-column", noteListCollapsed: false, desktopSurface: true })).toBe(true);
+      expect(usesThreeColumnFolderNavigation({ mode: "standard", noteListCollapsed: false, desktopSurface: true })).toBe(false);
+      expect(usesThreeColumnFolderNavigation({ mode: "three-column", noteListCollapsed: true, desktopSurface: true })).toBe(false);
+      expect(usesThreeColumnFolderNavigation({ mode: "three-column", noteListCollapsed: false, desktopSurface: false })).toBe(false);
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    });
+
+    it("migrates the previous note-list collapsed preference", () => {
+    expect(loadNoteWorkspaceLayoutMode(true)).toBe("standard");
+    expect(loadNoteWorkspaceLayoutMode(false)).toBe("three-column");
+  });
+
+  it("persists an explicit device-local preference", () => {
+    const changed = new Promise<NoteWorkspaceLayoutMode>((resolve) => {
+      window.addEventListener(NOTE_WORKSPACE_LAYOUT_CHANGED_EVENT, (event) => {
+        resolve((event as CustomEvent<NoteWorkspaceLayoutMode>).detail);
+      }, { once: true });
+    });
+    persistNoteWorkspaceLayoutMode("standard");
+    expect(localStorage.getItem(NOTE_WORKSPACE_LAYOUT_STORAGE_KEY)).toBe("standard");
+    expect(loadNoteWorkspaceLayoutMode(false)).toBe("standard");
+    return expect(changed).resolves.toBe("standard");
+  });
+
+  it("shows the middle list when three-column mode has enough room", () => {
+    expect(resolveNoteWorkspaceVisibility({
+      mode: "three-column",
+      noteListCollapsed: false,
+      editorFullscreen: false,
+      viewportWidth: THREE_COLUMN_MIN_VIEWPORT_WIDTH,
+      splitDirection: null,
+    })).toEqual({ showNoteList: true, autoCollapseReason: null });
+  });
+
+  it("falls back on narrow windows without changing the preferred mode", () => {
+    expect(resolveNoteWorkspaceVisibility({
+      mode: "three-column",
+      noteListCollapsed: false,
+      editorFullscreen: false,
+      viewportWidth: THREE_COLUMN_MIN_VIEWPORT_WIDTH - 1,
+      splitDirection: null,
+    })).toEqual({ showNoteList: false, autoCollapseReason: "viewport" });
+  });
+
+  it("temporarily collapses for right split but not down split", () => {
+    expect(getAutomaticCollapseReason({
+      editorFullscreen: false,
+      viewportWidth: 1920,
+      splitDirection: "right",
+    })).toBe("right-split");
+    expect(getAutomaticCollapseReason({
+      editorFullscreen: false,
+      viewportWidth: 1920,
+      splitDirection: "down",
+    })).toBeNull();
+  });
+
+  it("uses focus mode as a temporary automatic collapse", () => {
+    expect(getAutomaticCollapseReason({
+      editorFullscreen: true,
+      viewportWidth: 1920,
+      splitDirection: null,
+    })).toBe("focus");
+  });
+});
+
+it.each(["darwin", "win32", undefined])("%s unified directory expands folders even with an old three-column preference", platform => {
+  (window as any).nowenDesktop = platform ? { isDesktop: true, platform } : undefined;
+  try {
+    expect(usesThreeColumnFolderNavigation({ mode: "three-column", noteListCollapsed: false, desktopSurface: true })).toBe(false);
+  } finally { delete (window as any).nowenDesktop; }
+});

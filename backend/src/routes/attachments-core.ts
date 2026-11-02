@@ -1,0 +1,1898 @@
+import { pendingNoteDeletionAttachments } from "../sync/noteDeletion";
+import { retainAttachmentInTrash } from "../services/attachment-trash";
+/**
+ * 附件管理路由（/api/attachments）
+ * ---------------------------------------------------------------------------
+ * 背景：
+ *   历史上「粘贴/插入图片」走 Tiptap Image + base64 data URI，图片字节内联
+ *   到 notes.content 里随笔记一起存。一张手机截图就能让单条 note.content
+ *   膨胀到几 MB，GET /api/notes/:id 把整个 blob 当 TEXT 拖回前端，前端还得
+ *   全量 rerender、生成 FTS、走乐观锁；规模一大体验就崩。
+ *
+ *   本路由把**任意类型**的附件落盘，notes.content 里只保留
+ *   `/api/attachments/<id>` 的 URL：
+ *     - 图片（image/*）仍然以 <img> 内联渲染；
+ *     - 其它格式（pdf / docx / zip / 音视频 / 任意二进制）以附件链接形式
+ *       插入编辑器，点击下载（后端带 Content-Disposition: attachment）。
+ *   设计目标是「不限制格式」，因此只用一个很小的黑名单拒绝高危可执行类型，
+ *   其它任意 MIME 一律放行。
+ *
+ * 模块导出：
+ *   - attachmentsAuthRouter：挂在 /api/attachments，受 JWT 中间件保护。
+ *     承接 POST（上传）/ DELETE。
+ *   - handleDownloadAttachment：显式挂在 JWT 中间件**之前**的下载 handler。
+ *     背景：<img src="/api/attachments/<id>"> 浏览器原生请求不会自动带
+ *     Authorization header；若走 JWT 会 401。因此下载接口不依赖 JWT，而是
+ *     根据 "附件挂载的 noteId" 判断：
+ *       1) 个人空间的 note：仅 owner 可 read → 需要 X-User-Id（同源 cookie
+ *          会话拿不到，所以下载接口也无法看到 userId）……为了让 <img> 能
+ *          正常显示，我们接受"同源登录态 + 猜不到的 uuid"作为隐式授权：
+ *          附件 id 是 uuid，除了读过 note.content 拿到 URL 的人之外没人能
+ *          枚举。理论上安全（与 Gitea / GitLab 等把私有仓库附件按不可枚举
+ *          id 发到任意登录用户的做法一致）。
+ *       2) 如果当前笔记已设置分享链接，在分享页的 <img> 也能直接请求到。
+ *     这是权衡后的妥协：
+ *       - 若要严格按 read 权限卡附件，需要改造前端把图片下载全部走 fetch
+ *         + Authorization + blob URL，代价是每切笔记都要重新拉二进制、
+ *         不能用浏览器图片缓存；
+ *       - 当前方案可以直接享受浏览器缓存（Cache-Control: immutable）。
+ *     如果要升级安全性，未来改成 "签名 URL（含 exp + hmac）" 最平滑。
+ *
+ * 协作 / 分享边界：
+ *   - 工作区笔记的附件访问默认也通过"id 不可枚举"保护；由于附件行里
+ *     记录了 noteId + userId，后续需要审计哪位用户上传的附件也可追溯。
+ */
+import { Hono } from "hono";
+import { attachmentDeletionRisk } from "../services/attachment-deletion-safety";
+import {
+  resolveFileAttachmentAccess,
+  type FileAttachmentAccessRow,
+} from "../services/fileAttachmentAccess";
+import type { Context } from "hono";
+import { getDb } from "../db/schema";
+import { isEncryptedNoteFormat } from "../lib/encryptedNotes.js";
+import { v4 as uuid } from "uuid";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { taskAttachmentsRepository } from "../repositories";
+import { attachmentQueryService } from "../queries";
+import { resolveNotePermission, hasPermission } from "../middleware/acl";
+import { enqueueAttachment } from "../services/embedding-worker";
+import { verifySudoFromRequest } from "../lib/auth-security";
+import { createUserAttachmentAccessUrls } from "../lib/attachment-signed-url";
+import { imageAttachmentUrl } from "../lib/attachment-image-url";
+import { extractAttachmentIdsFromContent, syncReferences } from "../lib/attachmentRefs";
+import {
+  checkAttachmentObjectExists,
+  deleteObjectStorageConfig,
+  deleteAttachmentObject,
+  ensureAttachmentsDir as ensureStorageAttachmentsDir,
+  getAttachmentStorageInfo,
+  getAttachmentsDir as getStorageAttachmentsDir,
+  readObjectStorageConfigPublic,
+  readAttachmentObject,
+  testObjectStorageConfig,
+  writeObjectStorageConfig,
+  writeAttachmentObject,
+  getUploadMonthPath,
+} from "../services/attachment-storage";
+import {
+  parseThumbnailWidth,
+  getOrCreateThumbnailAsync,
+  getOrCreateThumbnailFromBufferAsync,
+  isThumbnailable,
+  deleteThumbnailsFor,
+} from "../services/thumbnails";
+import { computeAttachmentEtag, requestMatchesEtag } from "../lib/attachment-etag";
+import { attachmentWriteErrorResponse } from "../lib/attachment-error-response";
+import { isHeifMime, resolveHeifUploadMime, sniffHeifMime } from "../lib/heif-mime";
+import { getOrCreateHeifPreview } from "../services/heif-preview";
+import { analyzeModernMedia } from "../lib/modern-media";
+import { getOrCreateMotionPreview, inspectPhotoMedia, recordHeifVariant, recordMediaAnalysis } from "../services/modern-media";
+import { parseSingleHttpRange } from "../lib/http-range";
+
+const ATTACHMENTS_DIR = getStorageAttachmentsDir();
+
+/** 确保目录存在。上传 / 迁移脚本都复用它。 */
+export function ensureAttachmentsDir(): string {
+  return ensureStorageAttachmentsDir();
+}
+
+/** 校验附件相对路径是否合法：仅允许旧平铺 uuid.ext 和新 YYYY/MM/uuid.ext 两种格式 */
+function isSafeAttachmentRelPath(relPath: string): boolean {
+  if (relPath.includes("\\")) return false;
+  const normalized = relPath;
+  if (!normalized || normalized.startsWith("/") || normalized.includes("..") || normalized.includes("//")) {
+    return false;
+  }
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-zA-Z0-9]{1,8}$/.test(normalized) ||
+    /^\d{4}\/\d{2}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-zA-Z0-9]{1,8}$/.test(normalized)
+  );
+}
+
+export function getAttachmentsDir(): string {
+  return getStorageAttachmentsDir();
+}
+
+/**
+ * 按 noteId 批量删除磁盘物理附件文件（不动 DB）。
+ * ---------------------------------------------------------------------------
+ * 背景：
+ *   attachments 表虽然与 notes 外键 ON DELETE CASCADE，但 SQLite 只会删 **行**，
+ *   磁盘上的 `data/attachments/<id>.<ext>` 不会被清理，长期使用会积累大量孤儿文件，
+ *   导致清空回收站后"占用的存储不会变小"。
+ *
+ * 调用场景：
+ *   - 永久删除笔记（DELETE /api/notes/:id）
+ *   - 清空回收站（DELETE /api/notes/trash/empty）
+ *
+ * 时序：**必须在 DB 删除笔记之前调用**——删除后 attachments 行就 CASCADE 没了，
+ *   就再也查不到 path。
+ *
+ * v1.1.7 引用计数兜底（修复 1.1.6 数据丢失事故）：
+ *   hash 去重 / 迁移路径下，多条 attachments 行可能共享同一个磁盘 path。
+ *   1.1.6 这里直接 unlink，会把"还活着的笔记"引用的物理文件也删掉，
+ *   导致另一份笔记里的图片变 404。
+ *   修复：unlink 前先看"是否还有不在本次删除范围内的 attachments 行也指向同一 path"。
+ *   有就只让 DB CASCADE 处理行级删除，物理文件保留；
+ *   没有任何活引用时才允许 unlink。
+ *   与 `app.delete("/:id")` 单条删除 (line ~497) 的策略对齐。
+ *
+ * 返回：真正 unlink 成功的文件数（日志 / 审计用）。
+ */
+export function deleteAttachmentFilesByNoteIds(noteIds: string[]): number {
+  if (!noteIds || noteIds.length === 0) return 0;
+  const db = getDb();
+  // SQLite 的绑定参数存在上限。清空包含数万篇笔记的回收站时，不能把所有
+  // noteId 塞进同一个 IN (...)；固定分块后仍只在服务端执行，不增加 HTTP 请求。
+  const QUERY_CHUNK_SIZE = 400;
+  // Check the whole deletion cohort before unlinking any object. The DB retention
+  // trigger alone is too late for callers that remove physical bytes first.
+  for (let offset = 0; offset < noteIds.length; offset += QUERY_CHUNK_SIZE) {
+    const chunk = noteIds.slice(offset, offset + QUERY_CHUNK_SIZE);
+    if (db.prepare(`SELECT 1 FROM attachments WHERE trashedAt IS NOT NULL AND noteId IN (${chunk.map(() => "?").join(",")}) LIMIT 1`).get(...chunk)) {
+      throw Object.assign(new Error("请先恢复或永久删除这些笔记的文件回收站内容"), { code: "ATTACHMENT_TRASH_RETAINED" });
+    }
+  }
+  const targetNoteIds = new Set(noteIds);
+  let rows: { id: string; path: string }[] = [];
+  try {
+    for (let offset = 0; offset < noteIds.length; offset += QUERY_CHUNK_SIZE) {
+      const chunk = noteIds.slice(offset, offset + QUERY_CHUNK_SIZE);
+      const placeholders = chunk.map(() => "?").join(",");
+      rows.push(...db
+        .prepare(`SELECT id, path FROM attachments WHERE noteId IN (${placeholders})`)
+        .all(...chunk) as { id: string; path: string }[]);
+    }
+  } catch {
+    return 0;
+  }
+  if (rows.length === 0) return 0;
+
+  // 引用计数：哪些 path 在"待死名单"以外还有活引用？这些 path 的物理文件不能删。
+  const dyingPaths = Array.from(new Set(rows.map((r) => r.path).filter(Boolean)));
+  const livePaths = new Set(pendingNoteDeletionAttachments(db).map(attachment=>attachment.path));
+  if (dyingPaths.length > 0) {
+    try {
+      for (let offset = 0; offset < dyingPaths.length; offset += QUERY_CHUNK_SIZE) {
+        const chunk = dyingPaths.slice(offset, offset + QUERY_CHUNK_SIZE);
+        const placeholders = chunk.map(() => "?").join(",");
+        const references = db
+          .prepare(`SELECT path, noteId FROM attachments WHERE path IN (${placeholders})`)
+          .all(...chunk) as { path: string; noteId: string }[];
+        for (const reference of references) {
+          if (reference?.path && !targetNoteIds.has(reference.noteId)) {
+            livePaths.add(reference.path);
+          }
+        }
+      }
+    } catch {
+      // 查询失败时保守处理：把所有 dying 的 path 都视作"还有活引用"，
+      // 宁可暂时残留孤儿文件（可被定期 reclaim 清理），也不要错删。
+      for (const p of dyingPaths) livePaths.add(p);
+    }
+  }
+
+  let removed = 0;
+  for (const r of rows) {
+    if (!r?.path) continue;
+    if (livePaths.has(r.path)) {
+      // 还有其它笔记引用这个物理文件 → 只让 DB 行被 CASCADE 删，文件保留。
+      // 但当前附件 id 对应的缩略图缓存已经不可再访问，可以安全清掉。
+      if (r.id) deleteThumbnailsFor(ATTACHMENTS_DIR, r.id);
+      continue;
+    }
+    const abs = path.join(ATTACHMENTS_DIR, r.path);
+    try {
+      if (fs.existsSync(abs)) {
+        fs.unlinkSync(abs);
+        removed++;
+      }
+    } catch {
+      /* 单个失败不阻塞批量 */
+    }
+    // v12：顺手清理对应的缩略图缓存（best-effort）。
+    // 阶段 B 后 attachments.id 可能与 path basename 不同（多行共享同一物理文件），
+    // 因此两个 key 都尝试清理：当前元数据 id + 物理文件 basename。
+    if (r.id) deleteThumbnailsFor(ATTACHMENTS_DIR, r.id);
+    const baseName = (r.path || "").replace(/\.[^.]+$/, "");
+    if (baseName && baseName !== r.id) deleteThumbnailsFor(ATTACHMENTS_DIR, baseName);
+  }
+  return removed;
+}
+
+// 允许的图片 MIME（用于「是否作为 <img> 内联展示」的判定；非图片走附件链接）
+const ALLOWED_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/svg+xml",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+  "image/heic",
+  "image/heif",
+  "image/heic-sequence",
+  "image/heif-sequence",
+]);
+
+export const MIME_TO_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+  "image/svg+xml": "svg",
+  "image/x-icon": "ico",
+  "image/vnd.microsoft.icon": "ico",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "image/heic-sequence": "heic",
+  "image/heif-sequence": "heif",
+  "audio/mp4": "m4a",
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+};
+
+// 判断附件是否属于「图片」——供 handleDownloadAttachment / 响应 category 字段共用。
+function isImageMime(mime: string): boolean {
+  return ALLOWED_IMAGE_MIMES.has((mime || "").toLowerCase());
+}
+
+/**
+ * 黑名单：出于安全考虑拒绝上传的高危可执行文件类型。
+ *
+ * 背景：需求是「不限制格式」，因此不再维护白名单；但下列 MIME 一旦被浏览器
+ * 识别为类型直接打开/执行仍然有风险。显式黑掉，其它任意类型放行。
+ */
+const BLOCKED_MIMES = new Set([
+  "application/x-msdownload",        // .exe / .dll
+  "application/x-ms-installer",      // .msi
+  "application/x-ms-shortcut",       // .lnk
+  "application/x-bat",               // .bat
+  "application/x-sh",                // .sh
+  "application/hta",                 // .hta
+  "application/x-executable",        // 通用可执行文件
+  "application/x-elf",               // Linux 可执行文件
+]);
+
+// SEC-UPLOAD-01: MIME 风险分级
+const HIGH_RISK_MIMES = new Set([
+  "text/html", "text/xml", "application/xhtml+xml",
+  "image/svg+xml", "application/xml",
+  "application/javascript", "text/javascript", "application/x-javascript",
+]);
+
+export function isHighRiskMime(mime: string): boolean {
+  return HIGH_RISK_MIMES.has((mime || "").toLowerCase().split(";")[0].trim());
+}
+
+function getMaxAttachmentSize(): number {
+  const envVal = process.env.MAX_ATTACHMENT_SIZE_MB;
+  if (envVal) {
+    const parsed = parseInt(envVal, 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 10240) return parsed * 1024 * 1024;
+  }
+  return 100 * 1024 * 1024;
+}
+
+// 从文件名兜底推断扩展名（file.name 为空或无点时用 MIME 映射，再兜底 "bin"）。
+function pickExt(filename: string | undefined, mime: string): string {
+  const name = filename || "";
+  const idx = name.lastIndexOf(".");
+  if (idx >= 0 && idx < name.length - 1) {
+    const ext = name.slice(idx + 1).toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (ext && ext.length <= 8) return ext;
+  }
+  return MIME_TO_EXT[mime.toLowerCase()] || "bin";
+}
+
+// 为响应头构造一个安全的 filename* 值（RFC 5987），避免中文/空格被截断或破坏。
+export function encodeContentDispositionFilename(name: string): string {
+  const safe = (name || "attachment").replace(/[\r\n"]/g, "_");
+  return `attachment; filename*=UTF-8''${encodeURIComponent(safe)}`;
+}
+
+/**
+ * Buffer → 响应体兼容包装。
+ *
+ * 背景（TS 5.7+ + @types/node 22 的类型鸿沟）：
+ *   - Node `Buffer` 的类型签名在 @types/node 22 / TS 5.7 之后变成
+ *     `Buffer<ArrayBufferLike>`，underlying buffer 可能是 `SharedArrayBuffer`。
+ *   - 而浏览器 `lib.dom.d.ts` 的 `BodyInit` / `BlobPart`、Hono 的 `Data`
+ *     全都要求 `Uint8Array<ArrayBuffer>`（裸 `ArrayBuffer`，非 `Like`）。
+ *   - 直接把 Buffer 喂给 `new Response()` / `new Blob([buf])` / `c.body(buf)`
+ *     都会被 TS 拒绝（TS2345 / TS2322 / TS2769）。
+ *
+ * 解法：
+ *   通过 `new Uint8Array(buf)` 拷贝构造一个**确定 underlying ArrayBuffer**
+ *   的视图。这是真拷贝（O(n)），但响应路径每个请求只走一次，相比磁盘 I/O
+ *   或 sharp 解码可以忽略；换来的是类型层面 100% 干净、运行期完全正确。
+ *
+ *   想零拷贝也可以用 `as unknown as Uint8Array<ArrayBuffer>` 强转，但显式
+ *   类型断言会绕过 TS 的有效检查；这里选择"显式拷贝 + 真实类型"。
+ */
+function toResponseBody(buf: Buffer): Uint8Array<ArrayBuffer> {
+  // Uint8Array 构造函数接受 ArrayBufferView 时会拷贝字节并新建 ArrayBuffer，
+  // 返回类型在新版 lib 里精确为 Uint8Array<ArrayBuffer>，正中 BodyInit 联合。
+  const out = new Uint8Array(buf.byteLength);
+  out.set(buf);
+  return out as Uint8Array<ArrayBuffer>;
+}
+
+// SEC-UPLOAD-01: 可配置的附件大小限制，默认 100MB，环境变量 MAX_ATTACHMENT_SIZE_MB 可覆盖。
+const MAX_ATTACHMENT_SIZE = getMaxAttachmentSize();
+
+export interface ExistingAttachmentForDedup {
+  id?: string;
+  path: string;
+  filename?: string;
+  mimeType: string;
+  size: number;
+  hash?: string | null;
+}
+
+export interface DeduplicatedAttachmentRow {
+  id: string;
+  url: string;
+  path: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+}
+
+/**
+ * 阶段 B：hash 命中时不再直接复用旧附件 id，而是复制一行新的附件元数据。
+ *
+ * 背景：迁移 / 导入 / 粘贴去重命中后，如果正文继续引用旧 id，新笔记并没有自己的
+ * attachments 行。后续按 noteId 清理、回滚或引用分析时都会失真。
+ *
+ * 策略：
+ *   - 物理文件仍复用 source.path，不额外写盘；
+ *   - 新建 attachments.id，并绑定到当前 noteId；
+ *   - 删除时依赖 path 引用计数兜底，最后一个引用消失才 unlink。
+ */
+export function createDeduplicatedAttachmentRow(args: {
+  source: ExistingAttachmentForDedup;
+  noteId: string;
+  userId: string;
+  workspaceId: string | null;
+  filename?: string;
+  hash?: string | null;
+  uploadSource?: string | null;
+}): DeduplicatedAttachmentRow {
+  const db = getDb();
+  const id = uuid();
+  const filename = args.filename || args.source.filename || args.source.path || `${id}.bin`;
+  const hash = args.hash ?? args.source.hash ?? null;
+
+  if (args.uploadSource !== undefined) {
+    db.prepare(
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash, uploadSource)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      args.noteId,
+      args.userId,
+      filename,
+      args.source.mimeType,
+      args.source.size,
+      args.source.path,
+      args.workspaceId,
+      hash,
+      args.uploadSource,
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      args.noteId,
+      args.userId,
+      filename,
+      args.source.mimeType,
+      args.source.size,
+      args.source.path,
+      args.workspaceId,
+      hash,
+    );
+  }
+
+  return {
+    id,
+    url: `/api/attachments/${id}`,
+    path: args.source.path,
+    filename,
+    mimeType: args.source.mimeType,
+    size: args.source.size,
+  };
+}
+
+/**
+ * 不需要 JWT 的下载 handler。index.ts 直接把它挂在 JWT 中间件**之前**。
+ *
+ * 授权模型（SEC-ATTACHMENT-01 升级）：
+ *   1. 带签名 URL（?exp=&sig=&scope=）→ 校验签名，通过即授权
+ *   2. 带 X-User-Id（fetch / API 调用）→ 走 note read 权限链
+ *   3. 无签名无 userId → 走"UUID 不可枚举"隐式授权（可通过环境变量关闭）
+ */
+export async function handleDownloadAttachment(
+  c: Context,
+  dependencies: {
+    readAttachmentObject?: typeof readAttachmentObject;
+    getOrCreateThumbnailFromBufferAsync?: typeof getOrCreateThumbnailFromBufferAsync;
+  } = {},
+): Promise<Response> {
+  const id = c.req.param("id");
+  const db = getDb();
+  const row = db
+    .prepare("SELECT id, noteId, mimeType, path, filename, userId, workspaceId, uploadSource FROM attachments WHERE id = ?")
+    .get(id) as (FileAttachmentAccessRow & { id: string; mimeType: string; path: string; filename: string }) | undefined;
+  if (!row) return c.json({ error: "附件不存在" }, 404);
+
+  // SEC-ATTACHMENT-01: 签名 URL 校验
+  const exp = c.req.query("exp");
+  const sig = c.req.query("sig");
+  const scope = c.req.query("scope");
+  const userId = c.req.header("X-User-Id") || "";
+
+  if (exp && sig && scope) {
+    const { verifyAttachmentSignature } = await import("../lib/attachment-signed-url");
+    const result = verifyAttachmentSignature(id, exp, sig, scope);
+    if (!result.valid) {
+      return c.json({ error: "签名无效或已过期", code: "INVALID_SIGNATURE", reason: result.reason }, 403);
+    }
+  } else if (row.noteId && userId) {
+    if (!resolveFileAttachmentAccess(row, userId).canView) {
+      return c.json({ error: "无权访问该附件" }, 403);
+    }
+  } else {
+    const { isLegacyPublicUrlEnabled } = await import("../lib/attachment-signed-url");
+    if (!isLegacyPublicUrlEnabled()) {
+      return c.json({
+        error: "需要签名 URL 或登录凭证",
+        code: "SIGNATURE_REQUIRED",
+      }, 401);
+    }
+  }
+
+  const forceDownload = /^(?:1|true|yes)$/i.test(c.req.query("download") || "");
+  // ?inline=1 —— 显式声明"用于浏览器内联预览（如 <video>/<audio>/<iframe>）"。
+  // 对于非图片附件，此参数会跳过 Content-Disposition: attachment，让浏览器直接渲染
+  // 而不是触发下载。和 forceDownload 互斥（forceDownload 优先级更高，因为是用户明示）。
+  // 注意：authorization 模型不变（uuid 不可枚举），inline 不会扩大攻击面——HTML/SVG 等
+  // 高危类型由前端预览组件自行 sanitize 处理。
+  const inlinePreview = c.req.query("inline") === "1";
+  const requestedWidth = parseThumbnailWidth(c.req.query("w"));
+  const readObject = dependencies.readAttachmentObject ?? readAttachmentObject;
+  const createThumbnailFromBuffer = dependencies.getOrCreateThumbnailFromBufferAsync
+    ?? getOrCreateThumbnailFromBufferAsync;
+
+  // 存量附件可能以空 MIME 或 octet-stream 入库；读取字节兜底识别，不依赖扩展名转码。
+  let heifSource: Buffer | null | undefined;
+  const readHeifSource = async () => {
+    if (heifSource === undefined) heifSource = await readObject(row.path);
+    return heifSource;
+  };
+  const mediaVariant = c.req.query("variant");
+  if ((c.req.query("media") === "info" || mediaVariant === "motion" || mediaVariant === "motion-original") && (!forceDownload || mediaVariant === "motion-original")) {
+    try {
+      const media = await inspectPhotoMedia(row.id, readHeifSource);
+      if (c.req.query("media") === "info") {
+        c.header("Cache-Control", "private, no-store");
+        return c.json({
+          kind: media.analysis.kind,
+          mimeType: media.analysis.mimeType,
+          hasMotion: Boolean(media.analysis.motion || media.companion),
+          motionStatus: media.analysis.motion || media.companion ? "available"
+            : media.analysis.kind === "live-photo" ? "missing-companion" : "none",
+          hasMotionOriginal: Boolean(media.companion),
+          canDownloadOriginal: c.get("attachmentAllowDownload") !== false,
+          ...(!sig && userId && !c.req.query("share") ? { accessUrls: createUserAttachmentAccessUrls(userId, [{ id: row.id, noteId: row.noteId }]) } : {}),
+        });
+      }
+      if (mediaVariant === "motion-original") {
+        // 配对原视频的下载仍受照片凭证及 wrapper 的下载权限约束。
+        if (!forceDownload) return c.json({ error: "下载动态原件需要 download=1" }, 400);
+        if (!media.companion) return c.json({ error: "没有配对的动态原件" }, 404);
+        const original = await readObject(media.companion.path);
+        if (!original) return c.json({ error: "attachment file missing" }, 404);
+        const current = await inspectPhotoMedia(row.id, readHeifSource);
+        if (current.companion?.id !== media.companion.id) return c.json({ error: "没有配对的动态原件" }, 404);
+        return c.body(toResponseBody(original), 200, {
+          "Content-Type": media.companion.mimeType,
+          "Content-Disposition": encodeContentDispositionFilename(media.companion.filename),
+        });
+      }
+      if (!media.analysis.motion && !media.companion) return c.json({ error: "照片没有可播放的动态内容", code: "MOTION_NOT_AVAILABLE" }, 404);
+      const preview = await getOrCreateMotionPreview(row.id, readHeifSource);
+      const etag = `"motion-v1-${crypto.createHash("sha256").update(preview).digest("hex")}"`;
+      const headers = { "Content-Type": "video/mp4", "Accept-Ranges": "bytes", ETag: etag };
+      const rangeHeader = c.req.header("Range");
+      const ifRange = c.req.header("If-Range");
+      const range = !ifRange || ifRange === etag ? parseSingleHttpRange(rangeHeader, preview.length) : null;
+      if (range && !range.ok) return c.body(null, 416, { ...headers, "Content-Range": `bytes */${preview.length}` });
+      if (requestMatchesEtag(new Headers(c.req.raw.headers), etag)) return c.body(null, 304, headers);
+      if (range?.ok) return c.body(toResponseBody(preview.subarray(range.start, range.end + 1)), 206, {
+        ...headers, "Content-Length": String(range.length), "Content-Range": `bytes ${range.start}-${range.end}/${preview.length}`,
+      });
+      return c.body(toResponseBody(preview), 200, { ...headers, "Content-Length": String(preview.length) });
+    } catch (error) {
+      console.warn(`[modern-media] 读取派生媒体失败 attachment=${row.id}:`, error);
+      return c.json({ error: "动态内容暂时无法播放，仍可查看照片或下载原件", code: "MEDIA_PREVIEW_FAILED" }, 422);
+    }
+  }
+  if (!isHeifMime(row.mimeType) && (
+    !row.mimeType || row.mimeType === "application/octet-stream"
+    || /\.hei[cf]$/i.test(row.filename) || /\.hei[cf]$/i.test(row.path)
+  )) {
+    const source = await readHeifSource();
+    const detected = source && sniffHeifMime(source);
+    if (detected) {
+      row.mimeType = detected;
+      db.prepare("UPDATE attachments SET mimeType = ? WHERE id = ?").run(detected, row.id);
+    }
+  }
+  if (isHeifMime(row.mimeType) && !forceDownload) {
+    const previewEtag = computeAttachmentEtag(row.id, requestedWidth || "heif-preview-v1");
+    if (requestMatchesEtag(new Headers(c.req.raw.headers), previewEtag)) {
+      return new Response(null, { status: 304, headers: { ETag: previewEtag } });
+    }
+    try {
+      const preview = await getOrCreateHeifPreview(ATTACHMENTS_DIR, row.id, readHeifSource);
+      recordHeifVariant(row.id);
+      const thumb = requestedWidth
+        ? await createThumbnailFromBuffer(ATTACHMENTS_DIR, row.id, preview, "image/webp", requestedWidth)
+        : null;
+      return c.body(toResponseBody(thumb?.buffer || preview), 200, {
+        "Content-Type": "image/webp",
+        ETag: thumb || !requestedWidth ? previewEtag : computeAttachmentEtag(row.id, "heif-preview-v1"),
+        ...(thumb ? { "X-Thumbnail-Width": String(requestedWidth) } : {}),
+      });
+    } catch (error) {
+      console.warn(`[heif-preview] 生成兼容预览失败 attachment=${row.id}:`, error);
+      if (heifSource === null) return c.json({ error: "attachment file missing" }, 404);
+      return c.json({
+        error: "无法生成 HEIC/HEIF 兼容预览，请下载原文件查看",
+        code: "HEIF_PREVIEW_FAILED",
+      }, 422);
+    }
+  }
+
+  // 是否会走缩略图分支只依赖 query 参数 + row.mimeType，不需要读文件内容就能
+  // 确定。据此可在读取任何字节之前算出这次响应的 ETag variant，命中
+  // If-None-Match 时直接 304，省掉磁盘/对象存储读取以及（若是缩略图）sharp
+  // 编码。此前 ETag 统一为 "att-<id>"，原图和不同宽度的缩略图共用同一个验证
+  // 器，属于错误的实体标识；现在按 (id, variant) 区分。
+  const willServeThumbnail = Boolean(requestedWidth) && !forceDownload && isThumbnailable(row.mimeType);
+  const etag = computeAttachmentEtag(row.id, willServeThumbnail ? requestedWidth! : "original");
+
+  if (requestMatchesEtag(new Headers(c.req.raw.headers), etag)) {
+    return new Response(null, {
+      status: 304,
+      statusText: "Not Modified",
+      headers: {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        ETag: etag,
+      },
+    });
+  }
+
+  const absPath = path.join(ATTACHMENTS_DIR, row.path);
+  const localExists = fs.existsSync(absPath);
+
+  // 缩略图分支：仅在
+  //   1) 请求带合法 ?w=
+  //   2) 不是 ?download=1（下载场景必须给原文件）
+  //   3) 原图是可缩略的 raster 图片
+  // 三者同时满足时尝试。任何一步失败就回退到原图。
+  let sourceBuffer: Buffer | null | undefined = heifSource;
+  if (willServeThumbnail) {
+    const thumb = localExists
+      ? await getOrCreateThumbnailAsync(
+          ATTACHMENTS_DIR,
+          row.id,
+          absPath,
+          row.mimeType,
+          requestedWidth!,
+        )
+      : await (async () => {
+          sourceBuffer = await readObject(row.path);
+          if (!sourceBuffer) return null;
+          return createThumbnailFromBuffer(
+            ATTACHMENTS_DIR,
+            row.id,
+            sourceBuffer,
+            row.mimeType,
+            requestedWidth!,
+          );
+        })();
+    if (thumb) {
+      return c.body(toResponseBody(thumb.buffer), 200, {
+        "Content-Type": thumb.mimeType,
+        // 缩略图与原图一样 immutable（webp 内容由 (id, w) 唯一决定）
+        "Cache-Control": "public, max-age=31536000, immutable",
+        // 让前端 / 代理可以观察到这张响应是缩略图
+        "X-Thumbnail-Width": String(requestedWidth),
+        ETag: etag,
+      });
+    }
+    // thumb 为 null（sharp 失败 / 不可用）→ fall through 返回原图。
+    // 此时上面预先算好的 etag 是缩略图 variant，和接下来要返回的原图内容
+    // 不匹配，下面重新按 "original" 计算，避免客户端拿到错误的验证器。
+  }
+
+  // undefined = 尚未读取；null = 已读取但对象不存在；Buffer = 可直接复用。
+  // 远程缩略图生成失败时必须复用同一次请求已取得的原图，避免 NAS/S3
+  // 再次下载；对象缺失时也不能为了确认 404 再读一次。
+  const buffer = sourceBuffer === undefined
+    ? await readObject(row.path)
+    : sourceBuffer;
+  if (!buffer) {
+    return c.json({ error: "attachment file missing" }, 404);
+  }
+
+  const originalEtag = willServeThumbnail ? computeAttachmentEtag(row.id, "original") : etag;
+  const headers: Record<string, string> = {
+    "Content-Type": row.mimeType || "application/octet-stream",
+    "Cache-Control": "public, max-age=31536000, immutable",
+    ETag: originalEtag,
+  };
+
+  // SEC-UPLOAD-01: 高风险 MIME 强制下载
+  const isHighRisk = isHighRiskMime(row.mimeType);
+
+  if (isHighRisk || (!isImageMime(row.mimeType) || forceDownload) && !(inlinePreview && !forceDownload)) {
+    headers["Content-Disposition"] = encodeContentDispositionFilename(row.filename || "");
+    if (isHighRisk) headers["X-Content-Type-Options"] = "nosniff";
+  }
+  return c.body(toResponseBody(buffer), 200, headers);
+}
+
+// ============================================================================
+// 下面的路由挂在 JWT 中间件之后（见 index.ts）：上传 / 删除
+// ============================================================================
+const app = new Hono();
+
+/**
+ * 上传附件（任意格式）。
+ *
+ * 请求：
+ *   POST /api/attachments
+ *   multipart/form-data：
+ *     file:   File
+ *     noteId: string  // 必传，用于 ACL 校验 + 外键
+ *
+ * 响应：
+ *   { id, url, mimeType, size, filename, category: "image" | "file" }
+ *   - url = `/api/attachments/<id>`，前端直接写到 <img src> 或 <a href>；
+ *   - category 供前端决定编辑器里插 <img> 还是附件链接。
+ *
+ * 权限：需要对 noteId 所指笔记拥有 `write` 权限（上传即修改笔记内容）。
+ */
+app.post("/", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const db = getDb();
+
+  let body: Record<string, any>;
+  try {
+    body = await c.req.parseBody();
+  } catch {
+    return c.json({ error: "invalid multipart body" }, 400);
+  }
+
+  const file = body.file;
+  const noteId = typeof body.noteId === "string" ? body.noteId : "";
+
+  if (!(file instanceof File)) {
+    return c.json({ error: "file 字段缺失或非文件" }, 400);
+  }
+  if (!noteId) {
+    return c.json({ error: "noteId 必传" }, 400);
+  }
+
+  // ACL：必须对目标笔记有 write 权限
+  // 同时拿到笔记的 workspaceId（null = 个人空间），用于附件行的 scope 归属：
+  // 这样"文件管理"在个人空间 / 工作区两处列表才能严格按空间区分——否则
+  // 所有通过编辑器粘贴 / 上传的图片都会落到 workspaceId IS NULL，
+  // 被个人空间的 list 捞到，而工作区的 list（a.workspaceId = ?）反而看不见。
+  const { permission, workspaceId: noteWorkspaceId } = resolveNotePermission(
+    noteId,
+    userId,
+  );
+  if (!hasPermission(permission, "write")) {
+    return c.json({ error: "无权向该笔记上传附件", code: "FORBIDDEN" }, 403);
+  }
+  const noteFormat = db.prepare("SELECT contentFormat FROM notes WHERE id = ?").get(noteId) as { contentFormat: string } | undefined;
+  if (isEncryptedNoteFormat(noteFormat?.contentFormat)) {
+    return c.json({ error: "加密文本笔记暂不支持附件", code: "ENCRYPTED_NOTE_ATTACHMENT_FORBIDDEN" }, 400);
+  }
+
+  // 大小 / MIME 校验
+  if (file.size > MAX_ATTACHMENT_SIZE) {
+    return c.json(
+      { error: `文件过大（最大 ${MAX_ATTACHMENT_SIZE / 1024 / 1024}MB）` },
+      413,
+    );
+  }
+  let mime = (file.type || "application/octet-stream").toLowerCase();
+  // 不限制格式：只拒绝少数高危可执行文件类型，其它任意 MIME 都放行。
+  if (BLOCKED_MIMES.has(mime)) {
+    return c.json({ error: `出于安全考虑，不支持该类型: ${mime}` }, 415);
+  }
+
+  // 落盘
+  ensureAttachmentsDir();
+  const id = uuid();
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(await file.arrayBuffer());
+  } catch (err: unknown) {
+    return attachmentWriteErrorResponse(c, "read", err);
+  }
+  mime = analyzeModernMedia(buffer, resolveHeifUploadMime(buffer, mime)).mimeType;
+  const ext = pickExt(file.name, mime);
+  const monthPath = getUploadMonthPath();
+  const storagePath = `${monthPath}/${id}.${ext}`;
+
+  // v11 hash 去重：先算 SHA-256，在同 scope（userId + workspaceId）内查命中。
+  // 阶段 B 命中策略：
+  //   - 相同 (userId, workspaceId, hash) 已存在一行 → 不写新文件，但复制一行新的
+  //     attachments 元数据绑定到当前 noteId，path 指向同一物理文件；
+  //   - 未命中 → 走正常落盘 + 入库流程，把 hash 一并写下来供后续命中。
+  // 范围"同 user 内"而非全局：避免跨用户 ACL 麻烦，删除时引用计数也只在
+  // 自己的范围内有效（不会因为另一个用户的笔记还在引用就拒删自己的附件）。
+  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+  const dedupRow = db
+    .prepare(
+      noteWorkspaceId
+        ? `SELECT id, path, mimeType, size, filename, hash FROM attachments
+            WHERE userId = ? AND workspaceId = ? AND hash = ? AND trashedAt IS NULL LIMIT 1`
+        : `SELECT id, path, mimeType, size, filename, hash FROM attachments
+            WHERE userId = ? AND workspaceId IS NULL AND hash = ? AND trashedAt IS NULL LIMIT 1`,
+    )
+    .get(
+      ...(noteWorkspaceId
+        ? [userId, noteWorkspaceId, sha256]
+        : [userId, sha256]),
+    ) as ExistingAttachmentForDedup | undefined;
+
+  if (dedupRow) {
+    // 旧附件可能只有通用 MIME，去重新记录按本次上传的真实媒体字节分类。
+    if (isHeifMime(mime) || mime === "image/jpeg" || mime === "image/png" || mime.startsWith("video/")) dedupRow.mimeType = mime;
+    let clone: DeduplicatedAttachmentRow;
+    try {
+      clone = createDeduplicatedAttachmentRow({
+        source: dedupRow,
+        noteId,
+        userId,
+        workspaceId: noteWorkspaceId,
+        filename: file.name || dedupRow.filename,
+        hash: sha256,
+      });
+    } catch (err: unknown) {
+      return attachmentWriteErrorResponse(c, "database", err);
+    }
+
+    enqueueAttachment({
+      attachmentId: clone.id,
+      userId,
+      workspaceId: noteWorkspaceId,
+      noteId,
+    });
+
+    recordMediaAnalysis(clone.id, buffer, clone.mimeType);
+
+    return c.json(
+      {
+        id: clone.id,
+        url: clone.url,
+        imageUrl: imageAttachmentUrl(c, clone.id, clone.mimeType),
+        mimeType: clone.mimeType,
+        size: clone.size,
+        filename: clone.filename,
+        category: isImageMime(clone.mimeType) ? "image" : "file",
+        deduplicated: true,
+        accessUrls: createUserAttachmentAccessUrls(userId, [{ id: clone.id, noteId }]),
+      },
+      201,
+    );
+  }
+
+  try {
+    await writeAttachmentObject(storagePath, buffer, mime);
+  } catch (err: unknown) {
+    return attachmentWriteErrorResponse(c, "storage", err);
+  }
+
+  // 写 DB。attachments.path 存**文件名**（相对 ATTACHMENTS_DIR）而非绝对路径，
+  // 换部署环境只需搬目录。
+  //
+  // workspaceId 继承自 noteId 所属笔记：
+  //   - 个人空间笔记 → workspaceId = NULL（文件管理"个人空间"可见）
+  //   - 工作区笔记   → workspaceId = <该工作区 id>（该工作区成员在"工作区文件管理"可见）
+  // 这与 files.ts 的 list/stats scope 过滤严格对齐，避免"上传到工作区笔记
+  // 却只在个人空间看得见"的错位。
+  try {
+    db.prepare(
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      noteId,
+      userId,
+      file.name || `${id}.${ext}`,
+      mime,
+      file.size,
+      storagePath,
+      noteWorkspaceId,
+      sha256,
+    );
+  } catch (err: unknown) {
+    // Keep the existing orphan-file rollback when database insertion fails.
+    try { await deleteAttachmentObject(storagePath); } catch { /* ignore */ }
+    return attachmentWriteErrorResponse(c, "database", err);
+  }
+
+  // v8：上传成功后立即把附件入队做内容索引。enqueueAttachment 内部吞错，
+  // 即使队列表异常也不影响上传成功响应。
+  enqueueAttachment({
+    attachmentId: id,
+    userId,
+    workspaceId: noteWorkspaceId,
+    noteId,
+  });
+
+  recordMediaAnalysis(id, buffer, mime);
+
+  return c.json(
+    {
+      id,
+      url: `/api/attachments/${id}`,
+      imageUrl: imageAttachmentUrl(c, id, mime),
+      mimeType: mime,
+      size: file.size,
+      filename: file.name || storagePath,
+      // category 供前端决定「作为图片 <img> 还是附件链接 <a>」插入编辑器
+      category: isImageMime(mime) ? "image" : "file",
+      accessUrls: createUserAttachmentAccessUrls(userId, [{ id, noteId }]),
+    },
+    201,
+  );
+});
+
+/**
+ * 删除附件。一般不直接由前端调用（清理靠笔记删除级联 + 定期扫描孤儿）。
+ * 保留作为管理端点：笔记 owner 可以删自己的附件。
+ */
+app.delete("/:id", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+
+  const row = db
+    .prepare("SELECT id, noteId, path FROM attachments WHERE id = ?")
+    .get(id) as { id: string; noteId: string; path: string } | undefined;
+  if (!row) return c.json({ error: "附件不存在" }, 404);
+
+  const { permission } = resolveNotePermission(row.noteId, userId);
+  if (!hasPermission(permission, "write")) {
+    return c.json({ error: "无权删除该附件", code: "FORBIDDEN" }, 403);
+  }
+
+  // Retain the object; permanent deletion is a separate confirmed trash action.
+  const risk = db.transaction(() => {
+    const risk = attachmentDeletionRisk(id);
+    if (!risk) retainAttachmentInTrash(id, userId);
+    return risk;
+  })();
+  if (risk) return c.json(risk, 409);
+  return c.json({ success: true });
+});
+
+// ============================================================================
+// 通用工具：把 notes.content 里内联的 base64 图片抽出来落盘 + 写 attachments 行
+// 供两处复用：
+//   1) /api/export/import（Step 5：导入链路改造）—— 新建笔记同事务内调用
+//   2) scripts/migrate-inline-images-to-attachments.ts（Step 6：一次性迁移）
+// ============================================================================
+
+// data URI 匹配：data:image/<sub>;base64,<payload>
+// 宽容匹配 quote（单/双引号）与属性顺序。只抓 <img src="data:..."> 形式，
+// 不去碰 CSS background-image 之类的偏门用法（Tiptap 正文里几乎不出现）。
+//
+// 为什么不用 DOM 解析：
+//   - 后端没有浏览器 DOM，引入 jsdom 会拖包体；
+//   - notes.content 99% 情况是序列化的 Tiptap JSON（JSON.stringify 后的字符串），
+//     同一份字符串同时承载 HTML 形式和 JSON 形式里的 src 属性值；
+//   - 用正则替换只操作 src 的值部分，对 JSON / HTML 都安全。
+const INLINE_IMG_BASE64_RE = /(["'])data:((?:image|audio)\/[a-z0-9.+\-]+);base64,([A-Za-z0-9+/=]+)\1/gi;
+const MARKDOWN_IMG_BASE64_RE = /!\[([^\]]*)\]\(data:(image\/[a-z0-9.+\-]+);base64,([A-Za-z0-9+/=]+)\)/gi;
+
+export interface InlineImageExtractResult {
+  /** 替换后的 content（data URI 已被换成 /api/attachments/<id>） */
+  content: string;
+  /** 本次创建的附件 id 列表；方便调用方记录 / 回滚 */
+  attachmentIds: string[];
+  /** 被替换掉的 data URI 数量（==attachmentIds.length；分开列出便于日志） */
+  replacedCount: number;
+}
+
+/**
+ * 扫描 content 字符串里的内联 data:image base64，把每一张图落盘 +
+ * 写 attachments 行，并把 content 里的 data URI 替换为 `/api/attachments/<id>`。
+ *
+ * 调用方负责保证 noteId 在 notes 表中已存在（attachments 外键要求）。
+ * 本函数**不**开事务；调用方在自己的事务里调用即可。
+ *
+ * 失败策略：单张图解码失败时**保留原 data URI**（不中断整批），并在返回结果里
+ * 通过 replacedCount 反映真实写入数。
+ *
+ * @param workspaceId 目标笔记的 workspaceId（null = 个人空间）。必须传：
+ *   否则附件的 workspaceId 与笔记不同步，会导致"文件管理"切空间时看不到图。
+ *   调用方通常在调用前已经算出（notes.POST 的 inheritedWorkspaceId、
+ *   notes.PUT 通过 resolveNotePermission、export 导入从 note 行读回）。
+ */
+export function extractInlineBase64Images(
+  content: string,
+  userId: string,
+  noteId: string,
+  workspaceId: string | null,
+): InlineImageExtractResult {
+  if (!content || typeof content !== "string") {
+    return { content: content || "", attachmentIds: [], replacedCount: 0 };
+  }
+  // 图片及 ZIP 导入的音频都进入现有附件存储。
+  if (!/data:(?:image|audio)\//i.test(content)) {
+    return { content, attachmentIds: [], replacedCount: 0 };
+  }
+
+  ensureAttachmentsDir();
+  const db = getDb();
+  const insertStmt = db.prepare(
+    `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  // v11 hash dedup 命中查询：与 POST /api/attachments 走同款"同 user + 同 workspace"
+  // 范围。阶段 B 起，命中后复制一行新元数据绑定当前 noteId，但 path 仍共享老物理文件。
+  const dedupSelect = db.prepare(
+    workspaceId
+      ? `SELECT id, path, filename, mimeType, size, hash FROM attachments
+          WHERE userId = ? AND workspaceId = ? AND hash = ? AND trashedAt IS NULL LIMIT 1`
+      : `SELECT id, path, filename, mimeType, size, hash FROM attachments
+          WHERE userId = ? AND workspaceId IS NULL AND hash = ? AND trashedAt IS NULL LIMIT 1`,
+  );
+
+  const attachmentIds: string[] = [];
+  let replacedCount = 0;
+
+  const createAttachmentUrl = (mime: string, base64: string): string | null => {
+    const mimeLower = mime.toLowerCase();
+    if (!ALLOWED_IMAGE_MIMES.has(mimeLower) && !(mimeLower.startsWith("audio/") && MIME_TO_EXT[mimeLower])) {
+      return null;
+    }
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.from(base64, "base64");
+    } catch {
+      return null;
+    }
+    if (buffer.length === 0 || buffer.length > MAX_ATTACHMENT_SIZE) {
+      return null;
+    }
+
+    // hash dedup：先查命中，命中则不写盘，但复制新元数据行并返回新 id
+    const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+    const hit = (workspaceId
+      ? dedupSelect.get(userId, workspaceId, sha256)
+      : dedupSelect.get(userId, sha256)) as ExistingAttachmentForDedup | undefined;
+    if (hit) {
+      try {
+        const clone = createDeduplicatedAttachmentRow({
+          source: hit,
+          noteId,
+          userId,
+          workspaceId,
+          filename: hit.filename,
+          hash: sha256,
+        });
+        attachmentIds.push(clone.id);
+        replacedCount++;
+        return clone.url;
+      } catch {
+        return null;
+      }
+    }
+
+    const id = uuid();
+    const ext = MIME_TO_EXT[mimeLower] || "bin";
+    const monthPath = getUploadMonthPath();
+    const filename = `${monthPath}/${id}.${ext}`;
+    const savePath = path.join(ATTACHMENTS_DIR, filename);
+
+    try {
+      fs.mkdirSync(path.dirname(savePath), { recursive: true });
+      fs.writeFileSync(savePath, buffer);
+    } catch {
+      return null;
+    }
+    try {
+      insertStmt.run(id, noteId, userId, filename, mimeLower, buffer.length, filename, workspaceId, sha256);
+    } catch {
+      // DB 写失败 → 清掉磁盘文件，保留原 data URI
+      try { fs.unlinkSync(savePath); } catch { /* ignore */ }
+      return null;
+    }
+
+    attachmentIds.push(id);
+    replacedCount++;
+    return `/api/attachments/${id}`;
+  };
+
+  const htmlRewritten = content.replace(
+    INLINE_IMG_BASE64_RE,
+    (_match, quote: string, mime: string, base64: string) => {
+      const url = createAttachmentUrl(mime, base64);
+      if (!url) return _match;
+      // 用同款 quote 包住替换值，避免破坏外层 JSON / HTML 的引号平衡
+      return `${quote}${url}${quote}`;
+    },
+  );
+
+  const newContent = htmlRewritten.replace(
+    MARKDOWN_IMG_BASE64_RE,
+    (_match, alt: string, mime: string, base64: string) => {
+      const url = createAttachmentUrl(mime, base64);
+      if (!url) return _match;
+      return `![${alt}](${url})`;
+    },
+  );
+
+  return { content: newContent, attachmentIds, replacedCount };
+}
+
+// ============================================================================
+// 孤儿附件扫描器 + GC（A1）
+// ----------------------------------------------------------------------------
+// 背景：
+//   即使 attachments 表对 notes 是 ON DELETE CASCADE，SQLite 也只删行不删
+//   磁盘文件；而且像"删除整个笔记本"会沿着 notebooks→notes→attachments 两层
+//   级联，业务代码很容易漏掉显式调用 deleteAttachmentFilesByNoteIds()。
+//
+//   "孤儿"分两类：
+//     A. **DB 孤儿**：磁盘上 .png/.jpg... 文件存在，但 attachments 表已查无此 id
+//        → 通常是上面级联删除的产物。可安全 unlink。
+//     B. **内容孤儿**：attachments 表里有行、磁盘也有文件，但已经没有任何
+//        notes.content 引用它了（用户在编辑器里删图但没触发清理）。
+//        → 删除前需要谨慎，因为有可能是"刚上传还没保存到 content"的窗口期；
+//        所以扫描时引入"宽限期"概念：只考虑 createdAt 早于 N 小时（默认 24h）
+//        的附件，避免误杀刚上传的临时附件。
+//
+//   GC 接口：
+//     GET  /api/attachments/_orphans/scan       — 扫描，返回两类孤儿数量+总字节
+//     POST /api/attachments/_orphans/clean      — 执行清理（dryRun 默认 true）
+//
+//   仅管理员可访问。
+// ============================================================================
+
+interface OrphanScanResult {
+  /** 磁盘存在但 DB 无对应行的文件 */
+  dbOrphans: { filename: string; bytes: number }[];
+  /** DB 有行但 notes.content 不再引用 */
+  contentOrphans: { id: string; filename: string; bytes: number; noteId: string; createdAt: string }[];
+  /** 总可回收字节数（dbOrphans + contentOrphans） */
+  reclaimableBytes: number;
+  /** 磁盘附件目录总占用 */
+  totalAttachmentBytes: number;
+  /** 扫描使用的内容孤儿宽限期小时数（早于该窗口的才参与） */
+  graceHours: number;
+}
+
+/**
+ * 递归扫描 ATTACHMENTS_DIR，返回所有物理文件的相对路径列表。
+ * 兼容两种存储格式：
+ *   - 旧平铺：<uuid>.<ext>
+ *   - 新月归档：YYYY/MM/<uuid>.<ext>
+ * 跳过隐藏目录（如 .thumbs/）。
+ */
+function listDiskFilesRecursive(): string[] {
+  const results: string[] = [];
+  function walk(dir: string, relPrefix: string) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.startsWith(".")) continue;
+      const abs = path.join(dir, entry);
+      const rel = relPrefix ? `${relPrefix}/${entry}` : entry;
+      try {
+        const stat = fs.statSync(abs);
+        if (stat.isFile()) {
+          results.push(rel);
+        } else if (stat.isDirectory()) {
+          walk(abs, rel);
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  }
+  walk(ATTACHMENTS_DIR, "");
+  return results;
+}
+
+/**
+ * 扫描孤儿附件。
+ *
+ * @param graceHours 内容孤儿的宽限期：createdAt 距今不足该小时数的附件不参与
+ *                   （避免误杀"刚上传还没保存到 content"的窗口期附件）
+ */
+export function scanOrphanAttachments(graceHours = 24): OrphanScanResult {
+  ensureAttachmentsDir();
+  const db = getDb();
+
+  // 1) 物理目录全部文件（递归扫描 YYYY/MM 子目录）
+  const diskFiles = listDiskFilesRecursive();
+
+  let totalAttachmentBytes = 0;
+  const fileSizes = new Map<string, number>();
+  for (const f of diskFiles) {
+    try {
+      const sz = fs.statSync(path.join(ATTACHMENTS_DIR, f)).size;
+      fileSizes.set(f, sz);
+      totalAttachmentBytes += sz;
+    } catch {
+      /* 单个 stat 失败忽略 */
+    }
+  }
+
+  // 2) DB 中所有附件
+  const dbRows = db
+    .prepare("SELECT id, noteId, path, size, createdAt, trashedAt FROM attachments")
+    .all() as { id: string; noteId: string; path: string; size: number; createdAt: string; trashedAt: string | null }[];
+  const templatePaths = db
+    .prepare("SELECT path FROM note_template_attachments")
+    .all() as Array<{ path: string }>;
+  const dbFilenames = new Set([
+    ...dbRows.map((r) => r.path),
+    ...templatePaths.map((r) => r.path),
+    ...pendingNoteDeletionAttachments(db).map((r)=>r.path),
+    ...(db.prepare("SELECT attachments FROM sync_note_deletion_cleanup").all() as {attachments:string}[]).flatMap(row=>(JSON.parse(row.attachments) as {path:string}[]).map(a=>a.path)),
+  ]);
+
+  // 3) DB 孤儿：磁盘有 + DB 无
+  const dbOrphans: { filename: string; bytes: number }[] = [];
+  for (const f of diskFiles) {
+    if (!dbFilenames.has(f)) {
+      dbOrphans.push({ filename: f, bytes: fileSizes.get(f) ?? 0 });
+    }
+  }
+
+  // 4) 内容孤儿：DB 有行，但所属 note 的 content 不再含 `/api/attachments/<id>`
+  //   - 我们一次性把所有 notes 的 content 拼起来做 indexOf 检查（避免 N+1）。
+  //   - 内容字段可能很大，但只取 content（已知是 TEXT）。一次扫描 OK。
+  const allContents = db.prepare("SELECT id, content FROM notes").all() as { id: string; content: string | null }[];
+  // 也要把 task_attachments 等其他可能引用 attachment id 的源头一并考虑——
+  // 当前项目只看到 notes.content 引用，task-attachments 是独立目录与表，
+  // 所以这里只覆盖 notes。后续如新增引用源在 sources[] 加即可。
+  const sources: string[] = [];
+  for (const n of allContents) {
+    if (n.content) sources.push(n.content);
+  }
+  const haystack = sources.join("\n");
+  const companionReferences = db.prepare(`SELECT sourceAttachmentId, variantAttachmentId FROM attachment_media_variants
+    WHERE kind = 'original-motion' AND variantAttachmentId IS NOT NULL`).all() as Array<{ sourceAttachmentId: string; variantAttachmentId: string }>;
+  const protectedCompanions = new Set(companionReferences
+    .filter((relation) => haystack.includes(`/api/attachments/${relation.sourceAttachmentId}`))
+    .map((relation) => relation.variantAttachmentId));
+
+  const cutoff = Date.now() - graceHours * 3600 * 1000;
+  const contentOrphans: OrphanScanResult["contentOrphans"] = [];
+  for (const r of dbRows) {
+    if (r.trashedAt) continue;
+    // 仅扫描宽限期之外的附件
+    const created = new Date(r.createdAt).getTime();
+    if (Number.isFinite(created) && created > cutoff) continue;
+    // 引用判定：搜 `/api/attachments/<id>`（uuid 不会与其他随机字符串混淆）
+    if (haystack.indexOf(`/api/attachments/${r.id}`) >= 0) continue;
+    if (protectedCompanions.has(r.id)) continue;
+    contentOrphans.push({
+      id: r.id,
+      filename: r.path,
+      bytes: r.size ?? fileSizes.get(r.path) ?? 0,
+      noteId: r.noteId,
+      createdAt: r.createdAt,
+    });
+  }
+
+  const reclaimableBytes =
+    dbOrphans.reduce((s, x) => s + x.bytes, 0) + contentOrphans.reduce((s, x) => s + x.bytes, 0);
+
+  return {
+    dbOrphans,
+    contentOrphans,
+    reclaimableBytes,
+    totalAttachmentBytes,
+    graceHours,
+  };
+}
+
+interface AttachmentHealthIssue {
+  id: string;
+  noteId: string;
+  noteTitle?: string;
+  filename: string;
+  path: string;
+  mimeType?: string;
+  size: number;
+  createdAt: string;
+  referencedBy: number;
+}
+
+interface AttachmentDanglingReference {
+  attachmentId: string;
+  noteId: string;
+  noteTitle?: string;
+  isTrashed?: boolean;
+}
+
+interface AttachmentSharedPhysicalFile {
+  path: string;
+  count: number;
+  bytes: number;
+  attachmentIds: string[];
+}
+
+interface AttachmentHealthReport {
+  ok: boolean;
+  totalAttachments: number;
+  totalPhysicalFiles: number;
+  totalAttachmentBytes: number;
+  missingPhysicalFiles: AttachmentHealthIssue[];
+  danglingReferences: AttachmentDanglingReference[];
+  sharedPhysicalFiles: AttachmentSharedPhysicalFile[];
+  orphans: OrphanScanResult;
+  checkedAt: string;
+}
+
+/**
+ * 阶段 C：附件健康检查。
+ *
+ * 目标不是清理，而是把“会导致用户看见裂图/404”的问题列出来：
+ *   - missingPhysicalFiles：attachments 行存在，但 path 指向的物理文件不存在；
+ *   - danglingReferences：notes.content 引用了 /api/attachments/<id>，但 DB 行不存在；
+ *   - sharedPhysicalFiles：多条 attachments 行共享同一个 path（阶段 B 的正常形态），
+ *     仅作观测，帮助确认引用计数兜底是否生效。
+ */
+export function scanAttachmentHealth(graceHours = 24): AttachmentHealthReport {
+  ensureAttachmentsDir();
+  const db = getDb();
+  const orphans = scanOrphanAttachments(graceHours);
+
+  // 递归扫描物理目录，兼容 YYYY/MM 子目录
+  const diskFiles = listDiskFilesRecursive();
+  const diskFileSet = new Set(diskFiles);
+
+  const rows = db
+    .prepare(
+      `SELECT a.id, a.noteId, a.path, a.filename, a.mimeType, COALESCE(a.size, 0) AS size,
+              a.createdAt, n.title AS noteTitle
+         FROM attachments a
+         LEFT JOIN notes n ON n.id = a.noteId`,
+    )
+    .all() as Array<{
+      id: string;
+      noteId: string;
+      path: string;
+      filename: string;
+      mimeType: string;
+      size: number;
+      createdAt: string;
+      noteTitle?: string;
+    }>;
+
+  const attachmentIds = new Set(rows.map((r) => r.id.toLowerCase()));
+  const refCount = new Map<string, number>();
+  const danglingReferences: AttachmentDanglingReference[] = [];
+  const notes = db
+    .prepare("SELECT id, title, content, isTrashed FROM notes WHERE content IS NOT NULL AND content <> ''")
+    .all() as Array<{ id: string; title?: string; content: string; isTrashed?: number }>;
+  for (const n of notes) {
+    const ids = extractAttachmentIdsFromContent(n.content);
+    for (const id of ids) {
+      refCount.set(id, (refCount.get(id) || 0) + 1);
+      if (!attachmentIds.has(id)) {
+        danglingReferences.push({
+          attachmentId: id,
+          noteId: n.id,
+          noteTitle: n.title,
+          isTrashed: !!n.isTrashed,
+        });
+      }
+    }
+  }
+
+  const missingPhysicalFiles: AttachmentHealthIssue[] = [];
+  const byPath = new Map<string, typeof rows>();
+  for (const r of rows) {
+    if (!diskFileSet.has(r.path)) {
+      missingPhysicalFiles.push({
+        id: r.id,
+        noteId: r.noteId,
+        noteTitle: r.noteTitle,
+        filename: r.filename || r.path,
+        path: r.path,
+        mimeType: r.mimeType,
+        size: r.size || 0,
+        createdAt: r.createdAt,
+        referencedBy: refCount.get(r.id.toLowerCase()) || 0,
+      });
+    }
+    const list = byPath.get(r.path) || [];
+    list.push(r);
+    byPath.set(r.path, list);
+  }
+
+  const sharedPhysicalFiles: AttachmentSharedPhysicalFile[] = [];
+  for (const [p, list] of byPath.entries()) {
+    if (list.length <= 1) continue;
+    sharedPhysicalFiles.push({
+      path: p,
+      count: list.length,
+      bytes: list[0]?.size || 0,
+      attachmentIds: list.map((r) => r.id),
+    });
+  }
+  sharedPhysicalFiles.sort((a, b) => b.count - a.count || b.bytes - a.bytes);
+
+  return {
+    ok: missingPhysicalFiles.length === 0 && danglingReferences.length === 0,
+    totalAttachments: rows.length,
+    totalPhysicalFiles: diskFiles.length,
+    totalAttachmentBytes: orphans.totalAttachmentBytes,
+    missingPhysicalFiles,
+    danglingReferences,
+    sharedPhysicalFiles,
+    orphans,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * 清理孤儿附件。
+ *
+ * @param opts.dryRun     仅返回将要清理的清单，不动磁盘和 DB（默认 true）
+ * @param opts.kinds      要清理的孤儿类型，默认 ["dbOrphans", "contentOrphans"]
+ * @param opts.graceHours 内容孤儿宽限期，与扫描一致
+ */
+export function cleanOrphanAttachments(opts: {
+  dryRun?: boolean;
+  kinds?: ("dbOrphans" | "contentOrphans")[];
+  graceHours?: number;
+}): {
+  dryRun: boolean;
+  removedFiles: number;
+  removedRows: number;
+  freedBytes: number;
+  scan: OrphanScanResult;
+} {
+  const dryRun = opts.dryRun !== false;
+  const kinds = opts.kinds ?? ["dbOrphans", "contentOrphans"];
+  const scan = scanOrphanAttachments(opts.graceHours ?? 24);
+
+  let removedFiles = 0;
+  let removedRows = 0;
+  let freedBytes = 0;
+
+  if (dryRun) {
+    return { dryRun, removedFiles: 0, removedRows: 0, freedBytes: 0, scan };
+  }
+
+  // 删 DB 孤儿（仅文件）：scan.dbOrphans 的定义是“磁盘有、DB 无”，因此可直接 unlink。
+  if (kinds.includes("dbOrphans")) {
+    for (const f of scan.dbOrphans) {
+      try {
+        fs.unlinkSync(path.join(ATTACHMENTS_DIR, f.filename));
+        removedFiles++;
+        freedBytes += f.bytes;
+      } catch {
+        /* 单个失败不阻塞批量 */
+      }
+    }
+  }
+
+  // 删内容孤儿（DB 行 + 可安全回收的物理文件）。
+  // 阶段 B 后多条 attachments 行可能共享同一个 path；只有当“本次删除集合以外”
+  // 没有任何行继续引用该 path 时，才允许 unlink 物理文件。
+  if (kinds.includes("contentOrphans") && scan.contentOrphans.length > 0) {
+    const db = getDb();
+    const orphanIds = new Set(scan.contentOrphans.map((o) => o.id));
+    const pathToOrphans = new Map<string, typeof scan.contentOrphans>();
+    for (const o of scan.contentOrphans) {
+      const arr = pathToOrphans.get(o.filename) || [];
+      arr.push(o);
+      pathToOrphans.set(o.filename, arr);
+    }
+
+    const pathsSafeToUnlink = new Set<string>();
+    for (const [p] of pathToOrphans.entries()) {
+      const rows = db
+        .prepare("SELECT id FROM attachments WHERE path = ?")
+        .all(p) as { id: string }[];
+      const hasLiveRef = rows.some((r) => !orphanIds.has(r.id));
+      if (!hasLiveRef) pathsSafeToUnlink.add(p);
+    }
+
+    const del = db.prepare("DELETE FROM attachments WHERE id = ?");
+    const tx = db.transaction(() => {
+      for (const o of scan.contentOrphans) {
+        try {
+          if (attachmentDeletionRisk(o.id)) continue;
+          const info = del.run(o.id);
+          if (info.changes > 0) removedRows++;
+        } catch {
+          continue;
+        }
+        deleteThumbnailsFor(ATTACHMENTS_DIR, o.id);
+      }
+    });
+    tx();
+
+    for (const [p, list] of pathToOrphans.entries()) {
+      if (!pathsSafeToUnlink.has(p)) continue;
+      if (db.prepare("SELECT 1 FROM attachments WHERE path = ? LIMIT 1").get(p)) continue;
+      try {
+        fs.unlinkSync(path.join(ATTACHMENTS_DIR, p));
+        removedFiles++;
+        freedBytes += list[0]?.bytes || 0;
+      } catch {
+        /* 文件已不存在或权限问题；DB 行已删，后续健康检查会显示 */
+      }
+      const baseName = (p || "").replace(/\.[^.]+$/, "");
+      if (baseName) deleteThumbnailsFor(ATTACHMENTS_DIR, baseName);
+    }
+  }
+
+  return { dryRun, removedFiles, removedRows, freedBytes, scan };
+}
+
+// ===== Admin 路由：扫描 / 清理 =====
+
+/** 仅管理员；与 data-file.ts 同款实现，避免相互依赖。 */
+function requireAdminOrDeny(c: Context): Response | null {
+  const userId = c.req.header("X-User-Id") || "";
+  if (!userId) return c.json({ error: "未授权" }, 401);
+  const db = getDb();
+  const me = db.prepare("SELECT role FROM users WHERE id = ?").get(userId) as { role: string } | undefined;
+  if (!me || me.role !== "admin") return c.json({ error: "仅管理员可操作" }, 403);
+  return null;
+}
+
+/** 管理员 + sudo：阶段 D 修复类写操作必须二次验证。 */
+function requireAdminSudoOrDeny(c: Context): Response | null {
+  const userId = c.req.header("X-User-Id") || "";
+  if (!userId) return c.json({ error: "未授权" }, 401);
+  const db = getDb();
+  const me = db
+    .prepare("SELECT role, tokenVersion FROM users WHERE id = ?")
+    .get(userId) as { role: string; tokenVersion: number } | undefined;
+  if (!me || me.role !== "admin") return c.json({ error: "仅管理员可操作" }, 403);
+  const sudo = verifySudoFromRequest(c, userId, me.tokenVersion ?? 0);
+  if (!sudo.ok) return c.json({ error: sudo.message, code: sudo.code }, sudo.status as 401 | 403);
+  return null;
+}
+
+function getAttachmentTableStats(
+  table: "attachments" | "diary_attachments" | "task_attachments" | "note_template_attachments",
+) {
+  try {
+    return getDb()
+      .prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM ${table}`)
+      .get() as { count: number; bytes: number };
+  } catch {
+    return { count: 0, bytes: 0 };
+  }
+}
+
+function getLocalAttachmentFileStats(dir: string) {
+  let files = 0;
+  let bytes = 0;
+  const walk = (current: string) => {
+    if (!fs.existsSync(current)) return;
+    for (const name of fs.readdirSync(current)) {
+      if (name === ".thumbs") continue;
+      const full = path.join(current, name);
+      const stat = fs.statSync(full);
+      if (stat.isDirectory()) {
+        walk(full);
+      } else if (stat.isFile()) {
+        files += 1;
+        bytes += stat.size;
+      }
+    }
+  };
+  try {
+    walk(dir);
+  } catch {
+    // 状态页不因为单个异常文件阻断数据管理入口。
+  }
+  return { files, bytes };
+}
+
+// getUniqueAttachmentPaths / countUniqueAttachmentPaths 已迁移至 attachmentQueryService
+
+/** GET /api/attachments/_storage/status */
+app.get("/_storage/status", (c) => {
+  const denied = requireAdminOrDeny(c);
+  if (denied) return denied;
+
+  const storage = getAttachmentStorageInfo();
+  const notes = getAttachmentTableStats("attachments");
+  const diary = getAttachmentTableStats("diary_attachments");
+  const tasks = getAttachmentTableStats("task_attachments");
+  const templates = getAttachmentTableStats("note_template_attachments");
+  const local = getLocalAttachmentFileStats(ATTACHMENTS_DIR);
+
+  return c.json({
+    storage,
+    db: {
+      rows: notes.count + diary.count + tasks.count + templates.count,
+      bytes: notes.bytes + diary.bytes + tasks.bytes + templates.bytes,
+      attachments: notes,
+      diaryAttachments: diary,
+      taskAttachments: tasks,
+      noteTemplateAttachments: templates,
+    },
+    local: {
+      dir: ATTACHMENTS_DIR,
+      ...local,
+    },
+    migrationCommand: storage.migrationCommand || null,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+/** GET /api/attachments/_storage/config */
+app.get("/_storage/config", (c) => {
+  const denied = requireAdminOrDeny(c);
+  if (denied) return denied;
+  return c.json(readObjectStorageConfigPublic());
+});
+
+/** PUT /api/attachments/_storage/config */
+app.put("/_storage/config", async (c) => {
+  const denied = requireAdminSudoOrDeny(c);
+  if (denied) return denied;
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    enabled?: boolean;
+    endpoint?: string;
+    region?: string;
+    bucket?: string;
+    accessKeyId?: string;
+    secretAccessKey?: string;
+    prefix?: string;
+  };
+
+  if (body.enabled) {
+    if (!String(body.endpoint || "").trim()) return c.json({ error: "endpoint is required" }, 400);
+    if (!String(body.bucket || "").trim()) return c.json({ error: "bucket is required" }, 400);
+    if (!String(body.accessKeyId || "").trim()) return c.json({ error: "accessKeyId is required" }, 400);
+  }
+
+  const saved = writeObjectStorageConfig({
+    enabled: body.enabled === true,
+    endpoint: body.endpoint || "",
+    region: body.region || "auto",
+    bucket: body.bucket || "",
+    accessKeyId: body.accessKeyId || "",
+    secretAccessKey: body.secretAccessKey,
+    prefix: body.prefix || "",
+  });
+  return c.json(saved);
+});
+
+/** DELETE /api/attachments/_storage/config */
+app.delete("/_storage/config", async (c) => {
+  const denied = requireAdminSudoOrDeny(c);
+  if (denied) return denied;
+  return c.json(deleteObjectStorageConfig());
+});
+
+/** POST /api/attachments/_storage/test */
+app.post("/_storage/test", async (c) => {
+  const denied = requireAdminSudoOrDeny(c);
+  if (denied) return denied;
+  const result = await testObjectStorageConfig();
+  return c.json(result, result.ok ? 200 : 502);
+});
+
+/** GET /api/attachments/_storage/remote-check?limit=50 */
+app.get("/_storage/remote-check", async (c) => {
+  const denied = requireAdminOrDeny(c);
+  if (denied) return denied;
+
+  const storage = getAttachmentStorageInfo();
+  const rawLimit = Number(c.req.query("limit") || 50);
+  const limit = Math.max(1, Math.min(200, Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 50));
+  const total = attachmentQueryService.countUniqueAttachmentPaths();
+
+  if (storage.driver !== "s3") {
+    return c.json({
+      ok: true,
+      skipped: true,
+      reason: "local-storage",
+      storage,
+      total,
+      limit,
+      checked: 0,
+      exists: 0,
+      missing: [],
+      errors: [],
+      checkedAt: new Date().toISOString(),
+    });
+  }
+
+  const rows = attachmentQueryService.getUniqueAttachmentPaths(limit);
+  const missing: Array<{ path: string; size: number; refs: number; status?: number }> = [];
+  const errors: Array<{ path: string; size: number; refs: number; status?: number; error: string }> = [];
+  let exists = 0;
+
+  for (const row of rows) {
+    const res = await checkAttachmentObjectExists(row.path);
+    if (res.exists) {
+      exists += 1;
+    } else if (res.error && res.status !== 404) {
+      errors.push({ ...row, status: res.status, error: res.error });
+    } else {
+      missing.push({ ...row, status: res.status });
+    }
+  }
+
+  return c.json({
+    ok: missing.length === 0 && errors.length === 0,
+    skipped: false,
+    storage,
+    total,
+    limit,
+    checked: rows.length,
+    exists,
+    missing,
+    errors,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+/** GET /api/attachments/_orphans/scan?graceHours=24 */
+app.get("/_orphans/scan", (c) => {
+  const denied = requireAdminOrDeny(c);
+  if (denied) return denied;
+  const grace = Number(c.req.query("graceHours") || 24);
+  return c.json(scanOrphanAttachments(Number.isFinite(grace) && grace >= 0 ? grace : 24));
+});
+
+/** GET /api/attachments/_health/report?graceHours=24 */
+app.get("/_health/report", (c) => {
+  const denied = requireAdminOrDeny(c);
+  if (denied) return denied;
+  const grace = Number(c.req.query("graceHours") || 24);
+  return c.json(scanAttachmentHealth(Number.isFinite(grace) && grace >= 0 ? grace : 24));
+});
+
+/**
+ * POST /api/attachments/_orphans/clean
+ * body: { dryRun?: boolean, kinds?: ("dbOrphans"|"contentOrphans")[], graceHours?: number }
+ *
+ * 默认 dryRun=true，必须显式传 false 才会真正删除——避免管理员一次手抖清空所有附件。
+ */
+app.post("/_orphans/clean", async (c) => {
+  const denied = requireAdminOrDeny(c);
+  if (denied) return denied;
+  const body = (await c.req.json().catch(() => ({}))) as {
+    dryRun?: boolean;
+    kinds?: ("dbOrphans" | "contentOrphans")[];
+    graceHours?: number;
+  };
+  const result = cleanOrphanAttachments({
+    dryRun: body.dryRun !== false,
+    kinds: body.kinds,
+    graceHours: body.graceHours,
+  });
+  return c.json(result);
+});
+
+/**
+ * POST /api/attachments/_repair/missing/:id/upload
+ * multipart/form-data: file=<replacement>, force=1(optional)
+ *
+ * 阶段 D：手动上传替代文件，修复“DB 行存在但物理文件缺失”的裂图。
+ * 默认只允许修复缺失文件；如物理文件已存在，必须显式 force=1 才覆盖。
+ */
+app.post("/_repair/missing/:id/upload", async (c) => {
+  const denied = requireAdminSudoOrDeny(c);
+  if (denied) return denied;
+
+  const id = c.req.param("id");
+  const db = getDb();
+  const row = db
+    .prepare("SELECT id, path FROM attachments WHERE id = ?")
+    .get(id) as { id: string; path: string } | undefined;
+  if (!row) return c.json({ error: "附件记录不存在" }, 404);
+  if (!isSafeAttachmentRelPath(row.path)) {
+    return c.json({ error: "附件路径异常，拒绝写入" }, 400);
+  }
+
+  let form: FormData;
+  try {
+    form = await c.req.formData();
+  } catch {
+    return c.json({ error: "请求必须是 multipart/form-data" }, 400);
+  }
+  const file = form.get("file");
+  const force = form.get("force") === "1";
+  if (!(file instanceof File)) return c.json({ error: "缺少 file 字段" }, 400);
+  if (file.size <= 0) return c.json({ error: "上传文件为空" }, 400);
+  if (file.size > MAX_ATTACHMENT_SIZE) {
+    return c.json({ error: `文件过大（最大 ${MAX_ATTACHMENT_SIZE / 1024 / 1024}MB）` }, 413);
+  }
+
+  const mime = (file.type || "application/octet-stream").toLowerCase();
+  if (BLOCKED_MIMES.has(mime)) {
+    return c.json({ error: `出于安全考虑，不支持该类型: ${mime}` }, 415);
+  }
+
+  ensureAttachmentsDir();
+  const abs = path.join(ATTACHMENTS_DIR, row.path);
+  if (fs.existsSync(abs) && !force) {
+    return c.json({ error: "物理文件已存在；如需覆盖请显式 force=1", code: "FILE_EXISTS" }, 409);
+  }
+
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(await file.arrayBuffer());
+  } catch (err: unknown) {
+    return attachmentWriteErrorResponse(c, "read", err);
+  }
+  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+
+  try {
+    fs.writeFileSync(abs, buffer);
+  } catch (err: unknown) {
+    return attachmentWriteErrorResponse(c, "repair-storage", err);
+  }
+
+  const sameRows = db
+    .prepare("SELECT id, noteId, userId, workspaceId FROM attachments WHERE path = ?")
+    .all(row.path) as Array<{ id: string; noteId: string; userId: string; workspaceId: string | null }>;
+
+  try {
+    db.prepare("UPDATE attachments SET mimeType = ?, size = ?, hash = ? WHERE path = ?")
+      .run(mime, buffer.length, sha256, row.path);
+  } catch (err: unknown) {
+    return attachmentWriteErrorResponse(c, "repair-database", err);
+  }
+
+  const baseName = (row.path || "").replace(/\.[^.]+$/, "");
+  if (baseName) deleteThumbnailsFor(ATTACHMENTS_DIR, baseName);
+  for (const r of sameRows) {
+    deleteThumbnailsFor(ATTACHMENTS_DIR, r.id);
+    enqueueAttachment({
+      attachmentId: r.id,
+      userId: r.userId,
+      workspaceId: r.workspaceId,
+      noteId: r.noteId,
+    });
+  }
+
+  return c.json({
+    success: true,
+    repairedRows: sameRows.length,
+    path: row.path,
+    size: buffer.length,
+    hash: sha256,
+    health: scanAttachmentHealth(24),
+  });
+});
+
+/**
+ * POST /api/attachments/_repair/dangling/remove
+ * body: { attachmentIds: string[], noteIds?: string[] }
+ *
+ * 阶段 D：移除正文中指向不存在附件 ID 的坏引用。为了不破坏 Tiptap JSON 结构，
+ * 最小安全动作是把 URL 字符串替换为空字符串；编辑器不再请求 404。
+ */
+app.post("/_repair/dangling/remove", async (c) => {
+  const denied = requireAdminSudoOrDeny(c);
+  if (denied) return denied;
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    attachmentIds?: string[];
+    noteIds?: string[];
+  };
+  const ids = Array.from(new Set((body.attachmentIds || []).map((x) => String(x || "").toLowerCase()).filter(Boolean)));
+  const noteFilter = new Set((body.noteIds || []).map((x) => String(x || "")).filter(Boolean));
+  if (ids.length === 0) return c.json({ error: "attachmentIds 不能为空" }, 400);
+
+  const db = getDb();
+  const notes = db
+    .prepare("SELECT id, content FROM notes WHERE content IS NOT NULL AND content <> ''")
+    .all() as Array<{ id: string; content: string }>;
+
+  let notesUpdated = 0;
+  let referencesRemoved = 0;
+  const changed: Array<{ noteId: string; removed: number }> = [];
+
+  const tx = db.transaction(() => {
+    const upd = db.prepare(
+      "UPDATE notes SET content = ?, updatedAt = datetime('now'), version = version + 1 WHERE id = ?",
+    );
+    for (const n of notes) {
+      if (noteFilter.size > 0 && !noteFilter.has(n.id)) continue;
+      let next = n.content || "";
+      let removedForNote = 0;
+      for (const id of ids) {
+        const needle = `/api/attachments/${id}`;
+        const before = next.length;
+        next = next.split(needle).join("");
+        if (next.length !== before) {
+          removedForNote += (before - next.length) / needle.length;
+        }
+      }
+      if (removedForNote <= 0 || next === n.content) continue;
+      upd.run(next, n.id);
+      try {
+        syncReferences(db, n.id, next);
+      } catch (e) {
+        console.warn("[attachments.repair] syncReferences failed for note", n.id, e);
+      }
+      notesUpdated++;
+      referencesRemoved += removedForNote;
+      changed.push({ noteId: n.id, removed: removedForNote });
+    }
+  });
+
+  try {
+    tx();
+  } catch (err: unknown) {
+    return attachmentWriteErrorResponse(c, "repair-references", err);
+  }
+
+  return c.json({
+    success: true,
+    notesUpdated,
+    referencesRemoved,
+    changed,
+    health: scanAttachmentHealth(24),
+  });
+});
+
+export default app;

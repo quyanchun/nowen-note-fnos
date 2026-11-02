@@ -1,0 +1,1129 @@
+import { Hono } from "hono";
+import { getDb } from "../db/schema";
+import { v4 as uuid } from "uuid";
+import bcrypt from "bcryptjs";
+import crypto from "crypto";
+import { signShareAccessToken, verifyShareAccessToken } from "../lib/auth-security";
+import { resolvePublicOrigin, rewriteRelativeAttachmentUrls } from "../lib/shareUrlRewrite";
+import { resolveNotePermission, hasPermission } from "../middleware/acl";
+import { broadcastNoteUpdated, broadcastToUser } from "../services/realtime";
+import { yDestroyDoc } from "../services/yjs";
+import { syncReferences as syncAttachmentReferences } from "../lib/attachmentRefs";
+import { syncNoteBlocks } from "../lib/noteBlocks";
+import { rebuildBlockAuthorityStore } from "../lib/blockAuthorityStore";
+import { rebuildYjsSubdocumentsIfEnabled } from "../services/yjs-subdocuments";
+import { logAudit } from "../services/audit";
+import { noteVersionsRepository, shareCommentsRepository, noteYsnapshotsRepository, noteYupdatesRepository } from "../repositories";
+import { resolveEffectiveNoteCapabilities } from "../services/share-capabilities";
+import { createNoteCommentWithNotifications, listManagedNoteComments } from "../services/noteCommentManagement.js";
+import { IssueError } from "../services/workspaceIssues.js";
+import { pageParams } from "./workspace-issues.js";
+import { parseShareManagementQuery, queryShareManagement } from "../services/share-management";
+import { consumeShareViewSession, findSingleShareByToken, installSingleShareGuard, resetShareViewSessions } from "../services/single-share-access";
+import { checkCredentialAttempt, getClientIp as getCredentialClientIp, hashClientIp, recordCredentialFailure, recordCredentialSuccess } from "../lib/share-credential-rate-limit";
+import { collectSharedMindMapSnapshots } from "../services/sharedMindMapSnapshots";
+import { desktopShareRequest } from "../services/desktop-shares";
+import {
+  canViewNoteThroughFolderPasswords,
+  resolveUnlockedFolderNodeIds,
+} from "../lib/knowledgeTreePasswordAccess";
+
+// H3: 使用密码学安全的随机源生成分享 token。
+//     原实现用 Math.random()，理论上可被预测；改用 crypto.randomBytes。
+//     输出 12 位 URL-safe base64（~72 bits 熵），与原长度保持一致，避免破坏前端/已发送链接格式。
+function generateShareToken(): string {
+  // 9 bytes base64url = 12 字符（无需 padding）
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+/**
+ * 取请求方真实 IP（按反代头优先级）。
+ *
+ * 用于：
+ *   - 公开评论的频次限制（同 IP/分钟），防止滥用；
+ *   - 写入 share_comments.guestIpHash（SHA-256 hex，不存明文）。
+ *
+ * 不直接用 c.req.raw.headers.get('x-forwarded-for')[0] 的原因：
+ *   有些反代会写多 IP 链 "client, proxy1, proxy2"，第一个才是真实客户端。
+ */
+function getClientIp(c: any): string {
+  const xff = c.req.header("X-Forwarded-For");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const xreal = c.req.header("X-Real-IP");
+  if (xreal) return xreal.trim();
+  // Hono 没有标准 socket.remoteAddress 暴露；fallback 到一个稳定但低分辨率的占位
+  return "unknown";
+}
+
+function hashIp(ip: string): string {
+  return crypto.createHash("sha256").update(ip).digest("hex");
+}
+
+/**
+ * 简易内存频次限制器（IP × token 维度）：默认每分钟 30 条评论。
+ *
+ * 设计权衡：
+ *   - 用 Map 而非 Redis：单进程部署足够，多进程后端可在反代/Nginx 层加 limit_req
+ *     再叠一层。本服务目前未支持多进程后端。
+ *   - 滑动窗口比 Token Bucket 实现简单，对人类滥用足够（机器人会绕，不在防御范围）。
+ *   - 自带 60s 过期清理，避免长期运行内存泄漏。
+ */
+const commentRateLimit = new Map<string, number[]>();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30;
+
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const bucket = commentRateLimit.get(key) || [];
+  const recent = bucket.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= RATE_LIMIT_MAX) {
+    commentRateLimit.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  commentRateLimit.set(key, recent);
+  return true;
+}
+
+function requireUnlockedNoteForShare(c: any, noteId: string, userId: string): Response | null {
+  const db = getDb();
+  const unlockedFolderNodeIds = resolveUnlockedFolderNodeIds(
+    db,
+    userId,
+    c.req.header("X-Folder-Unlock-Tokens"),
+  );
+  if (canViewNoteThroughFolderPasswords(db, noteId, unlockedFolderNodeIds)) return null;
+  return c.json({
+    error: "受密码保护的目录尚未解锁",
+    code: "FOLDER_UNLOCK_REQUIRED",
+  }, 403);
+}
+
+// ===== 需要 JWT 认证的管理路由 =====
+const sharesRouter = new Hono();
+sharesRouter.use("*", async (c, next) => {
+  const response = await desktopShareRequest(c.req.raw, c.req.header("X-User-Id") || "", c.req.header("X-Auth-Mode"));
+  if (response) return response;
+  await next();
+});
+
+// Explicitly publish a legacy desktop link without changing its URL or password.
+sharesRouter.post("/import-desktop", async (c) => {
+  if (process.env.ELECTRON_USER_DATA) return c.json({ error: "请在笔记服务端接收分享", code: "SHARE_SERVER_REQUIRED" }, 409);
+  const body = await c.req.json().catch(() => null);
+  const userId = c.req.header("X-User-Id") || "";
+  if (!userId || c.req.header("X-Auth-Mode") === "api-token") return c.json({ error: "请使用笔记账号登录", code: "SHARE_ACCOUNT_LOGIN_REQUIRED" }, 403);
+  if (!body || !/^[a-f\d-]{36}$/i.test(body.id || "") || !/^[\w-]{1,128}$/.test(body.noteId || "")
+    || !/^[A-Za-z0-9_-]{12,128}$/.test(body.shareToken || "") || !["view", "comment", "edit", "edit_auth"].includes(body.permission)
+    || ![0, 1].includes(body.isActive)
+    || !Number.isSafeInteger(body.expectedNoteVersion) || body.expectedNoteVersion < 1
+    || (body.expiresAt !== null && (typeof body.expiresAt !== "string" || !Number.isFinite(Date.parse(body.expiresAt))))
+    || (body.maxViews !== null && (!Number.isInteger(body.maxViews) || body.maxViews < 1 || body.maxViews > 1_000_000))
+    || (body.passwordHash !== null && (typeof body.passwordHash !== "string" || !/^\$2[aby]\$(?:0[4-9]|1[0-4])\$[./A-Za-z0-9]{53}$/.test(body.passwordHash)))) {
+    return c.json({ error: "本机分享参数无效", code: "INVALID_SHARE_PUBLICATION" }, 400);
+  }
+  const db = getDb(), note = db.prepare("SELECT contentFormat,version FROM notes WHERE id=?").get(body.noteId) as any;
+  if (!note || !resolveEffectiveNoteCapabilities(body.noteId, userId).reshare) return c.json({ error: "无权发布此笔记", code: "RESHARE_FORBIDDEN" }, 403);
+  if (note.contentFormat?.startsWith("encrypted-")) return c.json({ error: "加密笔记暂不支持公开分享", code: "ENCRYPTED_NOTE_SHARING_FORBIDDEN" }, 400);
+  if (note.version !== body.expectedNoteVersion) return c.json({ error: "服务端笔记已更新，请同步后重试", code: "SHARE_NOTE_NOT_SYNCED" }, 409);
+  const locked = requireUnlockedNoteForShare(c, body.noteId, userId);
+  if (locked) return locked;
+  db.exec(`CREATE TABLE IF NOT EXISTS desktop_share_imports(
+    shareId TEXT PRIMARY KEY,tokenHash TEXT NOT NULL UNIQUE,ownerId TEXT NOT NULL,noteId TEXT NOT NULL)`);
+  const tokenHash = crypto.createHash("sha256").update(body.shareToken).digest("hex");
+  const result = db.transaction(() => {
+    const existing = db.prepare("SELECT * FROM shares WHERE id=? OR shareToken=?").all(body.id, body.shareToken) as any[];
+    const imported = db.prepare("SELECT * FROM desktop_share_imports WHERE shareId=? OR tokenHash=?").all(body.id, tokenHash) as any[];
+    if (imported.length && (imported.length !== 1 || imported[0].shareId !== body.id || imported[0].tokenHash !== tokenHash
+      || imported[0].ownerId !== userId || imported[0].noteId !== body.noteId || !existing.length)) return null;
+    if (existing.length) {
+      if (existing.length !== 1 || existing[0].id !== body.id || existing[0].shareToken !== body.shareToken
+        || existing[0].noteId !== body.noteId || existing[0].ownerId !== userId) return null;
+      db.prepare("INSERT OR IGNORE INTO desktop_share_imports VALUES(?,?,?,?)").run(body.id, tokenHash, userId, body.noteId);
+      return existing[0];
+    }
+    db.prepare(`INSERT INTO shares(id,noteId,ownerId,shareToken,shareType,permission,password,expiresAt,maxViews,isActive)
+      VALUES(?,?,?,?,'link',?,?,?,?,?)`).run(body.id, body.noteId, userId, body.shareToken, body.permission, body.passwordHash, body.expiresAt, body.maxViews, body.isActive);
+    db.prepare("INSERT INTO desktop_share_imports VALUES(?,?,?,?)").run(body.id, tokenHash, userId, body.noteId);
+    logAudit(userId, "share", "create", { shareId: body.id, noteId: body.noteId, source: "desktop", hasPassword: !!body.passwordHash }, { targetType: "share", targetId: body.id });
+    return db.prepare("SELECT * FROM shares WHERE id=?").get(body.id) as any;
+  })();
+  if (!result) return c.json({ error: "分享标识已被使用，未覆盖已有分享", code: "SHARE_PUBLICATION_CONFLICT" }, 409);
+  const { password, ...share } = result;
+  return c.json({ ...share, hasPassword: !!password });
+});
+sharesRouter.get("/comments", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  if (!userId) return c.json({ error: "请先登录" }, 401);
+  if (c.req.header("X-Auth-Mode") === "api-token") return c.json({ error: "评论管理需要账号登录" }, 403);
+  try {
+    const page = pageParams(c.req.query("limit"), c.req.query("offset"));
+    return c.json(listManagedNoteComments(userId, {
+      ...page, status: c.req.query("status") || "all", query: (c.req.query("q") || "").trim(),
+      unlockedFolderNodeIds: resolveUnlockedFolderNodeIds(getDb(), userId, c.req.header("X-Folder-Unlock-Tokens")),
+    }));
+  } catch (error) {
+    if (error instanceof IssueError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
+});
+
+// 创建分享
+sharesRouter.post("/", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const body = await c.req.json();
+  const { noteId, permission, password, expiresAt, maxViews } = body as {
+    noteId: string;
+    permission?: string;
+    password?: string;
+    expiresAt?: string;
+    maxViews?: number;
+  };
+
+  if (!noteId) {
+    return c.json({ error: "缺少 noteId 参数" }, 400);
+  }
+
+  const note = db.prepare("SELECT id, userId, title, contentFormat, version FROM notes WHERE id = ?").get(noteId) as any;
+  if (!note) return c.json({ error: "笔记不存在" }, 404);
+  if (note.contentFormat?.startsWith("encrypted-")) return c.json({ error: "加密笔记暂不支持公开分享", code: "ENCRYPTED_NOTE_SHARING_FORBIDDEN" }, 400);
+  const folderPasswordError = requireUnlockedNoteForShare(c, noteId, userId);
+  if (folderPasswordError) return folderPasswordError;
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  if (!capabilities.reshare) {
+    return c.json({ error: "当前目录不允许二次分享", code: "RESHARE_FORBIDDEN" }, 403);
+  }
+
+  const id = uuid();
+  const shareToken = generateShareToken();
+  const perm = permission || "view";
+  if (!["view", "comment", "edit", "edit_auth"].includes(perm)) {
+    return c.json({ error: "分享权限无效" }, 400);
+  }
+
+  // 如果设置了密码，使用 bcrypt 加密
+  let passwordHash: string | null = null;
+  if (password && password.trim()) {
+    passwordHash = await bcrypt.hash(password.trim(), 10);
+  }
+
+  if (body.expectedNoteVersion !== undefined && (!Number.isSafeInteger(body.expectedNoteVersion)
+    || (db.prepare("SELECT version FROM notes WHERE id=?").get(noteId) as any)?.version !== body.expectedNoteVersion)) {
+    return c.json({ error: "服务端笔记已更新，请同步后重试", code: "SHARE_NOTE_NOT_SYNCED" }, 409);
+  }
+
+  db.prepare(`
+    INSERT INTO shares (id, noteId, ownerId, shareToken, shareType, permission, password, expiresAt, maxViews)
+    VALUES (?, ?, ?, ?, 'link', ?, ?, ?, ?)
+  `).run(id, noteId, userId, shareToken, perm, passwordHash, expiresAt || null, maxViews || null);
+
+  // SEC-AUDIT-01: 记录分享创建（不记录密码）
+  logAudit(userId, "share", "create", {
+    shareId: id, noteId, permission: perm, hasPassword: !!passwordHash,
+  }, { targetType: "share", targetId: id });
+
+  const share = db.prepare("SELECT * FROM shares WHERE id = ?").get(id) as any;
+  delete share.password;
+  share.hasPassword = !!passwordHash;
+
+  return c.json(share, 201);
+});
+
+// 获取当前用户的所有分享。management=1 启用分享管理中心的筛选、统计和分页响应；
+// 未携带该参数时继续返回旧数组结构，避免破坏 SDK 与历史客户端。
+sharesRouter.get("/", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  if (c.req.query("management") === "1") {
+    return c.json(queryShareManagement(db, userId, parseShareManagementQuery(c.req.query())));
+  }
+
+  const shares = db.prepare(`
+    SELECT s.*, n.title AS noteTitle
+    FROM shares s
+    LEFT JOIN notes n ON s.noteId = n.id
+    WHERE s.ownerId = ?
+    ORDER BY s.createdAt DESC
+  `).all(userId) as any[];
+
+  return c.json(shares.map((s: any) => {
+    const hasPassword = !!s.password;
+    delete s.password;
+    return { ...s, hasPassword };
+  }));
+});
+
+// 获取某笔记的所有分享
+sharesRouter.get("/note/:noteId", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+
+  const folderPasswordError = requireUnlockedNoteForShare(c, noteId, userId);
+  if (folderPasswordError) return folderPasswordError;
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  const shares = capabilities.manage
+    ? db.prepare("SELECT * FROM shares WHERE noteId = ? ORDER BY createdAt DESC").all(noteId)
+    : db.prepare("SELECT * FROM shares WHERE noteId = ? AND ownerId = ? ORDER BY createdAt DESC").all(noteId, userId) as any[];
+
+  return c.json(shares.map((s: any) => {
+    const hasPassword = !!s.password;
+    delete s.password;
+    return { ...s, hasPassword };
+  }));
+});
+
+// 获取分享详情
+sharesRouter.get("/:id", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+
+  const share = db.prepare("SELECT * FROM shares WHERE id = ?").get(id) as any;
+  if (!share) return c.json({ error: "分享不存在" }, 404);
+  const capabilities = resolveEffectiveNoteCapabilities(share.noteId, userId);
+  if (share.ownerId !== userId && !capabilities.manage) {
+    return c.json({ error: "分享不存在" }, 404);
+  }
+
+  const hasPassword = !!share.password;
+  delete share.password;
+  return c.json({ ...share, hasPassword });
+});
+
+// 更新分享设置
+sharesRouter.put("/:id", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => ({}));
+
+  const share = db.prepare("SELECT * FROM shares WHERE id = ?").get(id) as any;
+  if (!share) return c.json({ error: "分享不存在" }, 404);
+  const capabilities = resolveEffectiveNoteCapabilities(share.noteId, userId);
+  if (share.ownerId !== userId && !capabilities.manage) {
+    return c.json({ error: "无权管理此分享", code: "FORBIDDEN" }, 403);
+  }
+
+  const fields: string[] = [];
+  const params: any[] = [];
+  let credentialChanged = false;
+
+  if (body.permission !== undefined) {
+    if (!["view", "comment", "edit", "edit_auth"].includes(body.permission)) {
+      return c.json({ error: "分享权限无效" }, 400);
+    }
+    fields.push("permission = ?"); params.push(body.permission);
+  }
+  if (body.expiresAt !== undefined) { fields.push("expiresAt = ?"); params.push(body.expiresAt || null); }
+  if (body.maxViews !== undefined) {
+    const value = body.maxViews === null || body.maxViews === "" ? null : Number(body.maxViews);
+    if (value !== null && (!Number.isInteger(value) || value < 1 || value > 1_000_000)) {
+      return c.json({ error: "最大访问会话数无效" }, 400);
+    }
+    fields.push("maxViews = ?"); params.push(value);
+  }
+  if (body.isActive !== undefined) { fields.push("isActive = ?"); params.push(body.isActive ? 1 : 0); }
+
+  if (body.password !== undefined) {
+    if (body.password === "" || body.password === null) {
+      fields.push("password = ?"); params.push(null);
+    } else {
+      const nextPassword = String(body.password).trim();
+      if (nextPassword.length < 4 || nextPassword.length > 128) {
+        return c.json({ error: "密码长度需为 4-128 个字符" }, 400);
+      }
+      fields.push("password = ?"); params.push(await bcrypt.hash(nextPassword, 10));
+    }
+    credentialChanged = true;
+  }
+  if (body.rotateToken === true) {
+    fields.push("shareToken = ?"); params.push(generateShareToken());
+    credentialChanged = true;
+  }
+  if (credentialChanged) fields.push("credentialVersion = credentialVersion + 1");
+
+  if (fields.length === 0 && body.resetViews !== true) {
+    return c.json({ error: "没有需要更新的字段" }, 400);
+  }
+  if (fields.length > 0) {
+    fields.push("updatedAt = datetime('now')");
+    params.push(id);
+    db.prepare(`UPDATE shares SET ${fields.join(", ")} WHERE id = ?`).run(...params);
+  }
+  if (body.resetViews === true) resetShareViewSessions(id);
+
+  logAudit(userId, "share", "update", {
+    shareId: id,
+    noteId: share.noteId,
+    permission: body.permission,
+    resetViews: body.resetViews === true,
+    rotateToken: body.rotateToken === true,
+    credentialChanged,
+  }, { targetType: "share", targetId: id });
+
+  const updated = db.prepare("SELECT * FROM shares WHERE id = ?").get(id) as any;
+  const hasPassword = !!updated.password;
+  delete updated.password;
+  return c.json({ ...updated, hasPassword });
+});
+
+// 删除（撤销）分享
+sharesRouter.delete("/:id", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+
+  const share = db.prepare("SELECT id, noteId, ownerId FROM shares WHERE id = ?").get(id) as any;
+  if (!share) return c.json({ error: "分享不存在" }, 404);
+  const capabilities = resolveEffectiveNoteCapabilities(share.noteId, userId);
+  if (share.ownerId !== userId && !capabilities.manage) return c.json({ error: "无权撤销此分享" }, 403);
+
+  db.prepare("DELETE FROM shares WHERE id = ?").run(id);
+
+  // SEC-AUDIT-01: 记录分享撤销
+  logAudit(userId, "share", "revoke", {
+    shareId: id, noteId: share.noteId,
+  }, { targetType: "share", targetId: id });
+
+  return c.json({ success: true });
+});
+
+// ===== 无需 JWT 认证的公开访问路由 =====
+const sharedRouter = new Hono();
+installSingleShareGuard(sharedRouter);
+
+// 获取分享信息（判断是否需要密码等）
+sharedRouter.get("/:token", (c) => {
+  const db = getDb();
+  const token = c.req.param("token");
+
+  const share = db.prepare(`
+    SELECT s.id, s.noteId, s.shareToken, s.permission, s.expiresAt, s.maxViews, s.viewCount, s.isActive, s.createdAt,
+           n.title AS noteTitle,
+           u.username AS ownerName
+    FROM shares s
+    LEFT JOIN notes n ON s.noteId = n.id
+    LEFT JOIN users u ON s.ownerId = u.id
+    WHERE s.shareToken = ?
+  `).get(token) as any;
+
+  if (!share) {
+    return c.json({ error: "分享链接不存在或已失效" }, 404);
+  }
+
+  if (!share.isActive) {
+    return c.json({ error: "分享已被撤销" }, 410);
+  }
+
+  // 检查是否过期
+  if (share.expiresAt && new Date(share.expiresAt) < new Date()) {
+    return c.json({ error: "分享链接已过期" }, 410);
+  }
+
+  // 检查是否需要密码
+  const shareRow = db.prepare("SELECT password FROM shares WHERE shareToken = ?").get(token) as any;
+  const needPassword = !!shareRow?.password;
+
+  return c.json({
+    id: share.id,
+    noteTitle: share.noteTitle,
+    ownerName: share.ownerName,
+    permission: share.permission,
+    needPassword,
+    expiresAt: share.expiresAt,
+    createdAt: share.createdAt,
+  });
+});
+
+// 验证密码（返回临时访问 token）
+sharedRouter.post("/:token/verify", async (c) => {
+  const token = c.req.param("token");
+  const body = await c.req.json().catch(() => ({}));
+  const password = String(body.password || "");
+  const share = findSingleShareByToken(token);
+  if (!share) return c.json({ error: "分享不存在" }, 404);
+
+  const ipHash = hashClientIp(getCredentialClientIp(c));
+  const rateKey = `single:${share.id}:${ipHash}`;
+  const rate = checkCredentialAttempt(rateKey);
+  if (!rate.allowed) {
+    c.header("Retry-After", String(rate.retryAfterSeconds));
+    return c.json({ error: "验证尝试过于频繁，请稍后再试", code: "SHARE_CREDENTIAL_RATE_LIMIT" }, 429);
+  }
+
+  if (share.password) {
+    if (!password) return c.json({ error: "请输入访问密码" }, 400);
+    if (!(await bcrypt.compare(password, share.password))) {
+      recordCredentialFailure(rateKey);
+      logAudit("", "share", "credential_failure", { shareId: share.id, ipHash }, {
+        targetType: "share", targetId: share.id, ip: ipHash, level: "warn",
+      });
+      return c.json({ error: "访问凭证错误" }, 403);
+    }
+  }
+  recordCredentialSuccess(rateKey);
+  const accessToken = signShareAccessToken({
+    shareId: share.id,
+    noteId: share.noteId,
+    credentialVersion: share.credentialVersion,
+  });
+  return c.json({ success: true, accessToken });
+});
+
+// 获取分享笔记内容
+sharedRouter.get("/:token/content", (c) => {
+  const db = getDb();
+  const token = c.req.param("token");
+
+  const share = db.prepare(`
+    SELECT s.id AS shareId, s.noteId, s.isActive, s.expiresAt, s.maxViews, s.viewCount, s.password, s.permission,
+           n.title, n.content, n.contentText, n.contentFormat, n.updatedAt AS noteUpdatedAt, n.version AS noteVersion,
+           n.isLocked AS noteIsLocked,
+           n.userId AS noteOwnerId,
+           n.workspaceId AS noteWorkspaceId
+    FROM shares s
+    LEFT JOIN notes n ON s.noteId = n.id
+    WHERE s.shareToken = ?
+  `).get(token) as any;
+
+  if (!share || !share.isActive) {
+    return c.json({ error: "分享不存在或已失效" }, 404);
+  }
+
+  // 检查是否过期
+  if (share.expiresAt && new Date(share.expiresAt) < new Date()) {
+    return c.json({ error: "分享链接已过期" }, 410);
+  }
+
+  // 如果有密码保护，检查 accessToken
+  if (share.password) {
+    const authHeader = c.req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return c.json({ error: "需要密码验证", needPassword: true }, 401);
+    }
+    const payload = verifyShareAccessToken(authHeader.slice(7), share.shareId);
+    if (!payload) {
+      return c.json({ error: "访问令牌无效或已过期，请重新验证密码" }, 401);
+    }
+  }
+
+  // 最大访问次数按浏览器会话计数；同一 tab 刷新、轮询和评论不会重复扣次数。
+  const accessRow = findSingleShareByToken(token);
+  if (!accessRow || !consumeShareViewSession(c, accessRow).ok) {
+    return c.json({ error: "分享链接已达到最大访问会话数", code: "SHARE_VIEW_LIMIT" }, 410);
+  }
+
+  // H6: 图床绝对化
+  //   分享场景下，content 里的 /api/attachments/<id>、/api/task-attachments/<id>
+  //   是相对路径，一旦分享页被第三方嵌入 / SPA 与后端不同源 / 走 CDN，
+  //   浏览器会按当前文档 origin 解析，导致图片 404。
+  //   这里在 HTTP 出口处统一改写成绝对 URL（基于反代头推断公网 origin），
+  //   不修改数据库原始内容，保留搬域可移植性。
+  const publicOrigin = resolvePublicOrigin((name) => c.req.header(name));
+  const rewrittenContent = publicOrigin
+    ? rewriteRelativeAttachmentUrls(share.content, publicOrigin)
+    : share.content;
+
+  // #790: Public share pages must never fetch private mind-map APIs directly.
+  // Resolve only explicitly embedded maps, under the note owner's current access and
+  // the same personal/workspace boundary, then ship a bounded read-only snapshot.
+  const mindMapSnapshots = collectSharedMindMapSnapshots(db, {
+    content: share.content || "",
+    contentFormat: share.contentFormat,
+    noteOwnerId: share.noteOwnerId,
+    noteWorkspaceId: share.noteWorkspaceId || null,
+  });
+
+  return c.json({
+    noteId: share.noteId,
+    title: share.title,
+    content: rewrittenContent,
+    contentText: share.contentText,
+    contentFormat: share.contentFormat,
+    permission: share.permission,
+    updatedAt: share.noteUpdatedAt,
+    version: share.noteVersion,
+    isLocked: share.noteIsLocked ? 1 : 0, // 用于前端判断是否允许进入编辑模式
+    // 笔记所有者 id：前端拿来跟当前登录用户对比，
+    // 如果访问者就是作者本人，则跳过"请填写访客昵称"弹窗，直接进入编辑模式。
+    // 这里只下发 id，不下发用户名/昵称等敏感信息。
+    ownerId: share.noteOwnerId,
+    mindMapSnapshots,
+  });
+});
+
+// 访客更新分享笔记内容（permission ∈ {'edit', 'edit_auth'}）
+// 设计原则：
+//   - permission='edit'      ：不需要 JWT 登录态，访客填昵称即可写入；密码分享额外校验 accessToken
+//   - permission='edit_auth' ：必须有 JWT（X-User-Id header）；未登录返 401 + code='LOGIN_REQUIRED'，
+//                              前端引导用户跳 /login?redirect=/share/<token>，登录回来再次提交。
+//                              登录后的请求依然可以走访客昵称兜底 —— 但实际上前端会用真实
+//                              用户名作为 guestName，方便审计；后端不强制。
+//   - 强制乐观锁，由前端带上最新 version，避免覆盖他人改动
+//   - 写入版本历史，changeType='guest_edit'，changeSummary 记录访客昵称，便于所有者审计
+//   - 笔记 isLocked === 1 时禁止写入
+sharedRouter.put("/:token/content", async (c) => {
+  const db = getDb();
+  const token = c.req.param("token");
+  const body = await c.req.json();
+  const { title, content, contentText, contentFormat, version, guestName } = body as {
+    title?: string;
+    content?: string;
+    contentText?: string;
+    contentFormat?: string;
+    version?: number;
+    guestName?: string;
+  };
+
+  // 1) 查分享 + 笔记
+  const share = db.prepare(`
+    SELECT s.id AS shareId, s.noteId, s.permission, s.password, s.isActive, s.expiresAt, s.maxViews, s.viewCount,
+           n.isLocked, n.version AS noteVersion, n.title AS noteTitle, n.content AS noteContent,
+           n.contentText AS noteContentText, n.contentFormat AS noteContentFormat, n.userId AS noteUserId
+    FROM shares s
+    LEFT JOIN notes n ON s.noteId = n.id
+    WHERE s.shareToken = ?
+  `).get(token) as any;
+
+  if (!share || !share.isActive) return c.json({ error: "分享不存在或已失效" }, 404);
+  if (share.expiresAt && new Date(share.expiresAt) < new Date()) {
+    return c.json({ error: "分享链接已过期" }, 410);
+  }
+
+  // 2) 权限校验：必须是 edit / edit_auth
+  if (share.permission !== "edit" && share.permission !== "edit_auth") {
+    return c.json({ error: "当前分享不支持编辑" }, 403);
+  }
+
+  // 2.1) edit_auth 额外校验：必须已登录
+  // 前端调用 updateSharedContent 时若用户已登录，api.ts 会自动带 X-User-Id header
+  // （见 src/lib/api.ts 的 fetchWithAuth）。后端直接读 header 判断登录态。
+  // 注意：这里不做"用户必须是笔记主"的校验——edit_auth 的语义是"任何登录用户
+  // 都可以编辑"，与笔记主的私人分享场景区分；私人分享应走带密码 + 短期 token 的链路。
+  if (share.permission === "edit_auth") {
+    const authUserId = c.req.header("X-User-Id");
+    if (!authUserId) {
+      return c.json(
+        {
+          error: "此分享需登录后才能编辑",
+          code: "LOGIN_REQUIRED",
+        },
+        401,
+      );
+    }
+  }
+
+  // 3) 笔记锁定校验
+  if (share.isLocked === 1) {
+    return c.json({ error: "笔记已被所有者锁定，暂不可编辑", code: "NOTE_LOCKED" }, 403);
+  }
+
+  // 4) 密码分享：校验 accessToken
+  if (share.password) {
+    const authHeader = c.req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return c.json({ error: "需要密码验证" }, 401);
+    }
+    const payload = verifyShareAccessToken(authHeader.slice(7), share.shareId);
+    if (!payload) return c.json({ error: "访问令牌无效或已过期" }, 401);
+  }
+
+  // 5) 参数校验：昵称必填（至少 1 个可见字符，不超过 32）
+  const trimmedName = (guestName || "").trim();
+  if (!trimmedName) {
+    return c.json({ error: "请先填写访客昵称后再编辑", code: "GUEST_NAME_REQUIRED" }, 400);
+  }
+  if (trimmedName.length > 32) {
+    return c.json({ error: "昵称过长（最多 32 个字符）" }, 400);
+  }
+
+  // 6) 乐观锁
+  const hasContentUpdate =
+    title !== undefined || content !== undefined || contentText !== undefined || contentFormat !== undefined;
+  if (hasContentUpdate && version === undefined) {
+    return c.json({ error: "缺少 version 字段，无法安全保存", code: "VERSION_REQUIRED" }, 400);
+  }
+  if (version !== undefined && version !== share.noteVersion) {
+    return c.json({ error: "内容已被他人更新，请刷新后再编辑", code: "VERSION_CONFLICT", currentVersion: share.noteVersion }, 409);
+  }
+
+  // 7) 写入前先存一份版本历史（保留原内容，便于回滚），changeType=guest_edit，用 changeSummary 记录访客昵称
+  //    userId 暂使用笔记所有者（访客无对应 users 记录）；真正的访客身份在 changeSummary 中。
+  if (hasContentUpdate) {
+    const hasContentChange = (content !== undefined && content !== share.noteContent)
+      || (contentText !== undefined && contentText !== share.noteContentText)
+      || (contentFormat !== undefined && contentFormat !== share.noteContentFormat)
+      || (title !== undefined && title !== share.noteTitle);
+    if (hasContentChange) {
+      const versionId = uuid();
+      noteVersionsRepository.create({
+        id: versionId,
+        noteId: share.noteId,
+        userId: share.noteUserId,
+        title: share.noteTitle,
+        content: share.noteContent,
+        contentText: share.noteContentText,
+        contentFormat: share.noteContentFormat,
+        version: share.noteVersion,
+        changeType: 'guest_edit',
+        changeSummary: `访客 ${trimmedName} 编辑`,
+      });
+    }
+  }
+
+  // 8) 更新笔记
+  const fields: string[] = [];
+  const params: any[] = [];
+  if (title !== undefined) { fields.push("title = ?"); params.push(title); }
+  if (content !== undefined) { fields.push("content = ?"); params.push(content); }
+  if (contentText !== undefined) { fields.push("contentText = ?"); params.push(contentText); }
+  if (contentFormat !== undefined) { fields.push("contentFormat = ?"); params.push(contentFormat); }
+  fields.push("version = version + 1");
+  fields.push("updatedAt = datetime('now')");
+  params.push(share.noteId);
+
+  db.prepare(`UPDATE notes SET ${fields.join(", ")} WHERE id = ?`).run(...params);
+  const updated = db.prepare("SELECT id, title, contentFormat, version, updatedAt FROM notes WHERE id = ?").get(share.noteId) as any;
+
+  return c.json({
+    success: true,
+    noteId: updated.id,
+    title: updated.title,
+    contentFormat: updated.contentFormat,
+    version: updated.version,
+    updatedAt: updated.updatedAt,
+    guestName: trimmedName,
+  });
+});
+
+// ===== Phase 3: 版本历史 API =====
+
+// 获取版本历史列表
+sharesRouter.get("/note/:noteId/versions", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const limit = parseInt(c.req.query("limit") || "20");
+  const offset = parseInt(c.req.query("offset") || "0");
+
+  // 验证笔记归属
+  const note = db.prepare("SELECT id FROM notes WHERE id = ? AND userId = ?").get(noteId, userId) as any;
+  if (!note) return c.json({ error: "笔记不存在或无权操作" }, 404);
+
+  const versions = noteVersionsRepository.listByNoteId(noteId, limit, offset);
+  const total = noteVersionsRepository.countByNoteId(noteId);
+
+  return c.json({ versions, total });
+});
+
+// 获取某个版本的完整内容
+sharesRouter.get("/note/:noteId/versions/:versionId", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const versionId = c.req.param("versionId");
+
+  const note = db.prepare("SELECT id FROM notes WHERE id = ? AND userId = ?").get(noteId, userId) as any;
+  if (!note) return c.json({ error: "笔记不存在或无权操作" }, 404);
+
+  const version = noteVersionsRepository.getByIdAndNoteId(versionId, noteId);
+  if (!version) return c.json({ error: "版本不存在" }, 404);
+
+  return c.json(version);
+});
+
+// 恢复到某个版本
+sharesRouter.post("/note/:noteId/versions/:versionId/restore", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const versionId = c.req.param("versionId");
+
+  const { permission } = resolveNotePermission(noteId, userId);
+  if (!hasPermission(permission, "write")) {
+    return c.json({ error: "笔记不存在或无权操作" }, 404);
+  }
+
+  const note = db.prepare("SELECT * FROM notes WHERE id = ?").get(noteId) as any;
+  if (!note) return c.json({ error: "笔记不存在或无权操作" }, 404);
+  if (note.isLocked) return c.json({ error: "笔记已锁定" }, 403);
+
+  const version = noteVersionsRepository.getByIdAndNoteId(versionId, noteId);
+  if (!version) return c.json({ error: "版本不存在" }, 404);
+
+  const updated = db.transaction(() => {
+    const currentVersionId = uuid();
+    noteVersionsRepository.create({
+      id: currentVersionId,
+      noteId,
+      userId,
+      title: note.title,
+      content: note.content,
+      contentText: note.contentText,
+      contentFormat: note.contentFormat,
+      version: note.version,
+      changeType: 'restore',
+      changeSummary: "恢复前自动备份",
+    });
+
+    db.prepare(`
+      UPDATE notes
+      SET title = ?, content = ?, contentText = ?, contentFormat = ?, version = version + 1, updatedAt = datetime('now')
+      WHERE id = ?
+    `).run(version.title, version.content, version.contentText, version.contentFormat || "tiptap-json", noteId);
+
+    const restoredContent = version.content || "";
+    const restoredContentFormat = version.contentFormat || "tiptap-json";
+    syncAttachmentReferences(db, noteId, restoredContent);
+    if (["tiptap-json", "markdown"].includes(restoredContentFormat)) {
+      // 恢复可见内容后补齐内部 Block ID，保证索引、权威存储与正文使用同一份规范化内容。
+      const synced = syncNoteBlocks(db, noteId, restoredContent, restoredContentFormat);
+      if (synced.changed) {
+        db.prepare("UPDATE notes SET content = ?, contentText = ? WHERE id = ?")
+          .run(synced.content, synced.contentText, noteId);
+      }
+      rebuildBlockAuthorityStore(db, noteId, synced.content, restoredContentFormat, {
+        noteVersion: note.version + 1,
+        operationType: "version-restore",
+        operationJson: { versionId },
+      });
+      rebuildYjsSubdocumentsIfEnabled(db, noteId, synced.content, restoredContentFormat);
+    }
+    noteYupdatesRepository.deleteByNoteId(noteId);
+    noteYsnapshotsRepository.deleteByNoteId(noteId);
+
+    return db.prepare(`
+      SELECT id, userId, notebookId, workspaceId, title, content, contentText, isPinned,
+        CASE WHEN EXISTS(SELECT 1 FROM favorites f WHERE f.noteId = notes.id AND f.userId = ?) THEN 1 ELSE 0 END AS isFavorite,
+        isLocked, isArchived, isTrashed, version, sortOrder, createdAt, updatedAt, trashedAt, contentFormat
+      FROM notes WHERE id = ?
+    `).get(userId, noteId) as any;
+  })();
+
+  try { yDestroyDoc(noteId); } catch (e) {
+    console.warn("[shares.restoreVersion] yDestroyDoc failed:", e);
+  }
+
+  const tags = db.prepare(`
+    SELECT t.* FROM tags t
+    JOIN note_tags nt ON t.id = nt.tagId
+    WHERE nt.noteId = ?
+  `).all(noteId);
+
+  try {
+    broadcastNoteUpdated(noteId, {
+      version: updated.version,
+      updatedAt: updated.updatedAt,
+      title: updated.title,
+      contentText: updated.contentText,
+      actorUserId: userId,
+    });
+    broadcastToUser(userId, {
+      type: "note:list-updated" as any,
+      note: {
+        id: updated.id,
+        title: updated.title,
+        contentText: updated.contentText,
+        updatedAt: updated.updatedAt,
+        version: updated.version,
+        isPinned: updated.isPinned,
+        isTrashed: updated.isTrashed,
+        notebookId: updated.notebookId,
+        workspaceId: updated.workspaceId,
+      },
+      actorUserId: userId,
+      actorConnectionId: null,
+    } as any);
+  } catch (e) {
+    console.warn("[shares.restoreVersion] broadcast failed:", e);
+  }
+
+  return c.json({ ...updated, tags });
+});
+
+// 清空某笔记的全部版本历史
+sharesRouter.delete("/note/:noteId/versions", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+
+  // 验证笔记归属
+  const note = db.prepare("SELECT id FROM notes WHERE id = ? AND userId = ?").get(noteId, userId) as any;
+  if (!note) return c.json({ error: "笔记不存在或无权操作" }, 404);
+
+  const before = noteVersionsRepository.countByNoteId(noteId);
+  const deleted = noteVersionsRepository.deleteByNoteId(noteId);
+
+  return c.json({ success: true, count: before, deleted });
+});
+
+// ===== Phase 3: 评论批注 API =====
+
+sharesRouter.get("/note/:noteId/comments", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  if (!capabilities.read) return c.json({ error: "无权读取评论", code: "FORBIDDEN" }, 403);
+  const locked = requireUnlockedNoteForShare(c, noteId, userId);
+  if (locked) return locked;
+  return c.json(shareCommentsRepository.listByNoteIdWithUser(noteId));
+});
+
+sharesRouter.post("/note/:noteId/comments", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  if (!capabilities.comment) return c.json({ error: "无权发表评论", code: "FORBIDDEN" }, 403);
+  const locked = requireUnlockedNoteForShare(c, noteId, userId);
+  if (locked) return locked;
+  const body = await c.req.json().catch(() => ({}));
+  const content = String(body.content || "").trim();
+  if (!content) return c.json({ error: "评论内容不能为空" }, 400);
+  if (content.length > 1000) return c.json({ error: "评论内容过长（最多 1000 字）" }, 400);
+  if (body.parentId) {
+    const parent = shareCommentsRepository.getById(String(body.parentId));
+    if (!parent || parent.noteId !== noteId) return c.json({ error: "父评论不属于当前笔记" }, 400);
+  }
+  const id = uuid();
+  createNoteCommentWithNotifications({
+    id,
+    noteId,
+    userId,
+    parentId: body.parentId || null,
+    content,
+    anchorData: body.anchorData || null,
+  });
+  return c.json(shareCommentsRepository.getByIdWithUser(id), 201);
+});
+
+sharesRouter.delete("/note/:noteId/comments/:commentId", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const commentId = c.req.param("commentId");
+  const comment = shareCommentsRepository.getById(commentId);
+  if (!comment || comment.noteId !== noteId) return c.json({ error: "评论不存在" }, 404);
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  if (!capabilities.read) return c.json({ error: "无权读取评论", code: "FORBIDDEN" }, 403);
+  const locked = requireUnlockedNoteForShare(c, noteId, userId);
+  if (locked) return locked;
+  if (comment.userId !== userId && !capabilities.manage) {
+    return c.json({ error: "只能删除自己的评论或由管理员删除" }, 403);
+  }
+  shareCommentsRepository.delete(commentId);
+  return c.json({ success: true });
+});
+
+sharesRouter.patch("/note/:noteId/comments/:commentId/resolve", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const noteId = c.req.param("noteId");
+  const commentId = c.req.param("commentId");
+  const capabilities = resolveEffectiveNoteCapabilities(noteId, userId);
+  if (!capabilities.manage) return c.json({ error: "无权操作", code: "FORBIDDEN" }, 403);
+  const locked = requireUnlockedNoteForShare(c, noteId, userId);
+  if (locked) return locked;
+  const comment = shareCommentsRepository.getResolved(commentId);
+  if (!comment || comment.noteId !== noteId) return c.json({ error: "评论不存在" }, 404);
+  shareCommentsRepository.updateResolved(commentId, comment.isResolved ? 0 : 1);
+  return c.json(shareCommentsRepository.getByIdWithUser(commentId));
+});
+
+// ===== Phase 2: 批量检查笔记分享状态 =====
+sharesRouter.get("/status/batch", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+
+  // 获取当前用户所有活跃分享的笔记 ID 集合
+  const sharedNotes = db.prepare(`
+    SELECT DISTINCT noteId FROM shares WHERE ownerId = ? AND isActive = 1
+  `).all(userId) as { noteId: string }[];
+
+  return c.json(sharedNotes.map((s) => s.noteId));
+});
+
+// ===== Phase 4: 公开路由 - 同步轮询 =====
+
+// 检查笔记是否有更新（轻量级，仅返回 version + updatedAt）
+sharedRouter.get("/:token/poll", (c) => {
+  const db = getDb();
+  const token = c.req.param("token");
+
+  const share = db.prepare(`
+    SELECT s.id, s.noteId, s.isActive, s.expiresAt, s.maxViews, s.viewCount, s.password,
+           n.version, n.updatedAt
+    FROM shares s
+    LEFT JOIN notes n ON s.noteId = n.id
+    WHERE s.shareToken = ?
+  `).get(token) as any;
+
+  if (!share || !share.isActive) {
+    return c.json({ error: "分享不存在或已失效" }, 404);
+  }
+
+  if (share.expiresAt && new Date(share.expiresAt) < new Date()) {
+    return c.json({ error: "分享链接已过期" }, 410);
+  }
+
+  // 如果有密码保护，验证 accessToken
+  if (share.password) {
+    const authHeader = c.req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return c.json({ error: "需要密码验证" }, 401);
+    }
+    const payload = verifyShareAccessToken(authHeader.slice(7), share.id);
+    if (!payload) return c.json({ error: "访问令牌无效或已过期" }, 401);
+  }
+
+  return c.json({
+    version: share.version,
+    updatedAt: share.updatedAt,
+  });
+});
+
+// 公开访问 - 获取评论列表（view 权限以上）
+sharedRouter.get("/:token/comments", (c) => {
+  const db = getDb();
+  const token = c.req.param("token");
+
+  const share = db.prepare(`
+    SELECT s.id, s.noteId, s.isActive, s.permission, s.password
+    FROM shares s WHERE s.shareToken = ?
+  `).get(token) as any;
+
+  if (!share || !share.isActive) {
+    return c.json({ error: "分享不存在" }, 404);
+  }
+  if (share.permission === "view") return c.json({ error: "当前分享不开放评论" }, 403);
+
+  // 密码验证
+  if (share.password) {
+    const authHeader = c.req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return c.json({ error: "需要密码验证" }, 401);
+    }
+    const payload = verifyShareAccessToken(authHeader.slice(7), share.id);
+    if (!payload) return c.json({ error: "无效或已过期的令牌" }, 401);
+  }
+
+  const comments = shareCommentsRepository.listByNoteIdWithUserForPublic(share.noteId);
+
+  // SQLite 的 1/0 → 转成 boolean，前端用起来更直观
+  for (const r of comments) {
+    r.isGuest = r.isGuest === 1;
+  }
+
+  return c.json(comments);
+});
+
+// 公开访问 - 添加评论（需要 comment / edit / edit_auth 权限）
+//
+// 鉴权策略：
+//   - 已登录用户（X-User-Id header 有值且对应用户存在）：写真实 userId，guestName=NULL
+//   - 未登录访客：写 userId=NULL，guestName=访客昵称（必填，最长 32）
+//
+// 反垃圾基础措施（最小可用）：
+//   - 内容长度 ≤ 1000（防灌水）
+//   - 同 IP 每分钟 ≤ 30 条评论（防机器刷屏）
+//   - honeypot 字段 `_hp`：前端永远不发，后端收到非空就认为是机器人，静默 200 不入库
+//
+// 注：edit_auth 权限下评论是否需要登录？
+//   不需要——评论与编辑是两个能力。edit_auth 仅约束"写正文"必须登录，
+//   评论沿用 comment 权限的访客政策（填昵称即可）。如果以后业务上要"评论也得登录"，
+//   再加 comment_auth 权限档位即可，本次不做。
+sharedRouter.post("/:token/comments", async (c) => {
+  const db = getDb();
+  const token = c.req.param("token");
+  const body = await c.req.json();
+  const { content, parentId, anchorData, guestName, _hp } = body as {
+    content: string; parentId?: string; anchorData?: string; guestName?: string; _hp?: string;
+  };
+
+  // honeypot：机器人填的字段，正常用户不会填
+  if (_hp && _hp.trim()) {
+    // 静默成功，不给攻击者反馈
+    return c.json({ ok: true, suppressed: true });
+  }
+
+  if (typeof content !== "string" || !content.trim()) return c.json({ error: "评论内容不能为空" }, 400);
+  const trimmedContent = content.trim();
+  if (trimmedContent.length > 1000) {
+    return c.json({ error: "评论内容过长（最多 1000 字）" }, 400);
+  }
+
+  const share = db.prepare(`
+    SELECT s.id, s.noteId, s.ownerId, s.isActive, s.permission, s.password
+    FROM shares s WHERE s.shareToken = ?
+  `).get(token) as any;
+
+  if (!share || !share.isActive) return c.json({ error: "分享不存在" }, 404);
+  if (share.permission === "view") return c.json({ error: "当前分享权限不支持评论" }, 403);
+
+  // 密码验证
+  if (share.password) {
+    const authHeader = c.req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return c.json({ error: "需要密码验证" }, 401);
+    }
+    const payload = verifyShareAccessToken(authHeader.slice(7), share.id);
+    if (!payload) return c.json({ error: "无效或已过期的令牌" }, 401);
+  }
+
+  // 频次限制：以 (token, IP) 为 key，避免一个分享被同一 IP 刷屏
+  const ip = getClientIp(c);
+  const ipHash = hashIp(ip);
+  if (!checkRateLimit(`${token}:${ipHash}`)) {
+    return c.json({ error: "评论过于频繁，请稍后再试" }, 429);
+  }
+
+  // 鉴权识别：已登录 → 真实 userId；未登录 → NULL + guestName
+  const authUserId = c.req.header("X-User-Id") || "";
+  let userId: string | null = null;
+  let storedGuestName: string | null = null;
+
+  if (authUserId) {
+    // 校验用户确实存在（避免伪造 header）
+    const userRow = db.prepare("SELECT id FROM users WHERE id = ?").get(authUserId) as { id: string } | undefined;
+    if (userRow) {
+      userId = userRow.id;
+    }
+  }
+
+  if (!userId) {
+    // 未登录访客必须填昵称
+    const trimmedName = typeof guestName === "string" ? guestName.trim() : "";
+    if (!trimmedName) {
+      return c.json({ error: "请填写昵称后再评论", code: "GUEST_NAME_REQUIRED" }, 400);
+    }
+    if (trimmedName.length > 32) {
+      return c.json({ error: "昵称过长（最多 32 个字符）" }, 400);
+    }
+    storedGuestName = trimmedName;
+  }
+
+  if (parentId) {
+    const parent = shareCommentsRepository.getById(String(parentId));
+    if (!parent || parent.noteId !== share.noteId) return c.json({ error: "父评论不属于当前笔记" }, 400);
+  }
+  const id = uuid();
+  createNoteCommentWithNotifications({
+    id,
+    noteId: share.noteId,
+    userId,
+    guestName: storedGuestName ?? undefined,
+    guestIpHash: ipHash,
+    parentId: parentId || null,
+    content: trimmedContent,
+    anchorData: anchorData || null,
+  });
+
+  const comment = shareCommentsRepository.getByIdWithUserForPublic(id);
+
+  comment.isGuest = comment.isGuest === 1;
+  return c.json(comment, 201);
+});
+
+export { sharesRouter, sharedRouter };

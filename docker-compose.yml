@@ -1,0 +1,100 @@
+services:
+  nowen-note:
+    image: cropflre/nowen-note:${NOWEN_IMAGE_TAG:-latest}
+    container_name: nowen-note
+    restart: unless-stopped
+    ports:
+      - "${NOWEN_PORT:-3001}:3001"
+    volumes:
+      - nowen-note-data:/app/data
+      # 推荐把备份放到独立物理卷，并同时设置 BACKUP_DIR=/app/backups
+      # - /path/on/another-disk/nowen-backups:/app/backups
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - NODE_ENV=production
+      - DB_PATH=/app/data/nowen-note.db
+      - PORT=3001
+      - TZ=${TZ:-Asia/Shanghai}
+      - PUBLIC_WEB_ORIGIN=${PUBLIC_WEB_ORIGIN:-}
+      - FILE_PUBLIC_ORIGIN=${FILE_PUBLIC_ORIGIN:-}
+      - NOWEN_DEPLOYMENT_TYPE=docker-compose-managed
+      - NOWEN_IMAGE_TAG=${NOWEN_IMAGE_TAG:-latest}
+      - NOWEN_UPDATER_URL=http://nowen-note-updater:3002
+      - NOWEN_UPDATER_TOKEN=${NOWEN_UPDATER_TOKEN:-}
+      - NOWEN_UPDATER_INSTANCE=${NOWEN_INSTANCE_ID:-nowen-note}
+    labels:
+      com.nowen-note.managed: "true"
+      com.nowen-note.role: "app"
+      com.nowen-note.project: "nowen-note"
+      com.nowen-note.instance: "${NOWEN_INSTANCE_ID:-nowen-note}"
+      com.nowen-note.image-repository: "cropflre/nowen-note"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const p=process.env.PORT||'3001';fetch('http://127.0.0.1:'+p+'/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - nowen-network
+      - nowen-update-internal
+
+  # 默认关闭：只有显式传入 --profile updater 才会启动。
+  # 该容器是唯一挂载 Docker Socket 的进程；主应用永远不挂载 Socket。
+  nowen-note-updater:
+    image: cropflre/nowen-note:${NOWEN_IMAGE_TAG:-latest}
+    container_name: nowen-note-updater
+    profiles: ["updater"]
+    restart: unless-stopped
+    depends_on:
+      nowen-note:
+        condition: service_healthy
+    entrypoint: ["/sbin/tini", "--"]
+    command: ["node", "backend/dist/updater/index.js"]
+    environment:
+      - NODE_ENV=production
+      - NOWEN_UPDATER_PORT=3002
+      - NOWEN_UPDATER_TOKEN=${NOWEN_UPDATER_TOKEN:-}
+      - NOWEN_UPDATER_INSTANCE=${NOWEN_INSTANCE_ID:-nowen-note}
+      - NOWEN_UPDATER_CONTAINER_NAME=nowen-note
+      - NOWEN_UPDATER_ALLOWED_IMAGE=cropflre/nowen-note
+      - NOWEN_UPDATER_TARGET_URL=http://nowen-note:3001
+      - NOWEN_UPDATER_STATE_DIR=/var/lib/nowen-updater
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - nowen-updater-state:/var/lib/nowen-updater
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3002/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - nowen-update-internal
+
+volumes:
+  nowen-note-data:
+    driver: local
+  nowen-updater-state:
+    driver: local
+
+networks:
+  nowen-network:
+  nowen-update-internal:
+    internal: true

@@ -1,0 +1,51 @@
+// Install the system-resolver fallback before url-import captures dns.resolve4/resolve6.
+import "./runtime/url-import-dns-compat.js";
+// Register feature migrations before any runtime imports can initialize the database.
+import "./runtime/knowledge-tree-migration-bootstrap.js";
+import "./runtime/task-metadata-migration-bootstrap.js";
+import "./runtime/task-time-planning-migration-bootstrap.js";
+import "./runtime/task-inbox-migration-bootstrap.js";
+// Permission routes import ACL services that may initialize database guards, so they must load
+// only after the feature migration list has been registered.
+import "./runtime/notebook-permission-management.js";
+// Keep Markdown <-> rich-text transitions from reviving stale browser IndexedDB Yjs structs.
+// This must load before index.ts mounts /api/notes so the guarded release-room route wins.
+import "./runtime/note-format-yjs-transition.js";
+// Install schema/route hardening before the main backend module evaluates.
+import "./runtime/task-stats-hardening.js";
+// Note appearance is note metadata. Mount its schema/API capability before /api/notes is registered.
+import "./runtime/note-appearance.js";
+// Keep the legacy Xiaomi route as a reusable, single-row-safe import pipeline.
+import "./runtime/micloud-import-hardening.js";
+// Mount persistent Xiaomi background jobs and one SSE progress stream before /api/micloud mounts.
+import "./runtime/micloud-import-jobs.js";
+// Recover interrupted embedding jobs before the legacy worker starts polling.
+import "./runtime/embedding-queue-hardening.js";
+// Must load after task-stats-hardening so this wrapper registers selected-section splitting before
+// the legacy all-section route when /api/notes is mounted.
+import "./runtime/note-split-selection.js";
+// Loaded after the Markdown selection wrapper so Tiptap requests are registered first, then
+// non-Tiptap requests continue through the existing Markdown and legacy handlers.
+import "./runtime/note-split-tiptap.js";
+// Wrap /api/blocks/resolve before the standard block router so old noteId + blockId links can follow
+// durable note-split records without rewriting the source notes that contain those links.
+import "./runtime/block-link-redirect.js";
+// Add an atomic Tiptap block patch endpoint while preserving all existing single-block routes.
+import "./runtime/block-patch.js";
+import "./runtime/auto-full-backup.js";
+// Full ZIP restore must stream from disk before /api/backups exposes restore endpoints; otherwise
+// multi-GB archives hit Node's readFileSync/Buffer ceiling during dry-run before recovery even starts.
+import "./runtime/backup-restore-large-archive.js";
+// Fail closed if production bootstrap ever stops installing the streaming restore wrapper.
+import "./runtime/backup-restore-large-archive-guard.js";
+// Mount encrypted WebDAV backup configuration and upload routes before /api/backups is registered.
+import "./runtime/backup-webdav.js";
+import "./runtime/notebook-publication.js";
+// Mount the unified content tree and capability guard around the legacy note/notebook routers.
+import "./runtime/knowledge-tree.js";
+// Install before the main Hono app registers its production wildcard static route.
+import "./runtime/static-precompressed-assets.js";
+// Publish the effective attachment-size policy and normalize oversized upload errors before the
+// legacy /api/attachments router is mounted.
+import "./runtime/attachment-upload-policy.js";
+import "./index.js";

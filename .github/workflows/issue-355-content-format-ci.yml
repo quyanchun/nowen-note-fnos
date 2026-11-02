@@ -1,0 +1,125 @@
+name: Issue 355 Content Format CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/src/lib/markdownUserContent.ts"
+      - "backend/src/lib/siyuanSyParser.ts"
+      - "backend/src/routes/notes.ts"
+      - "backend/src/routes/export.ts"
+      - "backend/tests/markdown-user-content.test.ts"
+      - "backend/tests/notes-content-view.test.ts"
+      - "backend/tests/siyuan-issue-494-markdown.test.ts"
+      - "frontend/src/lib/editorMode.ts"
+      - "frontend/src/lib/noteEditorRouting.ts"
+      - "frontend/src/lib/markdownUserContent.ts"
+      - "frontend/src/lib/markdownInternalMarkers.ts"
+      - "frontend/src/lib/contentFormat.ts"
+      - "frontend/src/lib/api.impl.ts"
+      - "frontend/src/lib/api.ts"
+      - "frontend/src/lib/workspaceRefreshBridge.ts"
+      - "frontend/src/lib/__tests__/editorMode.test.ts"
+      - "frontend/src/lib/__tests__/workspaceRefreshBridge.test.ts"
+      - "frontend/src/components/FormatAwareEditorPane.tsx"
+      - "frontend/src/components/EditorPaneRuntime.tsx"
+      - "frontend/src/components/MarkdownEditorImpl.tsx"
+      - "frontend/src/components/LargeMarkdownSafeEditor.tsx"
+      - "frontend/src/components/MarkdownPreview.tsx"
+      - "frontend/src/components/__tests__/FormatAwareEditorPane.test.tsx"
+      - "frontend/src/components/__tests__/EditorPaneRuntimeLayout.test.tsx"
+      - "frontend/src/components/__tests__/MarkdownPreview.issue494.test.tsx"
+      - "frontend/src/lib/__tests__/markdownUserContent.test.ts"
+      - ".github/workflows/issue-355-content-format-ci.yml"
+  pull_request:
+    paths:
+      - "backend/src/lib/markdownUserContent.ts"
+      - "backend/src/lib/siyuanSyParser.ts"
+      - "backend/src/routes/notes.ts"
+      - "backend/src/routes/export.ts"
+      - "backend/tests/markdown-user-content.test.ts"
+      - "backend/tests/notes-content-view.test.ts"
+      - "backend/tests/siyuan-issue-494-markdown.test.ts"
+      - "frontend/src/lib/editorMode.ts"
+      - "frontend/src/lib/noteEditorRouting.ts"
+      - "frontend/src/lib/markdownUserContent.ts"
+      - "frontend/src/lib/markdownInternalMarkers.ts"
+      - "frontend/src/lib/contentFormat.ts"
+      - "frontend/src/lib/api.impl.ts"
+      - "frontend/src/lib/api.ts"
+      - "frontend/src/lib/workspaceRefreshBridge.ts"
+      - "frontend/src/lib/__tests__/editorMode.test.ts"
+      - "frontend/src/lib/__tests__/workspaceRefreshBridge.test.ts"
+      - "frontend/src/components/FormatAwareEditorPane.tsx"
+      - "frontend/src/components/EditorPaneRuntime.tsx"
+      - "frontend/src/components/MarkdownEditorImpl.tsx"
+      - "frontend/src/components/LargeMarkdownSafeEditor.tsx"
+      - "frontend/src/components/MarkdownPreview.tsx"
+      - "frontend/src/components/__tests__/FormatAwareEditorPane.test.tsx"
+      - "frontend/src/components/__tests__/EditorPaneRuntimeLayout.test.tsx"
+      - "frontend/src/components/__tests__/MarkdownPreview.issue494.test.tsx"
+      - "frontend/src/lib/__tests__/markdownUserContent.test.ts"
+      - ".github/workflows/issue-355-content-format-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Markdown and SiYuan regressions
+        run: >-
+          node --import tsx --test
+          tests/markdown-user-content.test.ts
+          tests/notes-content-view.test.ts
+          tests/siyuan-issue-494-markdown.test.ts
+      - run: npm run build:tsc
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Existing content-format regressions
+        run: >-
+          npm run test:run --
+          src/lib/__tests__/markdownUserContent.test.ts
+          src/lib/__tests__/editorMode.test.ts
+          src/components/__tests__/FormatAwareEditorPane.test.tsx
+          src/components/__tests__/EditorPaneRuntimeLayout.test.tsx
+      - name: Issue 494 Callout sanitization regression
+        run: >-
+          npm run test:run --
+          src/components/__tests__/MarkdownPreview.issue494.test.tsx
+          -t "preserves Callout metadata"
+      - name: Issue 494 iframe parameter regression
+        if: always()
+        run: >-
+          npm run test:run --
+          src/components/__tests__/MarkdownPreview.issue494.test.tsx
+          -t "decodes legacy double-escaped iframe parameters"
+      - name: Issue 494 content-tree refresh regression
+        if: always()
+        run: npm run test:run -- src/lib/__tests__/workspaceRefreshBridge.test.ts
+      - name: Frontend typecheck
+        if: always()
+        run: npx tsc -b

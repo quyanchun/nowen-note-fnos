@@ -1,0 +1,18 @@
+services:
+  gateway:
+    image: nginx:1.28-alpine
+    container_name: nowen-note-https-gateway
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /usr/trim/etc/ssl.crt:/etc/nginx/tls/nas.crt:ro
+      - /usr/trim/etc/ssl.key:/etc/nginx/tls/nas.key:ro
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID, CHOWN]
+    security_opt: [no-new-privileges:true]

@@ -1,0 +1,47 @@
+name: 🐛 Bug 反馈
+description: 软件哪里不对？简单说一下就行
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！不用写得很专业，把看到的问题说清楚即可。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 发生了什么？
+      description: 简单说明你做了什么、出现了什么问题。能复现的话顺便写一下步骤。
+      placeholder: |
+        例如：
+        1. 打开某篇笔记
+        2. 点击分享
+        3. 页面一直加载，无法打开
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 在哪里遇到的？
+      options:
+        - 电脑客户端
+        - 电脑浏览器
+        - 手机浏览器 / App
+        - Docker / 自建服务
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本号（不知道可不填）
+      placeholder: 例如：v1.3.1
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: 截图、录屏或报错（推荐）
+      description: 直接拖进来即可。请不要上传密码、密钥、Token 等敏感信息。
+      placeholder: 把截图、录屏或报错内容粘贴到这里……

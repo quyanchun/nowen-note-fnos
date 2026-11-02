@@ -1,0 +1,2975 @@
+/* 浣跨敤绯荤粺瀛椾綋鏍堬紝鏃犻渶渚濊禆 Google Fonts CDN */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== 鏃х増 WebView 鍏煎鎬у洖閫€ =====
+ * 灏忕背 8 绛夋棫璁惧鐨?WebView 涓嶆敮鎸?dvh / color-mix,
+ * 瀵艰嚧鏍瑰鍣ㄩ珮搴︿负 0 鈫?榛戝睆銆?
+ * 鐢?@supports 鍋氭笎杩涘寮猴紝淇濊瘉鏂拌澶囦笉鍙楀奖鍝嶃€?
+ */
+
+/* dvh 鍥為€€锛氭棫娴忚鍣ㄧ敤 vh 鍏戞浛 */
+@supports not (height: 100dvh) {
+  .h-\[100dvh\] { height: 100vh !important; }
+  .min-h-\[100dvh\] { min-height: 100vh !important; }
+  .max-h-\[100dvh\] { max-height: 100vh !important; }
+  .max-md\:h-\[100dvh\] { height: 100vh !important; }
+  /* LoginPage 鍐呰仈鏍峰紡鍥為€€ */
+  [style*="100dvh"] {
+    min-height: 100vh !important;
+    max-height: 100vh !important;
+    height: 100vh !important;
+  }
+}
+
+/* ===== Light Theme (榛樿) ===== */
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --editor-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+
+  --color-bg: #ffffff;
+  --color-surface: #f9fafb;
+  --color-sidebar: #f3f4f6;
+  --color-elevated: #ffffff;
+  --color-border: #e5e7eb;
+  --color-hover: #f3f4f6;
+  --color-active: #e0e7ff;
+
+  --color-text-primary: #111827;
+  --color-text-secondary: #6b7280;
+  --color-text-tertiary: #9ca3af;
+  --color-text-inverse: #ffffff;
+
+  --color-accent-primary: #3b82f6;
+  --color-accent-secondary: #22c55e;
+  --color-accent-warning: #f59e0b;
+  --color-accent-danger: #ef4444;
+  --color-accent-muted: #9ca3af;
+
+  /* ProseMirror 缂栬緫鍣ㄨ壊鍊?*/
+  --pm-text: #374151;
+  --pm-heading: #111827;
+  --pm-code-bg: #f3f4f6;
+  --pm-code-text: #dc2626;
+  --pm-pre-bg: #f9fafb;
+  --pm-pre-border: #e5e7eb;
+  --pm-pre-text: #374151;
+  --pm-blockquote-border: #3b82f6;
+  --pm-blockquote-text: #6b7280;
+  --pm-hr: #e5e7eb;
+  --pm-placeholder: #9ca3af;
+  --pm-task-done: #9ca3af;
+  --pm-scrollbar: #d1d5db;
+  --pm-scrollbar-hover: #9ca3af;
+  --pm-selection: rgba(59, 130, 246, 0.2);
+}
+
+/* ===== Dark Theme ===== */
+.dark {
+  --color-bg: #0d1117;
+  --color-surface: #161b22;
+  --color-sidebar: #1c2128;
+  --color-elevated: #1c2333;
+  --color-border: #30363d;
+  --color-hover: #1f2937;
+  --color-active: #253040;
+
+  --color-text-primary: #e6edf3;
+  --color-text-secondary: #8b949e;
+  --color-text-tertiary: #6e7681;
+  --color-text-inverse: #0d1117;
+
+  --color-accent-primary: #58a6ff;
+  --color-accent-secondary: #7ee787;
+  --color-accent-warning: #f0883e;
+  --color-accent-danger: #f85149;
+  --color-accent-muted: #8b949e;
+
+  --pm-text: #c9d1d9;
+  --pm-heading: #e6edf3;
+  --pm-code-bg: #1c2333;
+  --pm-code-text: #f0883e;
+  --pm-pre-bg: #161b22;
+  --pm-pre-border: #30363d;
+  --pm-pre-text: #c9d1d9;
+  --pm-blockquote-border: #58a6ff;
+  --pm-blockquote-text: #8b949e;
+  --pm-hr: #30363d;
+  --pm-placeholder: #6e7681;
+  --pm-task-done: #6e7681;
+  --pm-scrollbar: #30363d;
+  --pm-scrollbar-hover: #484f58;
+  --pm-selection: rgba(88, 166, 255, 0.25);
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ===== Safe Area 缁熶竴鍙橀噺 =====
+ * 绉诲姩绔《閮?/ 搴曢儴閬胯楂樺害銆備袱绉嶈繍琛屾ā寮忛兘瑕佸吋瀹癸細
+ *
+ *   A) 娴忚鍣?/ iOS WKWebView / Capacitor 寮€鍚?StatusBar.setOverlaysWebView(true)锛?
+ *      鐘舵€佹爮瑕嗙洊 WebView锛孋SS 鐨?env(safe-area-inset-*) 鑳芥嬁鍒扮湡瀹炴暟鍊笺€?
+ *   B) Android + Capacitor StatusBar.setOverlaysWebView(false)锛堝綋鍓嶉粯璁わ級锛?
+ *      鐘舵€佹爮鐙崰涓€鏉★紝WebView 椤惰竟 = y=0锛宔nv(safe-area-inset-top) 鎭掍负 0銆?
+ *      杩欑妯″紡涓嬫垜浠湪 JS (useStatusBarSync) 鍒濆鍖栨椂鎶?`visualViewport.offsetTop`
+ *      鎴栧師鐢熺姸鎬佹爮楂樺害鍐欏叆 --android-status-bar-height 鍋氬厹搴曘€?
+ *
+ * 缁勪欢閲岀粺涓€浣跨敤 var(--safe-area-top/bottom)锛屾棤闇€鍐嶆暎钀藉啓 env() + max() 缁勫悎銆?
+ */
+:root {
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+}
+
+/* Android 鍘熺敓澹筹細status bar / nav bar 涓?overlay WebView锛宔nv() 鎭掍负 0锛?
+ * 鐢?JS 娉ㄥ叆 --android-status-bar-height / --android-nav-bar-height 浣滀负鏇寸簿纭殑
+ * 鍏滃簳鍊硷紝浣嗗嵆渚?JS 娌¤窇锛堟瀬绔椂搴忛棶棰橈級锛孋SS 杩欓噷涔熺粰涓€浠?*纭厹搴?*锛?
+ *   - 椤堕儴 28px锛氳创杩戞櫘閫氬睆鐪熷疄鐘舵€佹爮楂樺害锛岄伩鍏嶆寜閽帇鍦ㄦ椂闂?鐢垫睜鍥炬爣涓婏紱
+ *               鍒樻捣/鎸栧瓟灞忕敱 JS 娉ㄥ叆鐨勭湡瀹炲€奸€氳繃 max() 鑷姩瑕嗙洊銆?
+ *   - 搴曢儴 24px锛氳鐩栨墜鍔挎潯锛岄伩鍏?home indicator 鍘嬩綇鍐呭銆?
+ * JS 娉ㄥ叆鐨勫€间細閫氳繃 max() 涓庣‖鍏滃簳鍙栬緝澶ц€咃紝楂樼姸鎬佹爮鏈哄瀷渚濈劧绮惧噯銆?
+ *
+ * 娉細Android 15+ (targetSdk>=35) 寮哄埗 Edge-to-Edge锛岀姸鎬佹爮/鎵嬪娍鏍忎細 overlay
+ * 鍦?WebView 涓婏紝蹇呴』渚濋潬杩欎袱涓厹搴曞彉閲忓仛閬胯銆?*/
+html[data-native="android"] {
+  --safe-area-top: max(var(--android-status-bar-height, 0px), 28px);
+  --safe-area-bottom: max(var(--android-nav-bar-height, 0px), 24px);
+}
+
+/* iOS 鍘熺敓澹筹細env(safe-area-inset-*) 閫氬父鑳芥纭繑鍥烇紝浣嗘煇浜涙満鍨?鍒濆鍖栨椂鏈?
+ * 涓嬩篃鍙兘鐭殏涓?0锛岀粰涓€浠借緝娓╁拰鐨勫厹搴曪紙椤堕儴 20px = 缁忓吀鐘舵€佹爮楂樺害锛夈€?*/
+html[data-native="ios"] {
+  --safe-area-top: max(env(safe-area-inset-top, 0px), 20px);
+  --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), 16px);
+}
+/* HarmonyOS ArkWeb WebView: safe-area padding
+ * ArkWeb基于Chromium，支持env(safe-area-inset-*)，
+ * 但鸿蒙状态栏高度因设备而异，用min兜底。
+ * --harmony-status-bar-height 由ArkTS通过CSS变量注入。
+ */
+html[data-native="harmony"] {
+  --safe-area-top: max(var(--harmony-status-bar-height, 0px), 32px);
+  --safe-area-bottom: max(var(--harmony-nav-bar-height, 0px), 16px);
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* ===== Tiptap / ProseMirror 缂栬緫鍣ㄦ牱寮?===== */
+.ProseMirror {
+  outline: none;
+  min-height: 300px;
+  /* 搴曢儴棰勭暀鍙粴鍔ㄧ殑绌虹櫧锛氬啓鍒版湯灏炬椂浠嶈兘鎶婂厜鏍囪寰€涓婃粴锛岄伩鍏嶈创灞忓箷搴曢儴 */
+  padding-bottom: 40vh;
+  font-family: var(--editor-font-family);
+  font-size: var(--editor-font-size, inherit);
+}
+
+.nowen-md-preview {
+  font-size: var(--editor-font-size, inherit);
+}
+
+/* ===== Note Theme Engine =====
+ * 主题只作用于编辑/阅读表面。默认主题不进入这组规则，继续继承现有 Skin、
+ * 明暗模式和用户字体；其他内置主题由账号偏好把一组白名单 Token 写到根节点。
+ */
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface {
+  background: var(--note-theme-surface);
+  color: var(--pm-text);
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview {
+  width: 100%;
+  max-width: var(--note-theme-content-width);
+  margin-left: auto;
+  margin-right: auto;
+  color: var(--pm-text);
+  line-height: var(--pm-p-line-height);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror a,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview a {
+  color: var(--note-theme-accent);
+  text-decoration-color: currentColor;
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror a:hover,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview a:hover {
+  color: var(--note-theme-accent-hover);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview h1,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview h2,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview h3,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview h4,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview h5,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview h6 {
+  color: var(--pm-heading);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview blockquote {
+  color: var(--pm-blockquote-text);
+  border-left-color: var(--pm-blockquote-border);
+  background: var(--note-theme-soft);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview :not(pre) > code {
+  color: var(--pm-code-text);
+  background: var(--pm-code-bg);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview hr,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview th,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview td,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror table,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror th,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror td {
+  border-color: var(--note-theme-border);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview th,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror th {
+  color: var(--pm-heading);
+  background: var(--note-theme-soft);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview tr:nth-child(even) td,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror tr:nth-child(even) td {
+  color: var(--pm-text);
+  background: var(--note-theme-table-stripe);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview mark {
+  color: inherit;
+  background: var(--note-theme-mark);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .ProseMirror ::selection,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-preview ::selection {
+  background: var(--pm-selection);
+}
+
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-editor .cm-editor,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-editor .cm-scroller,
+html[data-note-theme]:not([data-note-theme="default"]) .note-theme-surface .nowen-md-editor .cm-gutters {
+  color: var(--pm-text);
+  background: var(--note-theme-surface);
+}
+
+/* 缂栬緫鍣ㄥ唴閾炬帴锛氬彲瑙佺殑棰滆壊 + 涓嬪垝绾?+ 鎸囬拡锛汿ypora 椋庢牸鐨勮交閲忔彁绀?*/
+.ProseMirror a {
+  color: #4f46e5; /* indigo-600 */
+  text-decoration: underline;
+  text-decoration-color: rgba(79, 70, 229, 0.45);
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+  cursor: pointer;
+  transition: color 0.15s ease, text-decoration-color 0.15s ease;
+  word-break: break-all; /* 闀?URL 涓嶆拺鐮村鍣?*/
+}
+.ProseMirror a:hover {
+  color: #4338ca; /* indigo-700 */
+  text-decoration-color: currentColor;
+}
+.dark .ProseMirror a {
+  color: #818cf8; /* indigo-400 */
+  text-decoration-color: rgba(129, 140, 248, 0.5);
+}
+.dark .ProseMirror a:hover {
+  color: #a5b4fc; /* indigo-300 */
+}
+
+.ProseMirror p.is-editor-empty:first-child::before {
+  color: var(--pm-placeholder);
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+.ProseMirror h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  margin: 2rem 0 0.75rem;
+  color: var(--pm-heading);
+  line-height: 1.4;
+}
+
+.ProseMirror h2 {
+  font-size: 1.375rem;
+  font-weight: 600;
+  margin: 1.75rem 0 0.625rem;
+  color: var(--pm-heading);
+  line-height: 1.4;
+}
+
+.ProseMirror h3 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin: 1.5rem 0 0.5rem;
+  color: var(--pm-heading);
+  line-height: 1.4;
+}
+
+.ProseMirror p {
+  margin: var(--pm-p-margin, 0) 0;
+  line-height: var(--pm-p-line-height, 1.6);
+  color: var(--pm-text);
+}
+
+.ProseMirror ul {
+  padding-left: 1.6em;
+  margin: 0.75rem 0;
+  list-style: none !important;
+  --nowen-ul-marker: "•";
+  --nowen-ul-marker-size: 1.1em;
+  --nowen-ul-marker-top: 0;
+}
+
+/* 无序列表符号显式覆盖 1～9 层；更深层级沿用第 9 层样式。 */
+.ProseMirror ul ul { --nowen-ul-marker: "◦"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.ProseMirror ul ul ul { --nowen-ul-marker: "▪"; --nowen-ul-marker-size: 1.2em; --nowen-ul-marker-top: -0.05em; }
+.ProseMirror ul ul ul ul { --nowen-ul-marker: "•"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.ProseMirror ul ul ul ul ul { --nowen-ul-marker: "◦"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.ProseMirror ul ul ul ul ul ul { --nowen-ul-marker: "▪"; --nowen-ul-marker-size: 1.2em; --nowen-ul-marker-top: -0.05em; }
+.ProseMirror ul ul ul ul ul ul ul { --nowen-ul-marker: "•"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.ProseMirror ul ul ul ul ul ul ul ul { --nowen-ul-marker: "◦"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.ProseMirror ul ul ul ul ul ul ul ul ul { --nowen-ul-marker: "▪"; --nowen-ul-marker-size: 1.2em; --nowen-ul-marker-top: -0.05em; }
+
+.ProseMirror ul > li:not([data-type="taskItem"]):not(.task-list-item) {
+  position: relative;
+}
+
+.ProseMirror ul > li:not([data-type="taskItem"]):not(.task-list-item)::before {
+  content: var(--nowen-ul-marker);
+  position: absolute;
+  left: -1.2em;
+  top: var(--nowen-ul-marker-top);
+  color: var(--pm-text);
+  font-size: var(--nowen-ul-marker-size);
+  line-height: 1;
+}
+
+.ProseMirror ul.contains-task-list > li.task-list-item::before,
+.ProseMirror ul[data-type="taskList"] > li[data-type="taskItem"]::before {
+  content: none !important;
+}
+
+.ProseMirror ol {
+  padding-left: 1.6em;
+  margin: 0.75rem 0;
+  list-style-type: decimal !important;
+  -webkit-padding-start: 1.6em;
+}
+
+.ProseMirror ol > li {
+  display: list-item !important;
+  list-style-type: decimal !important;
+}
+
+/* 确保嵌套有序列表仅影响自己的直接列表项。 */
+.ProseMirror ol > li > ol > li {
+  list-style-type: lower-alpha !important;
+}
+
+.ProseMirror ol > li > ol > li > ol > li {
+  list-style-type: lower-roman !important;
+}
+
+.ProseMirror li:not([data-type="taskItem"]) {
+  margin: var(--pm-li-margin, 0.35rem) 0;
+  color: var(--pm-text);
+  display: list-item;
+}
+
+/* 浠诲姟椤瑰崟鐙簲鐢ㄦ牱寮忥紝涓嶄娇鐢?list-item锛岄伩鍏嶄笌 flex 甯冨眬鍐茬獊 */
+.ProseMirror li[data-type="taskItem"] {
+  margin: var(--pm-li-margin, 0.35rem) 0;
+  color: var(--pm-text);
+}
+
+.ProseMirror li p {
+  margin: 0;
+}
+
+.ProseMirror blockquote {
+  border-left: 3px solid var(--pm-blockquote-border);
+  padding-left: 1rem;
+  margin: 1rem 0;
+  color: var(--pm-blockquote-text);
+  font-style: italic;
+}
+
+.ProseMirror code {
+  background: var(--pm-code-bg);
+  color: var(--pm-code-text);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Source Code Pro', 'Menlo', 'Consolas', 'Courier New', monospace;
+  font-size: 0.85em;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+
+/* ===== 鏌ユ壘/鏇挎崲 瑁呴グ楂樹寒 =====
+ * 鐢?SearchReplacePanel 鐨?ProseMirror 瑁呴グ鎻掍欢闄勫姞锛?
+ *   .search-match         鈥斺€?鎵€鏈夊懡涓?
+ *   .search-match-active  鈥斺€?褰撳墠閫変腑鐨勫懡涓紙鏇撮矞鏄庯級
+ * 鐢ㄦ祬榛勫簳 + 鍦嗚锛岄伩寮€ light/dark 閮戒笉鍒虹溂銆?*/
+.ProseMirror .search-match {
+  background-color: rgba(250, 204, 21, 0.45); /* yellow-400 / 45% */
+  border-radius: 2px;
+}
+.ProseMirror .search-match-active {
+  background-color: rgba(249, 115, 22, 0.65); /* orange-500 / 65% */
+  outline: 1px solid rgba(234, 88, 12, 0.85);
+  border-radius: 2px;
+}
+.dark .ProseMirror .search-match {
+  background-color: rgba(202, 138, 4, 0.55);
+}
+.dark .ProseMirror .search-match-active {
+  background-color: rgba(234, 88, 12, 0.8);
+  outline-color: rgba(251, 146, 60, 0.95);
+}
+
+/* ===== Code Block锛堣嚜瀹氫箟 NodeView锛氬伐鍏锋爮 + 璇硶楂樹寒锛?=====
+ * 涓婚閫氳繃鏍?<html data-code-theme="..."> 鍒囨崲锛屼互涓嬫槸榛樿鍙橀噺锛圙itHub Dark锛夈€?
+ * 鍒嗕韩椤典娇鐢ㄧ浉鍚岀殑鍙橀噺浣撶郴锛?shared-note-content锛夈€?
+ */
+:root {
+  --code-bg: #0d1117;
+  --code-fg: #c9d1d9;
+  --code-toolbar-bg: #161b22;
+  --code-border: #30363d;
+  --code-muted: #8b949e;
+  --code-muted-strong: #e6edf3;
+  --code-selection: rgba(56, 139, 253, 0.4);
+  --code-hover-bg: #21262d;
+  --code-popup-bg: #161b22;
+  --code-popup-input-bg: #0d1117;
+  --code-popup-placeholder: #6e7681;
+  --code-popup-active-bg: rgba(31, 111, 235, 0.2);
+  --code-popup-active-fg: #58a6ff;
+  --code-copy-success-fg: #3fb950;
+  --code-copy-success-bg: rgba(35, 134, 54, 0.1);
+
+  /* 璇硶 token 棰滆壊 */
+  --hl-comment: #8b949e;
+  --hl-keyword: #ff7b72;
+  --hl-string: #a5d6ff;
+  --hl-number: #79c0ff;
+  --hl-title: #d2a8ff;
+  --hl-built-in: #ffa657;
+  --hl-attr: #7ee787;
+  --hl-symbol: #79c0ff;
+  --hl-deletion-fg: #ffa198;
+  --hl-deletion-bg: rgba(248, 81, 73, 0.15);
+  --hl-addition-fg: #7ee787;
+  --hl-addition-bg: rgba(46, 160, 67, 0.15);
+  --hl-params: #c9d1d9;
+  --hl-meta: #8b949e;
+}
+
+/* --- 涓婚锛欸itHub Light --- */
+html[data-code-theme="github-light"] {
+  --code-bg: #f6f8fa;
+  --code-fg: #24292f;
+  --code-toolbar-bg: #eaeef2;
+  --code-border: #d0d7de;
+  --code-muted: #57606a;
+  --code-muted-strong: #24292f;
+  --code-selection: rgba(9, 105, 218, 0.2);
+  --code-hover-bg: #d0d7de;
+  --code-popup-bg: #ffffff;
+  --code-popup-input-bg: #f6f8fa;
+  --code-popup-placeholder: #8c959f;
+  --code-popup-active-bg: rgba(9, 105, 218, 0.12);
+  --code-popup-active-fg: #0969da;
+  --code-copy-success-fg: #1a7f37;
+  --code-copy-success-bg: rgba(26, 127, 55, 0.1);
+
+  --hl-comment: #6e7781;
+  --hl-keyword: #cf222e;
+  --hl-string: #0a3069;
+  --hl-number: #0550ae;
+  --hl-title: #8250df;
+  --hl-built-in: #953800;
+  --hl-attr: #116329;
+  --hl-symbol: #0550ae;
+  --hl-deletion-fg: #82071e;
+  --hl-deletion-bg: rgba(255, 129, 130, 0.2);
+  --hl-addition-fg: #116329;
+  --hl-addition-bg: rgba(46, 160, 67, 0.15);
+  --hl-params: #24292f;
+  --hl-meta: #6e7781;
+}
+
+/* --- 涓婚锛歄ne Dark锛圓tom锛?--- */
+html[data-code-theme="one-dark"] {
+  --code-bg: #282c34;
+  --code-fg: #abb2bf;
+  --code-toolbar-bg: #21252b;
+  --code-border: #3e4451;
+  --code-muted: #7f848e;
+  --code-muted-strong: #d7dae0;
+  --code-selection: rgba(82, 139, 255, 0.4);
+  --code-hover-bg: #3e4451;
+  --code-popup-bg: #21252b;
+  --code-popup-input-bg: #282c34;
+  --code-popup-placeholder: #5c6370;
+  --code-popup-active-bg: rgba(82, 139, 255, 0.2);
+  --code-popup-active-fg: #61afef;
+  --code-copy-success-fg: #98c379;
+  --code-copy-success-bg: rgba(152, 195, 121, 0.12);
+
+  --hl-comment: #5c6370;
+  --hl-keyword: #c678dd;
+  --hl-string: #98c379;
+  --hl-number: #d19a66;
+  --hl-title: #61afef;
+  --hl-built-in: #e5c07b;
+  --hl-attr: #d19a66;
+  --hl-symbol: #56b6c2;
+  --hl-deletion-fg: #e06c75;
+  --hl-deletion-bg: rgba(224, 108, 117, 0.15);
+  --hl-addition-fg: #98c379;
+  --hl-addition-bg: rgba(152, 195, 121, 0.15);
+  --hl-params: #abb2bf;
+  --hl-meta: #7f848e;
+}
+
+/* --- 涓婚锛欴racula --- */
+html[data-code-theme="dracula"] {
+  --code-bg: #282a36;
+  --code-fg: #f8f8f2;
+  --code-toolbar-bg: #21222c;
+  --code-border: #44475a;
+  --code-muted: #6272a4;
+  --code-muted-strong: #f8f8f2;
+  --code-selection: rgba(189, 147, 249, 0.35);
+  --code-hover-bg: #44475a;
+  --code-popup-bg: #21222c;
+  --code-popup-input-bg: #282a36;
+  --code-popup-placeholder: #6272a4;
+  --code-popup-active-bg: rgba(189, 147, 249, 0.2);
+  --code-popup-active-fg: #bd93f9;
+  --code-copy-success-fg: #50fa7b;
+  --code-copy-success-bg: rgba(80, 250, 123, 0.1);
+
+  --hl-comment: #6272a4;
+  --hl-keyword: #ff79c6;
+  --hl-string: #f1fa8c;
+  --hl-number: #bd93f9;
+  --hl-title: #50fa7b;
+  --hl-built-in: #8be9fd;
+  --hl-attr: #50fa7b;
+  --hl-symbol: #bd93f9;
+  --hl-deletion-fg: #ff5555;
+  --hl-deletion-bg: rgba(255, 85, 85, 0.15);
+  --hl-addition-fg: #50fa7b;
+  --hl-addition-bg: rgba(80, 250, 123, 0.15);
+  --hl-params: #ffb86c;
+  --hl-meta: #6272a4;
+}
+
+/* --- 涓婚锛歁onokai --- */
+html[data-code-theme="monokai"] {
+  --code-bg: #272822;
+  --code-fg: #f8f8f2;
+  --code-toolbar-bg: #1e1f1a;
+  --code-border: #3e3d32;
+  --code-muted: #75715e;
+  --code-muted-strong: #f8f8f2;
+  --code-selection: rgba(73, 72, 62, 0.8);
+  --code-hover-bg: #3e3d32;
+  --code-popup-bg: #1e1f1a;
+  --code-popup-input-bg: #272822;
+  --code-popup-placeholder: #75715e;
+  --code-popup-active-bg: rgba(166, 226, 46, 0.2);
+  --code-popup-active-fg: #a6e22e;
+  --code-copy-success-fg: #a6e22e;
+  --code-copy-success-bg: rgba(166, 226, 46, 0.1);
+
+  --hl-comment: #75715e;
+  --hl-keyword: #f92672;
+  --hl-string: #e6db74;
+  --hl-number: #ae81ff;
+  --hl-title: #a6e22e;
+  --hl-built-in: #66d9ef;
+  --hl-attr: #a6e22e;
+  --hl-symbol: #ae81ff;
+  --hl-deletion-fg: #f92672;
+  --hl-deletion-bg: rgba(249, 38, 114, 0.15);
+  --hl-addition-fg: #a6e22e;
+  --hl-addition-bg: rgba(166, 226, 46, 0.15);
+  --hl-params: #fd971f;
+  --hl-meta: #75715e;
+}
+
+/* --- 涓婚锛歂ord --- */
+html[data-code-theme="nord"] {
+  --code-bg: #2e3440;
+  --code-fg: #d8dee9;
+  --code-toolbar-bg: #272b35;
+  --code-border: #3b4252;
+  --code-muted: #7b8494;
+  --code-muted-strong: #eceff4;
+  --code-selection: rgba(136, 192, 208, 0.3);
+  --code-hover-bg: #3b4252;
+  --code-popup-bg: #272b35;
+  --code-popup-input-bg: #2e3440;
+  --code-popup-placeholder: #616e88;
+  --code-popup-active-bg: rgba(136, 192, 208, 0.2);
+  --code-popup-active-fg: #88c0d0;
+  --code-copy-success-fg: #a3be8c;
+  --code-copy-success-bg: rgba(163, 190, 140, 0.12);
+
+  --hl-comment: #616e88;
+  --hl-keyword: #81a1c1;
+  --hl-string: #a3be8c;
+  --hl-number: #b48ead;
+  --hl-title: #88c0d0;
+  --hl-built-in: #8fbcbb;
+  --hl-attr: #8fbcbb;
+  --hl-symbol: #b48ead;
+  --hl-deletion-fg: #bf616a;
+  --hl-deletion-bg: rgba(191, 97, 106, 0.15);
+  --hl-addition-fg: #a3be8c;
+  --hl-addition-bg: rgba(163, 190, 140, 0.15);
+  --hl-params: #d8dee9;
+  --hl-meta: #7b8494;
+}
+
+/* --- 涓婚锛歋olarized Light --- */
+html[data-code-theme="solarized-light"] {
+  --code-bg: #fdf6e3;
+  --code-fg: #586e75;
+  --code-toolbar-bg: #eee8d5;
+  --code-border: #d5cdb3;
+  --code-muted: #93a1a1;
+  --code-muted-strong: #073642;
+  --code-selection: rgba(181, 137, 0, 0.2);
+  --code-hover-bg: #d5cdb3;
+  --code-popup-bg: #fdf6e3;
+  --code-popup-input-bg: #eee8d5;
+  --code-popup-placeholder: #93a1a1;
+  --code-popup-active-bg: rgba(38, 139, 210, 0.15);
+  --code-popup-active-fg: #268bd2;
+  --code-copy-success-fg: #859900;
+  --code-copy-success-bg: rgba(133, 153, 0, 0.1);
+
+  --hl-comment: #93a1a1;
+  --hl-keyword: #859900;
+  --hl-string: #2aa198;
+  --hl-number: #d33682;
+  --hl-title: #268bd2;
+  --hl-built-in: #b58900;
+  --hl-attr: #cb4b16;
+  --hl-symbol: #d33682;
+  --hl-deletion-fg: #dc322f;
+  --hl-deletion-bg: rgba(220, 50, 47, 0.1);
+  --hl-addition-fg: #859900;
+  --hl-addition-bg: rgba(133, 153, 0, 0.1);
+  --hl-params: #586e75;
+  --hl-meta: #93a1a1;
+}
+
+.ProseMirror .code-block-wrapper {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Source Code Pro', 'Menlo', 'Consolas', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.65;
+  background: var(--code-bg) !important;
+  border-color: var(--code-border) !important;
+}
+
+/* 浠ｇ爜鍖哄澹?*/
+.ProseMirror .code-block-pre {
+  margin: 0 !important;
+  padding: 14px 16px !important;
+  background: var(--code-bg) !important;
+  border: none !important;
+  border-radius: 0 !important;
+  overflow-x: auto;
+}
+
+/* 浠ｇ爜鍐呭 */
+.ProseMirror .code-block-content {
+  display: block;
+  color: var(--code-fg) !important;
+  background: transparent !important;
+  padding: 0 !important;
+  font-family: inherit !important;
+  font-size: 13px !important;
+  line-height: 1.65 !important;
+  white-space: pre !important;
+  tab-size: 4;
+  -moz-tab-size: 4;
+}
+
+/* 浠ｇ爜鍧楀唴閫変腑鑹?*/
+.ProseMirror .code-block-content::selection,
+.ProseMirror .code-block-content *::selection {
+  background: var(--code-selection) !important;
+  color: inherit !important;
+}
+
+/* 宸ュ叿鏍?& 閫夋嫨鍣紙閰嶅悎 CodeBlockView 鐨勮涔?class锛?*/
+.ProseMirror .code-block-toolbar {
+  background: var(--code-toolbar-bg);
+  border-color: var(--code-border) !important;
+}
+
+.ProseMirror .code-block-tool-btn {
+  color: var(--code-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.ProseMirror .code-block-tool-btn:hover {
+  color: var(--code-muted-strong);
+  background: var(--code-hover-bg);
+}
+.ProseMirror .code-block-tool-btn.is-copied {
+  color: var(--code-copy-success-fg);
+  background: var(--code-copy-success-bg);
+}
+
+/* 涓嬫媺闈㈡澘锛堣瑷€/涓婚閫夋嫨鍣級鈥?浣跨敤涓嶅甫 .ProseMirror 鍓嶇紑鐨勯€夋嫨鍣紝
+ * 浠ヤ究 Portal 娓叉煋鍒?<body> 涓嬫椂浠嶈兘鍛戒腑鏍峰紡锛堥伩鍏嶉€忚/鏃犺儗鏅級銆?*/
+.code-block-popup {
+  background: var(--code-popup-bg, #161b22);
+  border-color: var(--code-border, #30363d);
+  color: var(--code-muted-strong, #e6edf3);
+  /* 缁欎竴涓厹搴曠殑瀹炲績鑳屾櫙锛岄槻姝㈡瀬绔儏鍐典笅 CSS 鍙橀噺鏈敞鍏ユ椂鐪嬭捣鏉ラ€忔槑 */
+  background-color: var(--code-popup-bg, #161b22);
+}
+.code-block-popup-title {
+  color: var(--code-muted, #8b949e);
+  border-color: var(--code-border, #30363d) !important;
+}
+.code-block-popup-input {
+  background: var(--code-popup-input-bg, #0d1117);
+  border-color: var(--code-border, #30363d) !important;
+  color: var(--code-muted-strong, #e6edf3);
+}
+.code-block-popup-input::placeholder {
+  color: var(--code-popup-placeholder, #6e7681);
+}
+.code-block-popup-empty {
+  color: var(--code-popup-placeholder, #6e7681);
+}
+.code-block-popup-item {
+  color: var(--code-fg, #c9d1d9);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.code-block-popup-item:hover {
+  background: var(--code-hover-bg, #21262d);
+}
+.code-block-popup-item.is-active {
+  background: var(--code-popup-active-bg, rgba(31, 111, 235, 0.2));
+  color: var(--code-popup-active-fg, #58a6ff);
+}
+
+.ProseMirror .code-block-wrapper {
+  transition: box-shadow 0.2s ease;
+}
+
+.ProseMirror .code-block-wrapper:hover {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+
+.dark .ProseMirror .code-block-wrapper:hover {
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.3);
+}
+
+/* 鍏煎鏃х殑 pre/code锛堥潪 NodeView 娓叉煋鏃剁殑闄嶇骇鏍峰紡锛?*/
+.ProseMirror pre:not(.code-block-pre) {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 1rem 0;
+  overflow-x: auto;
+  color: var(--code-fg);
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Source Code Pro', 'Menlo', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.ProseMirror pre:not(.code-block-pre) code {
+  background: none;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
+}
+
+.ProseMirror hr {
+  border: none;
+  border-top: 1px solid var(--pm-hr);
+  margin: 1.5rem 0;
+}
+
+/* ===== Table 琛ㄦ牸锛堝弬鑰冧负鐭ョ瑪璁帮細鎸夊唴瀹硅嚜閫傚簲瀹藉害锛屾敮鎸佸垪瀹芥嫋鎷斤級 ===== */
+.ProseMirror .tableWrapper {
+  overflow-x: auto;
+  margin: 1rem 0;
+  padding: 2px 0;
+}
+
+.ProseMirror table {
+  border-collapse: collapse;
+  margin: 0;
+  width: auto;
+  max-width: none;
+  table-layout: fixed;
+  border-radius: 6px;
+  border: 1px solid var(--color-border);
+}
+
+/* 鍒楀鎷栨嫿鎵嬫焺 */
+.ProseMirror .column-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: -2px;
+  width: 4px;
+  background-color: var(--color-accent-primary, #3b82f6);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 20;
+}
+
+.ProseMirror table:hover .column-resize-handle,
+.ProseMirror.resize-cursor .column-resize-handle {
+  opacity: 0.6;
+}
+
+.ProseMirror.resize-cursor {
+  cursor: col-resize;
+}
+
+/* 琛岄珮鎷栨嫿鎵嬫焺锛堣嚜鐮?TableRowResizable 鎵╁睍浣跨敤锛?
+ * 鍗曚緥 DOM锛宧over 鍦?<tr> 搴曡竟 卤5px 鏃剁敱 plugin 鍔ㄦ€佸畾浣?+ 鏄剧ず銆?
+ * 璁捐鍚?column-resize-handle锛氶€忔槑鐑尯 + 涓€鏉?2px 钃濊壊妯嚎銆?
+ */
+.tiptap-row-resize-handle {
+  /* 閫忔槑鐑尯锛屾墿灞曟€ф洿濂斤紱閫氳繃 ::before 鐢诲彲瑙佺殑妯嚎 */
+  background: transparent !important;
+}
+.tiptap-row-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 2px;
+  background-color: var(--color-accent-primary, #3b82f6);
+  opacity: 0.6;
+  pointer-events: none;
+}
+.tiptap-row-resize-handle:hover::before {
+  opacity: 1;
+  height: 3px;
+}
+
+/* ===== 闃呰瀵嗗害锛坮eading density锛?====
+ * 鐢?useUserPreferences.readingDensity 鎺у埗锛氶粯璁?cozy锛堜笉闇€浠讳綍 class锛屼娇鐢ㄤ笂鏂?
+ * 鍚勮鍒欎腑 var(...) 鐨?fallback 鍊硷紝淇濇寔鍘嗗彶瑙傛劅锛夛紱鐢ㄦ埛鍒囧埌绱у噾妯″紡鏃剁敱
+ * Provider 缁?<body> 鍔?.density-compact锛岃繖閲岀敤 CSS 鍙橀噺瑕嗙洊娈佃惤 / 鍒楄〃椤圭殑
+ * 绾靛悜闂磋窛涓庤楂橈紝绾靛悜绌洪棿绾﹀彲鐪?30-40%銆?
+ *
+ * 鍙姩 p / li 鏄湁鎰忎负涔嬶細鏍囬銆佷唬鐮佸潡銆佽〃鏍肩殑杈硅窛鏋勬垚瑙嗚閿氱偣锛屾敼浜嗗弽鑰屾樉寰椾贡銆?
+ */
+body.density-compact {
+  --pm-p-margin: 0;
+  --pm-p-line-height: 1.5;
+  --pm-li-margin: 0.2rem;
+}
+
+/* ===== 缂╄繘绾у埆 =====
+ * 浣跨敤 margin-left锛堣€岄潪 padding-left锛夐伩鍏嶄笌鍒楄〃鑷韩鐨?padding-left 鍐茬獊锛?
+ * 淇濊瘉 bullet / ordered / task list / codeBlock / blockquote / table 绛?
+ * 閮借兘閫氳繃 data-indent 鐙珛鍙犲姞缂╄繘銆?
+ */
+.ProseMirror [data-indent="1"] { margin-left: 2rem !important; }
+.ProseMirror [data-indent="2"] { margin-left: 4rem !important; }
+.ProseMirror [data-indent="3"] { margin-left: 6rem !important; }
+.ProseMirror [data-indent="4"] { margin-left: 8rem !important; }
+.ProseMirror [data-indent="5"] { margin-left: 10rem !important; }
+.ProseMirror [data-indent="6"] { margin-left: 12rem !important; }
+.ProseMirror [data-indent="7"] { margin-left: 14rem !important; }
+.ProseMirror [data-indent="8"] { margin-left: 16rem !important; }
+
+/* 分享页复用编辑器的块级缩进契约。data-indent 只接受 1-8，
+ * 写入端和渲染端均通过 normalizeIndentValue 归一化。 */
+.shared-note-content [data-indent="1"] { margin-left: 2rem !important; }
+.shared-note-content [data-indent="2"] { margin-left: 4rem !important; }
+.shared-note-content [data-indent="3"] { margin-left: 6rem !important; }
+.shared-note-content [data-indent="4"] { margin-left: 8rem !important; }
+.shared-note-content [data-indent="5"] { margin-left: 10rem !important; }
+.shared-note-content [data-indent="6"] { margin-left: 12rem !important; }
+.shared-note-content [data-indent="7"] { margin-left: 14rem !important; }
+.shared-note-content [data-indent="8"] { margin-left: 16rem !important; }
+
+.ProseMirror th,
+.ProseMirror td {
+  position: relative;
+  box-sizing: border-box;
+  border: 1px solid var(--color-border);
+  padding: 0.5rem 0.75rem;
+  text-align: center;
+  vertical-align: middle;
+  min-width: 60px;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+.ProseMirror th {
+  background: var(--color-elevated);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.ProseMirror td {
+  color: var(--color-text-secondary);
+}
+
+.ProseMirror tr:nth-child(even) td {
+  background: var(--color-hover);
+}
+
+/* 琛ㄦ牸閫変腑鐘舵€侊紙Tiptap table 鎵╁睍锛?*/
+.ProseMirror .selectedCell {
+  background: rgba(var(--color-accent-primary-rgb, 59, 130, 246), 0.1);
+}
+
+.ProseMirror img {
+  max-width: 100%;
+  border-radius: 8px;
+  /* 涓婁笅 margin 鏀剁揣锛岄伩鍏嶅浘鐗囧潡涓庢鏂囦箣闂寸┖鐧借繃澶э紱
+     涓?ResizableImageView wrapper 鐨?margin 淇濇寔涓€鑷淬€?
+     娉細wrapper 鏄?inline-block 涓嶄笌澶栧眰 <p> 鐨?margin 鎶樺彔锛?
+     鎵€浠ユ澶勫彇灏忓€硷紝璁╁彔鍔犲悗鐨勮瑙夐棿璺濊惤鍦?~14px銆?*/
+  margin: 0.25rem auto;
+  display: block;
+  cursor: zoom-in;
+  /*
+   * 澶栬竟妗嗭細鐢?outline 鑰屼笉鏄?border锛屽師鍥狅細
+   *   1) outline 涓嶅弬涓庣洅妯″瀷灏哄璁＄畻锛屼笉浼氳鍥剧墖"鍙樼獎涓€鐐?锛?
+   *   2) 涓嶅彈 Tailwind preflight 鍜?prose 涓婚瀵?img 鐨?border 璁剧疆褰卞搷锛?
+   *   3) 涔熶笉浼氬拰 ResizableImageView wrapper 鐨勯€変腑鎬?outline 鍐茬獊
+   *      锛堥€変腑鎬?outline 鍦?wrapper 涓婏紝杩欓噷鍦?img 涓婏紝灞傛涓嶅悓锛夈€?
+   * 鐢?!important 鏄负浜嗗帇杩?prose / preflight 鐨勬綔鍦ㄨ鐩栥€?
+   */
+  outline: 1px solid rgba(0, 0, 0, 0.18) !important;
+  outline-offset: 0;
+  transition: box-shadow 0.2s ease, outline-color 0.2s ease;
+}
+
+.ProseMirror img:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  outline-color: rgba(0, 0, 0, 0.32) !important;
+}
+
+/* 鏆楄壊妯″紡涓嬩娇鐢ㄦ洿鏌斿拰鐨勮竟妗嗚壊锛岄伩鍏嶅湪娣辫壊鑳屾櫙涓嬪お鍒虹溂 */
+.dark .ProseMirror img {
+  outline-color: rgba(255, 255, 255, 0.22) !important;
+}
+.dark .ProseMirror img:hover {
+  outline-color: rgba(255, 255, 255, 0.4) !important;
+}
+
+/*
+ * ResizableImageView 鐨勫灞?wrapper锛?
+ *   - 杩欓噷鍐嶈ˉ涓€灞?box-shadow 褰㈠紡鐨?杈规"锛屼綔涓?wrapper 绾у埆鐨勫厹搴曘€?
+ *   - 鐢?inset box-shadow 鑰屼笉鏄?border锛岄伩鍏嶅奖鍝?wrapper 鐨勫疄闄呭昂瀵?/ 鎵嬫焺瀹氫綅銆?
+ *   - 閫変腑鎬佺敱缁勪欢 inline 鍐欑殑 outline 澶勭悊锛屼簰涓嶅啿绐併€?
+ */
+.ProseMirror .resizable-image-wrapper {
+  border-radius: 8px;
+  display: inline-block;
+  vertical-align: middle;
+  margin: 0.25rem 0.375rem;
+}
+.ProseMirror .resizable-image-wrapper + .resizable-image-wrapper {
+  margin-left: 0.5rem;
+}
+
+/* ===== Task List ===== */
+.ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.5rem 0;
+}
+
+/* 宓屽 task list 缂╄繘 */
+.ProseMirror ul[data-type="taskList"] ul[data-type="taskList"] {
+  margin: 0.25rem 0 0.25rem 1.25rem;
+}
+
+/* 寰呭姙椤瑰鍣?- 纭繚澶嶉€夋鍜屾枃瀛楀湪鍚屼竴琛?*/
+.ProseMirror li[data-type="taskItem"],
+.ProseMirror ul[data-type="taskList"] > li {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  align-items: center !important; /* 鍨傜洿灞呬腑瀵归綈锛屼娇澶嶉€夋涓庡崟琛屾枃瀛楁按骞冲眳涓?*/
+  gap: 0.5rem;
+  margin: 0.375rem 0;
+  border-radius: 6px;
+  padding: 2px 4px;
+  transition: background-color 0.15s ease;
+  list-style: none !important;
+}
+
+/* 纭繚浠诲姟椤瑰唴閮ㄦ钀戒笉浜х敓棰濆鎹㈣ */
+.ProseMirror li[data-type="taskItem"] > div > p {
+  margin: 0 !important;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.ProseMirror li[data-type="taskItem"]:hover {
+  background-color: var(--color-hover);
+}
+
+/* Checkbox label 瀹瑰櫒 鈥斺€?寮哄埗 inline-flex锛岄伩鍏嶈 UA / tailwind preflight 缃负 block 瀵艰嚧鎹㈣ */
+.ProseMirror li[data-type="taskItem"] > label {
+  display: inline-flex !important;
+  flex: 0 0 auto !important; /* 涓嶅弬涓庝几缂╋紝鍗犺嚜韬搴?*/
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+}
+
+/* 鏂囨湰鑺傜偣 wrapper 鈥斺€?鍗犳嵁鍓╀綑绌洪棿浣嗕笉鎹㈠埌涓嬩竴琛?*/
+.ProseMirror li[data-type="taskItem"] > div {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  display: block !important;
+  line-height: 1.6;
+}
+
+/* ===== 鑷畾涔?Checkbox 鏍稿績鏍峰紡 ===== */
+.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: 2px solid var(--task-checkbox-border);
+  background: var(--task-checkbox-bg);
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* Hover 鏁堟灉 - 鏀惧ぇ + 杈规鍙樿壊 */
+.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"]:hover {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+  transform: scale(1.1);
+}
+
+/* 閫変腑鎬?- 涓婚鑹茶儗鏅?+ 鐧借壊瀵瑰嬀 */
+.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"]:checked {
+  background: #6366f1;
+  border-color: #6366f1;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12.207 4.793a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0l-2-2a1 1 0 011.414-1.414L6.5 9.086l4.293-4.293a1 1 0 011.414 0z'/%3E%3C/svg%3E");
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"]:checked:hover {
+  background: #4f46e5;
+  border-color: #4f46e5;
+}
+
+/* 鏂囨湰鍐呭鍖猴紙淇濈暀杩囨浮/outline锛屽竷灞€鐢变笂闈㈢殑 > div 瑙勫垯涓诲锛?*/
+.ProseMirror li[data-type="taskItem"] > div {
+  transition: all 0.2s ease;
+  outline: none;
+}
+
+/* 宸插畬鎴愭€侊細鏂囧瓧鍙樼伆 + 鍒犻櫎绾?*/
+.ProseMirror li[data-type="taskItem"][data-checked="true"] > div > p {
+  text-decoration: line-through;
+  text-decoration-color: var(--task-done-strike);
+  color: var(--pm-task-done);
+  transition: color 0.2s ease, text-decoration-color 0.2s ease;
+}
+
+/* ===== Task Checkbox 鑹插僵鍙橀噺 ===== */
+:root {
+  --task-checkbox-border: #d1d5db;
+  --task-checkbox-bg: #ffffff;
+  --task-done-strike: #d1d5db;
+}
+
+.dark {
+  --task-checkbox-border: #52525b;
+  --task-checkbox-bg: #27272a;
+  --task-done-strike: #52525b;
+}
+
+/* ===== highlight.js 璇硶楂樹寒閰嶈壊锛堥€氳繃 CSS 鍙橀噺鏀寔澶氫富棰橈級 =====
+ * 鍚屾椂瑕嗙洊缂栬緫鍣ㄥ唴浠ｇ爜鍧椼€侀檷绾?pre锛屼互鍙婂垎浜〉 .shared-note-content 鍐呯殑浠ｇ爜鍧椼€?
+ */
+.ProseMirror .code-block-content .hljs-comment,
+.ProseMirror .code-block-content .hljs-quote,
+.ProseMirror pre .hljs-comment,
+.ProseMirror pre .hljs-quote,
+.shared-note-content .shared-code-content .hljs-comment,
+.shared-note-content .shared-code-content .hljs-quote {
+  color: var(--hl-comment);
+  font-style: italic;
+}
+.ProseMirror .code-block-content .hljs-keyword,
+.ProseMirror .code-block-content .hljs-selector-tag,
+.ProseMirror .code-block-content .hljs-literal,
+.ProseMirror .code-block-content .hljs-doctag,
+.ProseMirror .code-block-content .hljs-subst,
+.ProseMirror pre .hljs-keyword,
+.ProseMirror pre .hljs-selector-tag,
+.shared-note-content .shared-code-content .hljs-keyword,
+.shared-note-content .shared-code-content .hljs-selector-tag,
+.shared-note-content .shared-code-content .hljs-literal,
+.shared-note-content .shared-code-content .hljs-doctag,
+.shared-note-content .shared-code-content .hljs-subst {
+  color: var(--hl-keyword);
+}
+.ProseMirror .code-block-content .hljs-string,
+.ProseMirror .code-block-content .hljs-meta .hljs-string,
+.ProseMirror .code-block-content .hljs-regexp,
+.ProseMirror pre .hljs-string,
+.shared-note-content .shared-code-content .hljs-string,
+.shared-note-content .shared-code-content .hljs-regexp {
+  color: var(--hl-string);
+}
+.ProseMirror .code-block-content .hljs-number,
+.ProseMirror .code-block-content .hljs-variable,
+.ProseMirror .code-block-content .hljs-template-variable,
+.ProseMirror .code-block-content .hljs-tag .hljs-attr,
+.ProseMirror pre .hljs-number,
+.shared-note-content .shared-code-content .hljs-number,
+.shared-note-content .shared-code-content .hljs-variable,
+.shared-note-content .shared-code-content .hljs-template-variable {
+  color: var(--hl-number);
+}
+.ProseMirror .code-block-content .hljs-title,
+.ProseMirror .code-block-content .hljs-title.function_,
+.ProseMirror .code-block-content .hljs-function .hljs-title,
+.ProseMirror .code-block-content .hljs-section,
+.ProseMirror pre .hljs-title,
+.ProseMirror pre .hljs-function,
+.shared-note-content .shared-code-content .hljs-title,
+.shared-note-content .shared-code-content .hljs-section {
+  color: var(--hl-title);
+  font-weight: 500;
+}
+.ProseMirror .code-block-content .hljs-built_in,
+.ProseMirror .code-block-content .hljs-builtin-name,
+.ProseMirror .code-block-content .hljs-type,
+.ProseMirror pre .hljs-built_in,
+.shared-note-content .shared-code-content .hljs-built_in,
+.shared-note-content .shared-code-content .hljs-builtin-name,
+.shared-note-content .shared-code-content .hljs-type {
+  color: var(--hl-built-in);
+}
+.ProseMirror .code-block-content .hljs-attr,
+.ProseMirror .code-block-content .hljs-attribute,
+.ProseMirror .code-block-content .hljs-name,
+.ProseMirror pre .hljs-attr,
+.shared-note-content .shared-code-content .hljs-attr,
+.shared-note-content .shared-code-content .hljs-attribute,
+.shared-note-content .shared-code-content .hljs-name {
+  color: var(--hl-attr);
+}
+.ProseMirror .code-block-content .hljs-symbol,
+.ProseMirror .code-block-content .hljs-bullet,
+.ProseMirror .code-block-content .hljs-link,
+.ProseMirror .code-block-content .hljs-selector-class,
+.ProseMirror .code-block-content .hljs-selector-id,
+.shared-note-content .shared-code-content .hljs-symbol,
+.shared-note-content .shared-code-content .hljs-bullet,
+.shared-note-content .shared-code-content .hljs-link {
+  color: var(--hl-symbol);
+}
+.ProseMirror .code-block-content .hljs-emphasis,
+.shared-note-content .shared-code-content .hljs-emphasis { font-style: italic; }
+.ProseMirror .code-block-content .hljs-strong,
+.shared-note-content .shared-code-content .hljs-strong { font-weight: 700; }
+.ProseMirror .code-block-content .hljs-deletion,
+.shared-note-content .shared-code-content .hljs-deletion {
+  color: var(--hl-deletion-fg);
+  background-color: var(--hl-deletion-bg);
+}
+.ProseMirror .code-block-content .hljs-addition,
+.shared-note-content .shared-code-content .hljs-addition {
+  color: var(--hl-addition-fg);
+  background-color: var(--hl-addition-bg);
+}
+.ProseMirror .code-block-content .hljs-params,
+.shared-note-content .shared-code-content .hljs-params { color: var(--hl-params); }
+.ProseMirror .code-block-content .hljs-meta,
+.shared-note-content .shared-code-content .hljs-meta { color: var(--hl-meta); }
+
+/* 娓呯悊鏃х増绠€鏄?hljs 鑹诧紙琚鐩栵紝浣嗕繚鐣欓伩鍏嶅奖鍝嶅叾浠栦綅缃級 */
+
+/* Highlight mark */
+.highlight-mark {
+  background: rgba(250, 204, 21, 0.3);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* Search result keyword highlight in note list cards */
+.search-result-highlight {
+  background: rgba(250, 204, 21, 0.35);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.dark .search-result-highlight {
+  background: rgba(250, 204, 21, 0.25);
+}
+.search-result-html mark,
+.note-card-title mark,
+.note-card-preview mark {
+  background: rgba(250, 204, 21, 0.35);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pm-scrollbar);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pm-scrollbar-hover);
+}
+
+/* Selection */
+::selection {
+  background: var(--pm-selection);
+}
+
+/* ===== Hide scrollbar (mobile toolbar) ===== */
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.editor-toolbar-scroll-fade {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 18px, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 18px, #000 calc(100% - 18px), transparent);
+}
+
+@media (min-width: 768px) {
+  .editor-toolbar-scroll-fade {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+/* 闅愯棌婊氬姩鏉′絾淇濈暀婊氬姩鍔熻兘 */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Context menu open animation */
+@keyframes contextMenuIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* ===== 绉诲姩绔?Android 閫傞厤 ===== */
+
+/* 纭繚 Tailwind 鐨?max-md:!w-full 鍦?< 768px 鏃惰鐩?inline style */
+@media (max-width: 767px) {
+  .max-md\:\!w-full {
+    width: 100% !important;
+  }
+}
+
+/* 绉诲姩绔Е鎺т紭鍖?*/
+@media (max-width: 767px) {
+  /* 澧炲ぇ鍙Е鎺у厓绱犵殑鏈€灏忓昂瀵革紙鎺掗櫎缂栬緫鍣ㄥ唴閮ㄥ厓绱犲拰鏍囩杈撳叆鍖哄煙鍐呯殑灏忔寜閽級 */
+  button:not(.ProseMirror *):not(.ProseMirror ~ * button):not(.tag-input-area *),
+  [role="button"]:not(.ProseMirror *):not(.tag-input-area *),
+  a:not(.ProseMirror *):not(.tag-input-area *) {
+    min-height: 36px;
+    min-width: 36px;
+  }
+
+  /* 纭繚缂栬緫鍣ㄥ唴浠诲姟鍒楄〃 checkbox 涓嶅彈绉诲姩绔渶灏忓昂瀵稿奖鍝?*/
+  .ProseMirror li[data-type="taskItem"] > label {
+    min-height: auto;
+    min-width: auto;
+  }
+
+  .ProseMirror li[data-type="taskItem"] > label input[type="checkbox"] {
+    min-height: auto;
+    min-width: auto;
+  }
+
+  /* 绉诲姩绔己鍒舵湁搴忓垪琛ㄦ樉绀烘暟瀛楃紪鍙?*/
+  .ProseMirror ol {
+    list-style-type: decimal !important;
+    -webkit-padding-start: 1.5rem;
+    padding-inline-start: 1.5rem;
+  }
+
+  .ProseMirror ol > li {
+    display: list-item !important;
+    list-style-type: decimal !important;
+  }
+
+  /* 绉诲姩绔换鍔″垪琛ㄧ‘淇濆悓琛屾樉绀?*/
+  .ProseMirror li[data-type="taskItem"] {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+  }
+
+  /* 缂栬緫鍣ㄥ伐鍏锋爮鍦ㄧЩ鍔ㄧ涓嶆崲琛岋紝鍏佽妯悜婊氬姩 */
+  .hide-scrollbar {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* 缂栬緫鍣ㄥ唴瀹瑰尯鍩熺Щ鍔ㄧ鍑忓皯姘村钩 padding */
+  .ProseMirror {
+    min-height: 200px;
+    /* 绉诲姩绔敭鐩?娴姩宸ュ叿鏍忓凡鐢辨粴鍔ㄥ鍣ㄥ唴鑱?padding 澶勭悊锛岃繖閲岀粰灏戦噺棰濆搴曢儴绌洪棿 */
+    padding-bottom: 25vh;
+  }
+}
+
+/* ===== 鍒嗕韩椤甸€氱敤鎺掔増锛堜笉渚濊禆 @tailwindcss/typography锛岃嚜缁欒嚜瓒筹級 =====
+ * 鐜扮姸锛歋haredNoteView 瀹瑰櫒铏界劧鍐欎簡 prose / prose-a:* 绛変慨楗扮被锛屼絾椤圭洰骞舵湭鍚敤
+ * @tailwindcss/typography 鎻掍欢锛屽鑷?Tailwind preflight 鎶?p/h1~h3/ul/ol/a 鍏ㄩ儴
+ * 閲嶇疆鍚庢病浜鸿ˉ鍥炲幓鈥斺€旀钀借创鍦ㄤ竴璧枫€佸垪琛ㄦ棤 bullet銆侀摼鎺ョ湅涓嶅嚭鏄摼鎺ャ€?
+ * 杩欓噷缁?.shared-note-content 鑷甫涓€濂楀熀纭€鎺掔増瑙勫垯锛屼繚璇佸垎浜〉鍙涓旈摼鎺ラ啋鐩€?
+ */
+.shared-note-content {
+  color: #3f3f46; /* zinc-700 */
+  line-height: 1.75;
+  font-size: 15px;
+  word-wrap: break-word;
+}
+.dark .shared-note-content {
+  color: #d4d4d8; /* zinc-300 */
+}
+
+/* 娈佃惤 / 閫氱敤鍧楃骇闂磋窛 */
+.shared-note-content p {
+  margin: 0.85em 0;
+}
+.shared-note-content > :first-child {
+  margin-top: 0;
+}
+.shared-note-content > :last-child {
+  margin-bottom: 0;
+}
+
+/* 鏍囬灞傜骇 */
+.shared-note-content h1,
+.shared-note-content h2,
+.shared-note-content h3,
+.shared-note-content h4,
+.shared-note-content h5,
+.shared-note-content h6 {
+  color: #18181b; /* zinc-900 */
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 1.6em 0 0.6em;
+  scroll-margin-top: var(--share-header-offset, 72px);
+}
+.dark .shared-note-content h1,
+.dark .shared-note-content h2,
+.dark .shared-note-content h3,
+.dark .shared-note-content h4,
+.dark .shared-note-content h5,
+.dark .shared-note-content h6 {
+  color: #fafafa; /* zinc-50 */
+}
+.shared-note-content h1 { font-size: 1.7em; }
+.shared-note-content h2 { font-size: 1.4em; }
+.shared-note-content h3 { font-size: 1.2em; }
+.shared-note-content h4 { font-size: 1.05em; }
+.shared-note-content h5 { font-size: 1em; }
+.shared-note-content h6 { font-size: 0.95em; color: #71717a; }
+
+/* 分享页 PC 大纲：跟随页面滚动容器 sticky，内容过长时仅大纲内部滚动。 */
+.shared-note-outline {
+  position: sticky;
+  top: var(--share-header-offset, 72px);
+  max-height: calc(100vh - var(--share-header-offset, 72px) - 24px);
+  overflow: hidden;
+  border: 1px solid rgba(228, 228, 231, 0.9);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(12px);
+}
+.dark .shared-note-outline {
+  border-color: rgba(63, 63, 70, 0.9);
+  background: rgba(24, 24, 27, 0.78);
+}
+.shared-note-outline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(228, 228, 231, 0.9);
+}
+.dark .shared-note-outline-header {
+  border-bottom-color: rgba(63, 63, 70, 0.9);
+}
+.shared-note-outline-collapse,
+.shared-note-outline-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: #71717a;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.shared-note-outline-collapse {
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.shared-note-outline-close {
+  width: 28px;
+  height: 28px;
+}
+.shared-note-outline-collapse:hover,
+.shared-note-outline-close:hover {
+  background: rgba(99, 102, 241, 0.1);
+  color: #4f46e5;
+}
+.dark .shared-note-outline-collapse:hover,
+.dark .shared-note-outline-close:hover {
+  background: rgba(129, 140, 248, 0.14);
+  color: #c7d2fe;
+}
+.shared-note-outline-scroll {
+  max-height: calc(100vh - var(--share-header-offset, 72px) - 64px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.shared-note-outline-item {
+  width: 100%;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-left: 3px solid transparent;
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.shared-note-outline-item:hover {
+  background: rgba(99, 102, 241, 0.08);
+  color: #3730a3;
+}
+.dark .shared-note-outline-item:hover {
+  background: rgba(129, 140, 248, 0.12);
+  color: #c7d2fe;
+}
+.shared-note-outline-item-active {
+  border-left-color: #6366f1;
+  background: rgba(99, 102, 241, 0.12);
+  color: #3730a3;
+}
+.dark .shared-note-outline-item-active {
+  border-left-color: #818cf8;
+  background: rgba(129, 140, 248, 0.18);
+  color: #e0e7ff;
+}
+.shared-note-outline-dot {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.45;
+}
+.shared-note-outline-item-active .shared-note-outline-dot {
+  opacity: 1;
+}
+.shared-note-outline-floating {
+  position: fixed;
+  top: calc(var(--share-header-offset, 72px) + 16px);
+  right: 24px;
+  z-index: 20;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid rgba(228, 228, 231, 0.9);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #4f46e5;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+  backdrop-filter: blur(12px);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.shared-note-outline-floating:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.16);
+}
+.dark .shared-note-outline-floating {
+  border-color: rgba(63, 63, 70, 0.9);
+  background: rgba(24, 24, 27, 0.86);
+  color: #c7d2fe;
+}
+.shared-note-outline-mobile {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(24, 24, 27, 0.45);
+  backdrop-filter: blur(4px);
+}
+.shared-note-outline-mobile-panel {
+  width: min(100%, 420px);
+  max-height: min(72vh, 560px);
+  overflow: hidden;
+  border: 1px solid rgba(228, 228, 231, 0.95);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.24);
+}
+.dark .shared-note-outline-mobile-panel {
+  border-color: rgba(63, 63, 70, 0.95);
+  background: rgba(24, 24, 27, 0.96);
+}
+.shared-note-outline-mobile-scroll {
+  max-height: calc(min(72vh, 560px) - 46px);
+}
+
+/* 閾炬帴锛堜笌缂栬緫鍣ㄨ瑙変繚鎸佷竴鑷达級 */
+.shared-note-content a {
+  color: #4f46e5; /* indigo-600 */
+  text-decoration: underline;
+  text-decoration-color: rgba(79, 70, 229, 0.45);
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+  word-break: break-all;
+  transition: color 0.15s ease, text-decoration-color 0.15s ease;
+}
+.shared-note-content a:hover {
+  color: #4338ca;
+  text-decoration-color: currentColor;
+}
+.dark .shared-note-content a {
+  color: #818cf8;
+  text-decoration-color: rgba(129, 140, 248, 0.5);
+}
+.dark .shared-note-content a:hover {
+  color: #a5b4fc;
+}
+
+/* 鍒楄〃锛氭仮澶嶉」鐩鍙蜂笌缂╄繘 */
+.shared-note-content ul,
+.shared-note-content ol {
+  margin: 0.85em 0;
+  padding-left: 1.6em;
+}
+.shared-note-content ul {
+  list-style: none !important;
+  --nowen-ul-marker: "•";
+  --nowen-ul-marker-size: 1.1em;
+  --nowen-ul-marker-top: 0;
+}
+/* 有序列表层级与编辑器保持一致：1. → a. → i. */
+.shared-note-content ol {
+  list-style-type: decimal !important;
+}
+.shared-note-content ol > li {
+  display: list-item !important;
+  list-style-type: decimal !important;
+}
+.shared-note-content ol > li > ol > li {
+  list-style-type: lower-alpha !important;
+}
+.shared-note-content ol > li > ol > li > ol > li {
+  list-style-type: lower-roman !important;
+}
+.shared-note-content ul ul { --nowen-ul-marker: "◦"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.shared-note-content ul ul ul { --nowen-ul-marker: "▪"; --nowen-ul-marker-size: 1.2em; --nowen-ul-marker-top: -0.05em; }
+.shared-note-content ul ul ul ul { --nowen-ul-marker: "•"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.shared-note-content ul ul ul ul ul { --nowen-ul-marker: "◦"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.shared-note-content ul ul ul ul ul ul { --nowen-ul-marker: "▪"; --nowen-ul-marker-size: 1.2em; --nowen-ul-marker-top: -0.05em; }
+.shared-note-content ul ul ul ul ul ul ul { --nowen-ul-marker: "•"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.shared-note-content ul ul ul ul ul ul ul ul { --nowen-ul-marker: "◦"; --nowen-ul-marker-size: 1.1em; --nowen-ul-marker-top: 0; }
+.shared-note-content ul ul ul ul ul ul ul ul ul { --nowen-ul-marker: "▪"; --nowen-ul-marker-size: 1.2em; --nowen-ul-marker-top: -0.05em; }
+
+.shared-note-content ul > li:not([data-type="taskItem"]):not(.task-list-item) {
+  position: relative;
+}
+
+.shared-note-content ul > li:not([data-type="taskItem"]):not(.task-list-item)::before {
+  content: var(--nowen-ul-marker);
+  position: absolute;
+  left: -1.2em;
+  top: var(--nowen-ul-marker-top);
+  font-size: var(--nowen-ul-marker-size);
+  line-height: 1;
+}
+
+.shared-note-content ul.contains-task-list > li.task-list-item::before,
+.shared-note-content ul[data-type="taskList"] > li[data-type="taskItem"]::before {
+  content: none !important;
+}
+.shared-note-content li {
+  margin: 0.25em 0;
+}
+.shared-note-content li > p {
+  margin: 0.25em 0;
+}
+
+/* Task list锛圙FM `- [ ]` / `- [x]`锛?*/
+.shared-note-content ul[data-type="taskList"],
+.shared-note-content ul.contains-task-list {
+  list-style: none;
+  padding-left: 0.5em;
+}
+/* The own text is a separate span so completing a parent does not strike its children. */
+.nowen-md-preview li.task-list-item[data-checked="true"] > .nowen-task-item-text,
+.nowen-md-preview li.task-list-item[data-checked="true"] > .nowen-task-item-text :is(a, strong, em, code),
+.nowen-md-preview li.task-list-item[data-checked="true"] > p > .nowen-task-item-text,
+.nowen-md-preview li.task-list-item[data-checked="true"] > p > .nowen-task-item-text :is(a, strong, em, code) {
+  color: var(--pm-task-done);
+  text-decoration: line-through;
+  text-decoration-color: var(--task-done-strike);
+  opacity: 0.82;
+}
+
+/* Shared Tiptap and GFM Markdown have different checkbox markup. */
+.shared-note-content li[data-checked="true"] > p,
+.shared-note-content li[data-checked="true"] > div > p,
+.shared-note-content li.task-item:has(> input[type="checkbox"]:checked) > p,
+.shared-note-content li.task-list-item:has(> p > input[type="checkbox"]:checked) > p {
+  color: var(--pm-task-done, #a1a1aa);
+  text-decoration: line-through;
+  text-decoration-color: currentColor;
+  opacity: 0.82;
+}
+
+/* 寮曠敤鍧?*/
+.shared-note-content blockquote {
+  margin: 1em 0;
+  padding: 0.4em 1em;
+  border-left: 4px solid #c7d2fe; /* indigo-200 */
+  background: rgba(99, 102, 241, 0.05);
+  color: #52525b;
+  border-radius: 0 6px 6px 0;
+}
+.dark .shared-note-content blockquote {
+  border-left-color: #4338ca;
+  background: rgba(99, 102, 241, 0.12);
+  color: #d4d4d8;
+}
+
+/* 琛屽唴浠ｇ爜 */
+.shared-note-content :not(pre) > code {
+  background: rgba(99, 102, 241, 0.1);
+  color: #4f46e5;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.92em;
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Source Code Pro', 'Menlo', 'Consolas', 'Courier New', monospace;
+}
+.dark .shared-note-content :not(pre) > code {
+  background: rgba(129, 140, 248, 0.15);
+  color: #a5b4fc;
+}
+
+/* 鍥剧墖 */
+/* BUG-SHARED-NOTE-IMAGE-LAYOUT-01: 覆盖 prose 的 display:block，
+   让连续图片保持 inline-block 并排，与编辑器 .resizable-image-wrapper 行为一致 */
+.shared-note-content img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid #e4e4e7;
+  margin: 0.25rem 0.375rem;
+  cursor: zoom-in;
+  vertical-align: middle;
+}
+.shared-note-content img + img {
+  margin-left: 0.375rem;
+}
+.dark .shared-note-content img {
+  border-color: #3f3f46;
+}
+
+/* 鍒嗛殧绾?*/
+.shared-note-content hr {
+  border: none;
+  border-top: 1px solid #e4e4e7;
+  margin: 2em 0;
+}
+.dark .shared-note-content hr {
+  border-top-color: #3f3f46;
+}
+
+/* 琛ㄦ牸 */
+.shared-note-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 0.95em;
+}
+.shared-note-content th,
+.shared-note-content td {
+  border: 1px solid #e4e4e7;
+  padding: 0.5em 0.75em;
+  text-align: center;
+  vertical-align: middle;
+}
+.shared-note-content th {
+  background: #f4f4f5;
+  font-weight: 600;
+}
+.dark .shared-note-content th,
+.dark .shared-note-content td {
+  border-color: #3f3f46;
+}
+.dark .shared-note-content th {
+  background: #27272a;
+}
+
+/* ===== 鍒嗕韩椤典唬鐮佸潡锛堣瑙変笌缂栬緫鍣?CodeBlockView 涓€鑷达紝閫氳繃 CSS 鍙橀噺鏀寔澶氫富棰橈級 ===== */
+.shared-note-content .shared-code-block {
+  margin: 1rem 0;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--code-border);
+  background: var(--code-bg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Source Code Pro', 'Menlo', 'Consolas', 'Courier New', monospace;
+}
+
+.shared-note-content .shared-code-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--code-toolbar-bg);
+  border-bottom: 1px solid var(--code-border);
+  user-select: none;
+}
+
+.shared-note-content .shared-code-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shared-note-content .shared-code-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shared-note-content .shared-code-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.shared-note-content .shared-code-lang {
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--code-muted);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.shared-note-content .shared-code-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--code-muted);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.shared-note-content .shared-code-copy:hover {
+  color: var(--code-muted-strong);
+  background: var(--code-hover-bg);
+}
+
+.shared-note-content .shared-code-copy[data-copied="1"] {
+  color: var(--code-copy-success-fg);
+  background: var(--code-copy-success-bg);
+}
+
+.shared-note-content .shared-code-copy[data-copied="1"] .shared-code-copy-label::after {
+  content: "已复制";
+}.shared-note-content .shared-code-copy[data-copied="1"] .shared-code-copy-label {
+  font-size: 0;
+}
+.shared-note-content .shared-code-copy[data-copied="1"] .shared-code-copy-label::after {
+  font-size: 11px;
+}
+
+.shared-note-content .shared-code-pre {
+  margin: 0;
+  padding: 14px 16px;
+  background: var(--code-bg);
+  overflow-x: auto;
+}
+
+.shared-note-content .shared-code-content {
+  display: block;
+  color: var(--code-fg);
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre;
+  tab-size: 4;
+  -moz-tab-size: 4;
+}
+
+/* 瑕嗙洊 tailwind typography 鐨?prose 瀵逛唬鐮佸潡鐨勯粯璁ゆ牱寮?*/
+.shared-note-content .shared-code-block :where(code):not(:where([class~="not-prose"] *)) {
+  background: transparent !important;
+  color: inherit !important;
+  padding: 0 !important;
+  font-weight: inherit !important;
+}
+.shared-note-content .shared-code-block :where(code):not(:where([class~="not-prose"] *))::before,
+.shared-note-content .shared-code-block :where(code):not(:where([class~="not-prose"] *))::after {
+  content: none !important;
+}
+.shared-note-content .shared-code-block :where(pre):not(:where([class~="not-prose"] *)) {
+  background: var(--code-bg) !important;
+  color: var(--code-fg) !important;
+  padding: 14px 16px !important;
+  border-radius: 0 !important;
+  margin: 0 !important;
+}
+
+/* ============================================================================
+ * Mermaid 娴佺▼鍥炬牱寮?
+ * ----------------------------------------------------------------------------
+ * 缂栬緫鍣ㄥ唴锛圕odeBlockView 棰勮鎬侊級鍜屽垎浜〉涓ゅ鍏辩敤澶ч儴鍒嗗瑙傦紝宸紓鐢卞悇鑷?
+ * 瀹瑰櫒绫婚┍鍔ㄣ€?
+ * ========================================================================= */
+
+/* 缂栬緫鍣ㄥ唴 mermaid 棰勮锛氭妸 SVG 灞呬腑锛屾祬鑹茶儗鏅笌浠ｇ爜鍖烘媺寮€灞傛 */
+.ProseMirror .code-block-wrapper .mermaid-preview-host {
+  background: var(--app-bg, #fafafa);
+  border-radius: 0 0 12px 12px;
+  min-height: 80px;
+}
+.dark .ProseMirror .code-block-wrapper .mermaid-preview-host {
+  background: rgba(255, 255, 255, 0.02);
+}
+.mermaid-view svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* 鍒嗕韩椤?mermaid 鍧楀崰浣嶄笌鍔犺浇/閿欒鎬?*/
+.shared-note-content .shared-mermaid-block {
+  margin: 1rem 0;
+  padding: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 12px;
+  background: #fafafa;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: auto;
+}
+.dark .shared-note-content .shared-mermaid-block {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+.shared-note-content .shared-mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+.shared-note-content .shared-mermaid-loading {
+  color: #888;
+  font-size: 12px;
+  padding: 24px 0;
+}
+.shared-note-content .shared-mermaid-error {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.06);
+  border: 1px solid rgba(192, 57, 43, 0.25);
+  border-radius: 8px;
+  padding: 12px 14px;
+  width: 100%;
+  font-size: 12px;
+}
+.shared-note-content .shared-mermaid-error-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.shared-note-content .shared-mermaid-error-msg {
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0.9;
+}
+.dark .shared-note-content .shared-mermaid-error {
+  color: #ff8a80;
+  background: rgba(255, 110, 110, 0.08);
+  border-color: rgba(255, 110, 110, 0.3);
+}
+
+/* ============================================================================
+ * LaTeX 鏁板鍏紡鏍峰紡锛圞aTeX锛?
+ * ----------------------------------------------------------------------------
+ * 涓変釜浣跨敤鍦烘櫙锛?
+ *   1) 缂栬緫鍣ㄥ唴鐨?MathInline / MathBlock NodeView锛坄.math-node-*`銆乣.math-view-*`锛?
+ *   2) 缂栬緫鍣ㄥ唴缂栬緫鎬佺殑婧愮爜 + 瀹炴椂棰勮锛坄.math-edit-*`锛?
+ *   3) 鍒嗕韩椤?MD / PM 璺緞鐨勫崰浣嶄笌寮傛娉ㄥ叆锛坄.shared-math-*`锛?
+ * KaTeX 鑷甫鐨?CSS 鍦?lib 閲屾寜闇€ inject锛岃繖閲屽彧琛?nowen 鑷畾涔夌殑瀹瑰櫒銆?
+ * ========================================================================= */
+
+/* 鈥斺€?缂栬緫鍣ㄥ唴锛歮ath 鑺傜偣瑙嗚 鈥斺€?*/
+.math-node-inline {
+  display: inline-block;
+  vertical-align: middle;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 3px;
+  transition: background-color 0.15s;
+}
+.math-node-inline:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+.math-node-block {
+  display: block;
+  margin: 0.5em 0;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: background-color 0.15s;
+}
+.math-node-block:hover {
+  background: rgba(99, 102, 241, 0.05);
+}
+.math-node.math-selected {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.06);
+}
+
+/* 缂栬緫鎬佺殑婧愮爜妗?*/
+.math-edit-box {
+  min-width: 180px;
+}
+.math-edit-textarea {
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  line-height: 1.4;
+}
+.math-edit-preview {
+  font-size: 13px;
+}
+
+/* 鈥斺€?鍒嗕韩椤碉細math 鍗犱綅 / 閿欒 鈥斺€?*/
+.shared-note-content .shared-math-block {
+  display: block;
+  margin: 1rem 0;
+  padding: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 8px;
+  background: #fafafa;
+  overflow-x: auto;
+  text-align: center;
+}
+.dark .shared-note-content .shared-math-block {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.06);
+}
+.shared-note-content .shared-math-inline {
+  /* 琛屽唴锛氫笉鍔犺儗鏅壊閬垮厤瑙嗚鍣煶锛汯aTeX 鑷繁鐨勬牱寮忔帴绠?*/
+  display: inline;
+}
+.shared-note-content .shared-math-loading {
+  color: #888;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  opacity: 0.7;
+}
+.shared-note-content .shared-math-error {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid rgba(192, 57, 43, 0.25);
+  background: rgba(192, 57, 43, 0.06);
+  border-radius: 6px;
+  font-size: 11px;
+  color: #c0392b;
+  max-width: 100%;
+  text-align: left;
+}
+.shared-note-content .shared-math-error-title {
+  font-weight: 600;
+}
+.shared-note-content .shared-math-error-src {
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  color: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.04);
+  padding: 2px 4px;
+  border-radius: 3px;
+  word-break: break-all;
+}
+.shared-note-content .shared-math-error-msg {
+  opacity: 0.85;
+  word-break: break-word;
+}
+.dark .shared-note-content .shared-math-error {
+  color: #ff8a80;
+  background: rgba(255, 110, 110, 0.08);
+  border-color: rgba(255, 110, 110, 0.3);
+}
+.dark .shared-note-content .shared-math-error-src {
+  color: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* KaTeX 鑷韩鍦ㄥ垎浜〉/缂栬緫鍣ㄩ噷鐨勫榻愪笌瀛楀彿缁嗚妭璋冩暣銆?
+ * KaTeX 榛樿琛屽唴瀛楀彿鐣ュ皬浜庢鏂囷紝鍧楃骇灞呬腑銆傚湪 prose 鏍峰紡浣滅敤涓?
+ * 瀛楀彿浼氳鍘嬬缉锛岃繖閲岀粰涓€涓暐澶х殑瀛楀彿璁╁叕寮忔洿鏄撹銆?*/
+.shared-note-content .katex,
+.ProseMirror .katex {
+  font-size: 1.05em;
+}
+.shared-note-content .katex-display,
+.ProseMirror .katex-display {
+  margin: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* ============================================================================
+ * 鑴氭敞锛團ootnote锛夋牱寮?
+ * ----------------------------------------------------------------------------
+ * 涓変釜鍦烘櫙锛?
+ *   1) 缂栬緫鍣ㄥ唴锛欶ootnoteReference (`.footnote-ref`) + FootnoteDefinition (`.footnote-def`)
+ *   2) 鍒嗕韩椤?PM 璺緞鍗犱綅锛歚.shared-footnote-ref` + `.shared-footnote-def`
+ *   3) 鍒嗕韩椤?MD 璺緞鍗犱綅锛氬悓涓婏紙preprocessMarkdownFootnotes 鐢熸垚鐩稿悓 class锛?
+ * ========================================================================= */
+
+/* 鈥斺€?缂栬緫鍣ㄥ唴锛氬紩鐢?鈥斺€?*/
+.footnote-ref {
+  display: inline;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: baseline;
+}
+.footnote-ref-sup {
+  display: inline-block;
+  font-size: 0.72em;
+  line-height: 1;
+  padding: 1px 3px;
+  margin: 0 1px;
+  border-radius: 3px;
+  color: #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+  font-weight: 600;
+  vertical-align: super;
+  transition: background-color 0.15s;
+}
+.footnote-ref:hover .footnote-ref-sup {
+  background: rgba(99, 102, 241, 0.2);
+}
+.footnote-ref-selected .footnote-ref-sup {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+  outline-offset: 1px;
+}
+.dark .footnote-ref-sup {
+  color: #a5b4fc;
+  background: rgba(165, 180, 252, 0.15);
+}
+.dark .footnote-ref:hover .footnote-ref-sup {
+  background: rgba(165, 180, 252, 0.25);
+}
+
+/* 鈥斺€?缂栬緫鍣ㄥ唴锛氬畾涔?鈥斺€?*/
+.footnote-def {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
+  background: rgba(99, 102, 241, 0.04);
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.footnote-def:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+.footnote-def-selected {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+}
+.footnote-def-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  color: #6366f1;
+  font-weight: 600;
+}
+.footnote-def-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  border: none;
+  background: transparent;
+  color: #6366f1;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+.footnote-def-back:hover {
+  background: rgba(99, 102, 241, 0.18);
+}
+.footnote-def-index {
+  min-width: 18px;
+}
+.footnote-def-content {
+  flex: 1;
+  color: var(--tx-primary, #1f2937);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.footnote-def-empty {
+  color: #94a3b8;
+  font-style: italic;
+}
+.footnote-def-id {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  font-size: 11px;
+  color: #94a3b8;
+  opacity: 0.7;
+  align-self: center;
+}
+.dark .footnote-def {
+  border-left-color: rgba(165, 180, 252, 0.5);
+  background: rgba(165, 180, 252, 0.06);
+}
+.dark .footnote-def:hover {
+  background: rgba(165, 180, 252, 0.1);
+}
+.dark .footnote-def-marker,
+.dark .footnote-def-back {
+  color: #a5b4fc;
+}
+.dark .footnote-def-content {
+  color: rgba(229, 231, 235, 0.92);
+}
+.dark .footnote-def-id {
+  color: rgba(229, 231, 235, 0.4);
+}
+
+/* 鈥斺€?鍒嗕韩椤碉細寮曠敤锛堜笂鏍囧皬鏁板瓧锛?鈥斺€?*/
+.shared-note-content .shared-footnote-ref {
+  display: inline;
+  vertical-align: super;
+  font-size: 0.72em;
+  line-height: 1;
+}
+.shared-note-content .shared-footnote-ref a {
+  display: inline-block;
+  padding: 1px 3px;
+  margin: 0 1px;
+  border-radius: 3px;
+  color: #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+  font-weight: 600;
+  text-decoration: none;
+  transition: background-color 0.15s;
+}
+.shared-note-content .shared-footnote-ref a:hover {
+  background: rgba(99, 102, 241, 0.22);
+}
+.dark .shared-note-content .shared-footnote-ref a {
+  color: #a5b4fc;
+  background: rgba(165, 180, 252, 0.15);
+}
+.dark .shared-note-content .shared-footnote-ref a:hover {
+  background: rgba(165, 180, 252, 0.28);
+}
+
+/* 鈥斺€?鍒嗕韩椤碉細瀹氫箟 鈥斺€?*/
+.shared-note-content .shared-footnote-def {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
+  background: rgba(99, 102, 241, 0.04);
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+.shared-note-content .shared-footnote-def-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  color: #6366f1;
+  font-weight: 600;
+}
+.shared-note-content .shared-footnote-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: #6366f1;
+  text-decoration: none;
+  font-size: 12px;
+  line-height: 1;
+}
+.shared-note-content .shared-footnote-back:hover {
+  background: rgba(99, 102, 241, 0.18);
+}
+.shared-note-content .shared-footnote-def-index {
+  min-width: 18px;
+}
+.shared-note-content .shared-footnote-def-content {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: inherit;
+}
+.dark .shared-note-content .shared-footnote-def {
+  border-left-color: rgba(165, 180, 252, 0.5);
+  background: rgba(165, 180, 252, 0.06);
+}
+.dark .shared-note-content .shared-footnote-def-marker,
+.dark .shared-note-content .shared-footnote-back {
+  color: #a5b4fc;
+}
+
+/* 鈥斺€?璺宠浆楂樹寒闂儊锛堢偣鍑?ref 鈫?def 鎴?def 鈫?ref 鏃剁煭鏆傞珮浜洰鏍囷級 鈥斺€?*/
+@keyframes shared-footnote-flash {
+  0%   { background-color: rgba(250, 204, 21, 0.35); }
+  100% { background-color: transparent; }
+}
+.shared-footnote-flash,
+.footnote-flash {
+  animation: shared-footnote-flash 1.1s ease-out;
+  border-radius: 4px;
+}
+
+
+
+
+
+/* ============================================================================
+ * macOS 澶栬椋庢牸锛圫kin锛?
+ * ----------------------------------------------------------------------------
+ * 璁捐鏉ユ簮锛欰pple Human Interface Guidelines锛坈olor / materials / typography锛夈€?
+ *
+ * 涓庨粯璁ょ毊鑲ょ殑鍏抽敭宸紓锛?
+ *   1. 璋冭壊鏉挎洿鍐枫€佹洿"鐪熷疄 Apple"銆侺ight 鐢?macOS windowBackground (#ECECEC)
+ *      + 鐧借壊鍐呭闈㈡澘锛汥ark 鐢ㄧ偔鐏?(#1E1E1E / #2E2E2E) 鑰岄潪绾粦锛岄伩鍏?OLED halo銆?
+ *   2. 寮鸿皟鑹?Light=#007AFF / Dark=#0A84FF锛圫ystem Blue锛夛紝涓嶆槸 Tailwind 榛樿钃濄€?
+ *   3. 鍒嗛殧绾夸笌鎮仠鎬佺敤 rgba() 鑰岄潪纭紪鐮佺伆鈥斺€斿彲鍙犲姞鍦ㄤ换鎰忚儗鏅笂淇濇寔灞傜骇銆?
+ *   4. 鏂板绗洓绾ф枃瀛楄壊 --color-text-quaternary锛堢鐢ㄦ€?/ 鏋佸急鎻愮ず锛夈€?
+ *   5. 鎻愪緵 --radius-window/card/button/input 鍥涚骇鍦嗚璇箟浠ょ墝銆?
+ *   6. 渚ц竟鏍忚涔夎壊鍋忓崐閫忔槑锛岄厤鍚?.vibrancy-* 宸ュ叿绫诲憟鐜?Vibrancy 姣涚幓鐠冦€?
+ *
+ * 閫氳繃 [data-skin="macos"] 涓?next-themes 鐨?.dark 姝ｄ氦缁勫悎锛?
+ *   [data-skin="macos"]          鈫?macOS Light
+ *   [data-skin="macos"].dark     鈫?macOS Dark
+ * ========================================================================= */
+
+:root {
+  /* 榛樿鐨偆鐨勫渾瑙掍护鐗岋紙琛ラ綈锛屼究浜庣粍浠舵棤宸埆浣跨敤锛?*/
+  --radius-window: 10px;
+  --radius-card: 8px;
+  --radius-button: 6px;
+  --radius-input: 6px;
+
+  /* 榛樿鐨偆鐨勭鍥涚骇鏂囧瓧鑹诧紙绂佺敤鎬侊級 */
+  --color-text-quaternary: #d1d5db;
+
+  /* 姣涚幓鐠冮檷绾ф椂浣跨敤鐨勪笉閫忔槑搴曡壊锛堥粯璁ょ毊鑲わ級 */
+  --color-sidebar-solid: #f3f4f6;
+  --color-elevated-solid: #ffffff;
+}
+
+.dark {
+  --color-text-quaternary: #4b5563;
+  --color-sidebar-solid: #1c2128;
+  --color-elevated-solid: #1c2333;
+}
+
+/* ---------- macOS Light ---------- */
+:root[data-skin="macos"] {
+  --color-bg: #ECECEC;
+  --color-surface: #ffffff;
+  --color-sidebar: rgba(246, 246, 246, 0.72);
+  --color-sidebar-solid: #F6F6F6;
+  --color-elevated: rgba(255, 255, 255, 0.85);
+  --color-elevated-solid: #ffffff;
+  --color-border: rgba(0, 0, 0, 0.10);
+  --color-hover: rgba(0, 0, 0, 0.04);
+  --color-active: #B4D8FF;
+
+  --color-text-primary: #000000;
+  --color-text-secondary: rgba(0, 0, 0, 0.60);
+  --color-text-tertiary: rgba(0, 0, 0, 0.40);
+  --color-text-quaternary: rgba(0, 0, 0, 0.20);
+  --color-text-inverse: #ffffff;
+
+  --color-accent-primary: #007AFF;
+  --color-accent-secondary: #34C759;
+  --color-accent-warning: #FF9500;
+  --color-accent-danger: #FF3B30;
+  --color-accent-muted: rgba(0, 0, 0, 0.40);
+
+  /* 缂栬緫鍣ㄤ笌榛樿鐨偆瑙ｈ€︼細macOS 鐨偆涓嬬紪杈戝櫒姝ｆ枃鐢ㄧ櫧搴?+ SF 鐏?*/
+  --pm-text: #1d1d1f;
+  --pm-heading: #000000;
+  --pm-code-bg: rgba(0, 0, 0, 0.05);
+  --pm-code-text: #D70015;
+  --pm-pre-bg: #F6F6F6;
+  --pm-pre-border: rgba(0, 0, 0, 0.10);
+  --pm-pre-text: #1d1d1f;
+  --pm-blockquote-border: #007AFF;
+  --pm-blockquote-text: rgba(0, 0, 0, 0.55);
+  --pm-hr: rgba(0, 0, 0, 0.10);
+  --pm-placeholder: rgba(0, 0, 0, 0.30);
+  --pm-task-done: rgba(0, 0, 0, 0.30);
+  --pm-scrollbar: rgba(0, 0, 0, 0.20);
+  --pm-scrollbar-hover: rgba(0, 0, 0, 0.35);
+  --pm-selection: rgba(0, 122, 255, 0.20);
+}
+
+/* ---------- macOS Dark ---------- */
+:root[data-skin="macos"].dark {
+  --color-bg: #1E1E1E;
+  --color-surface: #2E2E2E;
+  --color-sidebar: rgba(30, 30, 30, 0.72);
+  --color-sidebar-solid: #252525;
+  --color-elevated: rgba(58, 58, 58, 0.85);
+  --color-elevated-solid: #3A3A3A;
+  --color-border: rgba(255, 255, 255, 0.12);
+  --color-hover: rgba(255, 255, 255, 0.06);
+  --color-active: rgba(10, 132, 255, 0.30);
+
+  --color-text-primary: #FFFFFF;
+  --color-text-secondary: rgba(255, 255, 255, 0.60);
+  --color-text-tertiary: rgba(255, 255, 255, 0.40);
+  --color-text-quaternary: rgba(255, 255, 255, 0.20);
+  --color-text-inverse: #1E1E1E;
+
+  --color-accent-primary: #0A84FF;
+  --color-accent-secondary: #30D158;
+  --color-accent-warning: #FF9F0A;
+  --color-accent-danger: #FF453A;
+  --color-accent-muted: rgba(255, 255, 255, 0.40);
+
+  --pm-text: #E8E8E8;
+  --pm-heading: #FFFFFF;
+  --pm-code-bg: rgba(255, 255, 255, 0.08);
+  --pm-code-text: #FF6B6B;
+  --pm-pre-bg: #252525;
+  --pm-pre-border: rgba(255, 255, 255, 0.10);
+  --pm-pre-text: #E8E8E8;
+  --pm-blockquote-border: #0A84FF;
+  --pm-blockquote-text: rgba(255, 255, 255, 0.55);
+  --pm-hr: rgba(255, 255, 255, 0.10);
+  --pm-placeholder: rgba(255, 255, 255, 0.30);
+  --pm-task-done: rgba(255, 255, 255, 0.30);
+  --pm-scrollbar: rgba(255, 255, 255, 0.20);
+  --pm-scrollbar-hover: rgba(255, 255, 255, 0.35);
+  --pm-selection: rgba(10, 132, 255, 0.30);
+}
+
+/* ---------- macOS 鍦嗚浠ょ墝 ---------- */
+:root[data-skin="macos"] {
+  --radius-window: 10px;
+  --radius-card: 8px;
+  --radius-button: 6px;
+  --radius-input: 5px;
+}
+
+/* ---------- macOS 瀛椾綋鏍堣皟鏁?----------
+ * 榛樿鏍堟妸 Inter 鎺掑湪 -apple-system 涔嬪墠銆俶acOS 涓?-apple-system 浼氬懡涓?SF Pro锛?
+ * 浣嗚 Inter 鎶㈠厛锛岀敤鎴锋劅鍙椾笉鍒?Apple 鍛?銆傜毊鑲ゆ縺娲诲悗璋冩崲椤哄簭銆?
+ */
+:root[data-skin="macos"] {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+               'Inter', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+               'Microsoft YaHei', Helvetica, Arial, sans-serif;
+  --editor-font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+               'Inter', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+               'Microsoft YaHei', Helvetica, Arial, sans-serif;
+}
+
+/* ============================================================================
+ * Vibrancy锛堟瘺鐜荤拑锛夊伐鍏风被
+ * ----------------------------------------------------------------------------
+ * 鐢ㄦ硶锛氬湪渚ц竟鏍忋€佷笅鎷夎彍鍗曘€佸脊鍑洪潰鏉挎牴鑺傜偣鍔?className="vibrancy-sidebar" 绛夈€?
+ *
+ * 閲嶈瀹炵幇缁嗚妭锛堣俯鍧戠粡楠岋級锛?
+ *   CSS 瑙勮寖瑙勫畾锛氶潪 none 鐨?`backdrop-filter` 浼氳鍏冪礌鎴愪负 fixed/absolute 鍚庝唬
+ *   鐨?containing block銆傝嫢瀹夸富鍏冪礌鍐呴儴鏈?`position: fixed` 鐨?Modal / Portal
+ *   缁勪欢锛堜緥濡?SettingsModal 娓叉煋鍦?Sidebar 瀛愭爲閲岋級锛屽涓讳竴鏃﹀紑鍚?backdrop-filter锛?
+ *   fixed 灏变細琚洶鍦ㄥ涓荤洅瀛愰噷鑰屼笉鏄摵婊¤鍙ｂ€斺€斿鑷村脊绐楄鎸ゆ垚涓€灏忔潯銆?
+ *
+ *   鍥犳**涓嶈兘鐩存帴**鍦ㄥ涓讳笂搴旂敤 `backdrop-filter`銆傝繖閲屾敼鐢?`::before` 浼厓绱?
+ *   鎵挎媴姣涚幓鐠冨眰锛氬涓讳繚鎸?骞插噣"锛屽唴閮?fixed 涓嶅彈褰卞搷銆傚涓婚渶瑕?position: relative
+ *   浠ヤ究 ::before 鑳?absolute 濉厖锛涘疄闄?.vibrancy-sidebar 宸茬粡澶勫湪 flex 甯冨眬涓紝
+ *   鍔?position: relative 鏃犲壇浣滅敤銆?
+ *
+ *   鍏跺畠娉ㄦ剰浜嬮」锛?
+ *   1. 渚濊禆 backdrop-filter銆侲lectron锛圕hromium 鏂扮増鏈級鍏ㄥ钩鍙版敮鎸侊紱Web 绔?
+ *      Safari 14+ / Chrome 76+ / Firefox 103+銆備笉鏀寔鏃惰嚜鍔ㄥ洖閫€涓?solid 鍙橀噺銆?
+ *   2. @media (prefers-reduced-transparency: reduce) 浼氬己鍒惰蛋 solid锛屽皧閲嶇郴缁熷亸濂姐€?
+ *   3. 浠呭湪 macOS 鐨偆鍚敤鏃舵墠鏄鹃湶姣涚幓鐠冭涔夆€斺€旈粯璁ょ毊鑲ゅ彧鐢?solid 搴曡壊锛?
+ *      閬垮厤缁欓潪 Apple 椋庢牸鐨勮璁″紩鍏ヤ笉蹇呰瑙嗚璐熸媴銆?
+ * ========================================================================= */
+.vibrancy-sidebar,
+.vibrancy-panel {
+  position: relative;
+  background-color: var(--color-sidebar-solid);
+}
+
+/* macOS 鐨偆涓嬶細瀹夸富 bg 閫忔槑锛岀敱 ::before 浼厓绱犺礋璐ｆ瘺鐜荤拑灞傘€?
+ * 涓嶄娇鐢?isolation: isolate锛岄伩鍏嶅垱寤烘柊灞傚彔涓婁笅鏂囷紙鍚﹀垯瀹夸富鍐呴儴鐨勯珮 z-index
+ * 瀛愬厓绱狅紝渚嬪 Sidebar 瀛愭爲閲屽彲鑳芥覆鏌撶殑 SettingsModal锛屽皢琚洶鍦ㄥ涓?stacking
+ * context 鍐咃紝鍑虹幇琚?濉炶繘渚ф爮"鐨勯敊涔憋級銆傞潬 ::before 鐨?z-index: -1 璁╁畠绌块€?
+ * 瀹夸富鑳屾櫙灞傦紱瀹夸富鏈韩鑳屾櫙閫忔槑锛岀湡瀹炲唴瀹硅嚜鐒跺彔鍦ㄤ笂鏂广€?*/
+:root[data-skin="macos"] .vibrancy-sidebar,
+:root[data-skin="macos"] .vibrancy-panel {
+  background-color: transparent;
+}
+
+:root[data-skin="macos"] .vibrancy-sidebar::before,
+:root[data-skin="macos"] .vibrancy-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+
+:root[data-skin="macos"] .vibrancy-sidebar::before {
+  background-color: var(--color-sidebar);
+  -webkit-backdrop-filter: saturate(180%) blur(30px);
+  backdrop-filter: saturate(180%) blur(30px);
+}
+
+:root[data-skin="macos"] .vibrancy-panel::before {
+  background-color: var(--color-elevated);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+/* 涓嶆敮鎸?backdrop-filter 鏃跺洖閫€鍒颁笉閫忔槑搴曡壊锛堢洿鎺ユ墦鍒板涓伙紝鏀惧純浼厓绱狅級 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root[data-skin="macos"] .vibrancy-sidebar { background-color: var(--color-sidebar-solid); }
+  :root[data-skin="macos"] .vibrancy-panel { background-color: var(--color-elevated-solid); }
+  :root[data-skin="macos"] .vibrancy-sidebar::before,
+  :root[data-skin="macos"] .vibrancy-panel::before { display: none; }
+}
+
+/* 鐢ㄦ埛寮€鍚?鍑忓皯閫忔槑搴?鍋忓ソ 鈫?寮哄埗 solid锛圚IG 鍙闂€у噯鍒欙級 */
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-skin="macos"] .vibrancy-sidebar { background-color: var(--color-sidebar-solid); }
+  :root[data-skin="macos"] .vibrancy-panel { background-color: var(--color-elevated-solid); }
+  :root[data-skin="macos"] .vibrancy-sidebar::before,
+  :root[data-skin="macos"] .vibrancy-panel::before { display: none; }
+}
+
+/* Text fields and document canvases use the caret instead of an added focus frame. */
+:root :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]), textarea, select, [contenteditable="true"], .ProseMirror, .cm-editor, .cm-content):is(:focus, :focus-visible, :focus-within) {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+:root :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]), textarea, select):focus:not([aria-invalid="true"]) {
+  border-color: var(--color-border) !important;
+}
+
+/* Keep a neutral keyboard focus indicator on actionable controls. */
+:root :is(button, a, [role="button"], summary):focus-visible:not(.no-focus-ring) {
+  outline: 2px solid var(--color-text-secondary);
+  outline-offset: 2px;
+}
+
+/* ============================================================================
+ * Reduce Motion锛氬皧閲嶇郴缁?鍑忓皯鍔ㄦ晥"鍋忓ソ锛圚IG 鏃犻殰纰嶈姹傦級
+ * 娉細浠呴檺鍒?CSS transition 涓?CSS 鍔ㄧ敾锛沠ramer-motion 鐨?JS 鍔ㄧ敾闇€瑕佺粍浠朵晶
+ *     閰嶅悎 useReducedMotion()鈥斺€旀湰娆℃柟妗?B 鏆備笉鍏ㄥ眬閾鸿锛屽彲鎸夐渶澧炶ˉ銆?
+ * ========================================================================= */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================================
+ * macOS hiddenInset title bar
+ * ----------------------------------------------------------------------------
+ * Traffic Lights occupy the window's upper-left corner. The rail starts below
+ * them, while the desktop sidebar header remains the draggable title area and
+ * reserves a small horizontal safety gap for the green control.
+ * ========================================================================== */
+html[data-electron="darwin"] .vibrancy-sidebar {
+  -webkit-app-region: no-drag;
+}
+
+html[data-electron="darwin"]
+  [data-unified-sidebar][data-sidebar-variant="desktop"]
+  > header {
+  -webkit-app-region: drag;
+  padding-left: 24px;
+}
+
+html[data-electron="darwin"] .vibrancy-sidebar button,
+html[data-electron="darwin"] .vibrancy-sidebar a,
+html[data-electron="darwin"] .vibrancy-sidebar input,
+html[data-electron="darwin"] .vibrancy-sidebar [role="button"],
+html[data-electron="darwin"] .vibrancy-sidebar [contenteditable="true"] {
+  -webkit-app-region: no-drag;
+}
+
+html[data-electron="darwin"]
+  [data-unified-sidebar][data-sidebar-variant="desktop"]
+  > header
+  button {
+  -webkit-app-region: no-drag;
+}
+
+/* Keep rail actions below the native window controls. */
+html[data-electron="darwin"] .nav-rail {
+  padding-top: 56px !important;
+}
+
+/* Fullscreen hides Traffic Lights, so restore the regular header inset. */
+html[data-electron="darwin"][data-fullscreen="1"]
+  [data-unified-sidebar][data-sidebar-variant="desktop"]
+  > header {
+  padding-left: 16px;
+}
+
+html[data-electron="darwin"][data-fullscreen="1"] .nav-rail {
+  padding-top: 4px !important;
+}
+
+/* ----------------------------------------------------------------------------
+ * NSFullSizeContentView锛氬唴瀹瑰欢浼稿埌鏍囬鏍?
+ *   涓昏繘绋嬪凡璁?`titleBarStyle: "hiddenInset"`锛岀瓑浠蜂簬 AppKit 鐨?
+ *   NSFullSizeContentViewWindowMask鈥斺€旂獥鍙ｆ病鏈夌嫭绔嬫爣棰樻爮锛屽唴瀹逛粠 y=0 寮€濮嬬粯鍒躲€?
+ *   浣?HIG 瑕佹眰"鍘熷簲鐢辨爣棰樻爮鎵挎媴鐨勬嫋鎷借兘鍔?蹇呴』鍦ㄥ唴瀹瑰尯琛ュ洖锛屽惁鍒欑敤鎴锋棤澶勬姄鍙?
+ *   绐楀彛銆傜粰涓诲唴瀹瑰尯椤堕儴 28px 璁句负 drag region 鍗冲彲锛涗晶鏍忛《閮ㄦ湰韬凡鏄?drag region锛?
+ *   杩欓噷琛ョ殑鏄?Sidebar 涔嬪鐨勫ぇ鍖哄煙锛堢紪杈戝櫒/绗旇鍒楄〃涓婃柟锛夈€?
+ *
+ *   閫夋嫨鍣ㄧ敤 `main`锛圓pp.tsx 鏍瑰竷灞€涓殑 <main> 鍏冪礌锛夈€傝嫢鏈潵缁撴瀯鏀瑰彉锛屽彲鏀规垚
+ *   data-app-root 涔嬬被鐨勭ǔ瀹氶€夋嫨鍣紱杩欓噷鍏堢敤璇箟鏍囩浠ュ厤姹℃煋涓氬姟 DOM銆?
+ * -------------------------------------------------------------------------- */
+html[data-electron="darwin"] main::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  -webkit-app-region: drag;
+  pointer-events: none; /* 涓嶉樆鎸′笅灞傜偣鍑?*/
+  z-index: 1;
+}
+
+/* main 闇€瑕佹槸 relative锛?:before 鎵嶈兘瀹氫綅鍒板畠 */
+html[data-electron="darwin"] main {
+  position: relative;
+}
+
+/* 鍏ㄥ睆涓嬫爣棰樻爮褰诲簳娑堝け锛屽洖鏀舵嫋鎷芥潯 */
+html[data-electron="darwin"][data-fullscreen="1"] main::before {
+  display: none;
+}
+
+
+
+/* ============================================================================
+ * prefers-contrast: more 鈥斺€?楂樺姣斿害鍋忓ソ锛圚IG / WCAG 2.1 AA-AAA 杩囨浮瑕佹眰锛?
+ * ----------------------------------------------------------------------------
+ * 瑙﹀彂鏉′欢锛?
+ *   - macOS锛氱郴缁熻缃?鈫?杈呭姪鍔熻兘 鈫?鏄剧ず 鈫?鎻愰珮瀵规瘮搴?
+ *   - Windows锛氳缃?鈫?杈呭姪鍔熻兘 鈫?瀵规瘮搴︿富棰橈紙楂樺姣斿害妯″紡涓嬫祻瑙堝櫒浼氫笂鎶?more锛?
+ *   - iOS锛氳缃?鈫?杈呭姪鍔熻兘 鈫?鏄剧ず涓庢枃瀛楀ぇ灏?鈫?鎻愰珮瀵规瘮搴?
+ *
+ * 绛栫暐锛?
+ *   1. 寮卞寲鐨?border 涓€寰嬪己鍖栦负 currentColor锛屽搴︿笉澧烇紙澧炲浼氳甯冨眬鎶栧姩锛夛紱
+ *   2. 姣涚幓鐠?/ 鍗婇€忔槑瑕嗙洊灞備竴寰嬪洖钀芥垚 solid 鍙橀噺锛?
+ *   3. 鐒︾偣鐜姞绮楀埌 3px 涓旀洿绾殑 accent 鑹诧紝涓嶅啀鐢?color-mix 40% 閫忔槑锛?
+ *   4. 娆¤鏂囧瓧浠?--color-text-secondary锛垀0.6 alpha锛夊洖钀藉埌涓绘枃鏈壊銆?
+ *
+ * 鎵€鏈夎鍐欓兘璧拌涔?token锛岀粍浠朵晶鏃犻渶浠讳綍鏀瑰姩銆?
+ * ========================================================================= */
+@media (prefers-contrast: more) {
+  :root {
+    /* 杈规锛氫粠寮辩伆鍒扮函榛?绾櫧锛堣窡 text 瀵归綈锛?*/
+    --color-border: currentColor;
+    --color-border-soft: currentColor;
+  }
+
+  /* 姣涚幓鐠?鈫?solid */
+  .vibrancy-sidebar,
+  .vibrancy-panel,
+  :root[data-skin="macos"] .vibrancy-sidebar,
+  :root[data-skin="macos"] .vibrancy-panel {
+    background-color: var(--color-sidebar-solid) !important;
+  }
+  :root[data-skin="macos"] .vibrancy-sidebar::before,
+  :root[data-skin="macos"] .vibrancy-panel::before {
+    display: none !important;
+  }
+
+  /* 鐒︾偣鐜細鏇寸矖銆佹洿绾?*/
+  *:focus-visible:not(.no-focus-ring) {
+    outline: 3px solid currentColor !important;
+    outline-offset: 2px !important;
+    box-shadow: none !important;
+  }
+  :root[data-skin="macos"] input:focus-visible:not(.no-focus-ring),
+  :root[data-skin="macos"] textarea:focus-visible:not(.no-focus-ring),
+  :root[data-skin="macos"] select:focus-visible:not(.no-focus-ring) {
+    outline: 3px solid currentColor !important;
+    outline-offset: 1px !important;
+    box-shadow: none !important;
+  }
+
+  /* 鍗婇€忔槑娆＄骇鏂囧瓧 鈫?婊″姣斿害 */
+  .text-app-muted,
+  .text-app-secondary {
+    color: var(--color-text) !important;
+  }
+
+  /* 閫氱敤鐨?hover 鍗婇€忔槑鑹插眰锛堝緢澶氭寜閽敤 bg-white/5 绫伙級鍦ㄩ珮瀵规瘮涓嬪嚑涔庝笉鍙锛?
+   * 閫氳繃 :hover 鏃跺姞鍙鐨?outline 琛ュ伩璇箟銆?*/
+  button:hover:not(:disabled),
+  [role="button"]:hover {
+    outline: 1px solid currentColor;
+    outline-offset: -1px;
+  }
+}
+
+
+
+/* ===== 浣滆€呮劅瑷€ Modal 涓撳睘鎺掔増寰皟 =====
+ * 澶嶇敤 .shared-note-content 鑷粰鑷冻鐨勫熀纭€鎺掔増锛屽啀涓洪暱鏂囬槄璇诲満鏅仛鍑犲澧炲己锛?
+ *   - 涓绘爣棰橈紙H1锛夋洿澶с€侀潬涓嬪姞涓€閬撴贰鎻忚竟锛屽己鍖?灏侀潰鎰?
+ *   - H2 鍓嶉潰鐣欐洿澶氬懠鍚哥┖闂达紝鍋氱珷鑺傚垏鍒?
+ *   - blockquote 鏀规垚宸︿晶鑹叉潯 + 娴呭簳锛岃"鍓爣棰?棰樿"鏇撮啋鐩?
+ *   - <hr> 鐢ㄦ笎鍙樿櫄绾匡紝閬垮厤 Tailwind preflight 閲嶇疆鍚庣湅涓嶈
+ *   - <strong> 鍊熷搧鐗岃壊锛岃窡姝ｆ枃鍖哄垎浣嗕笉鍠у澶轰富
+ */
+.author-story-content {
+  font-size: 14.5px;
+  line-height: 1.85;
+}
+.author-story-content h1 {
+  font-size: 1.5em;
+  text-align: left;
+  margin: 0.2em 0 0.8em;
+  padding-bottom: 0.55em;
+  border-bottom: 1px solid rgb(228 228 231 / 0.8); /* zinc-200 */
+}
+.dark .author-story-content h1 {
+  border-bottom-color: rgb(63 63 70 / 0.6); /* zinc-700 */
+}
+.author-story-content h2 {
+  font-size: 1.18em;
+  margin: 2em 0 0.7em;
+}
+.author-story-content blockquote {
+  margin: 1em 0 1.4em;
+  padding: 0.6em 1em;
+  border-left: 3px solid var(--color-accent-primary, #6366f1);
+  background: rgb(99 102 241 / 0.06);
+  border-radius: 0 6px 6px 0;
+  color: rgb(82 82 91); /* zinc-600 */
+  font-style: normal;
+}
+.dark .author-story-content blockquote {
+  background: rgb(99 102 241 / 0.1);
+  color: rgb(212 212 216); /* zinc-300 */
+}
+.author-story-content blockquote p {
+  margin: 0.25em 0;
+}
+.author-story-content hr {
+  border: none;
+  height: 1px;
+  margin: 2em 0;
+  background: linear-gradient(
+    to right,
+    transparent,
+    rgb(161 161 170 / 0.4) 20%,
+    rgb(161 161 170 / 0.4) 80%,
+    transparent
+  );
+}
+.author-story-content strong {
+  color: var(--color-accent-primary, #6366f1);
+  font-weight: 600;
+}
+.dark .author-story-content strong {
+  color: #a5b4fc; /* indigo-300锛屾繁鑹叉ā寮忎笅鍔犱寒涓€妗?*/
+}
+/* 鍐呰仈浠ｇ爜锛氳 nowen-note / 缇ゅ悕 QQ 鍙蜂竴绫荤殑鏍囪瘑鏇存樉鐪?*/
+.author-story-content :not(pre) > code {
+  background: rgb(244 244 245); /* zinc-100 */
+  color: rgb(99 102 241);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  font-size: 0.88em;
+}
+.dark .author-story-content :not(pre) > code {
+  background: rgb(39 39 42); /* zinc-800 */
+  color: #a5b4fc;
+}
+/* 鍒楄〃椤圭粰涓€鐐圭偣闂磋窛锛岄暱鏂囬槄璇讳笉鎸?*/
+.author-story-content ol > li,
+.author-story-content ul > li {
+  margin: 0.4em 0;
+}
+
+
+
+
+/* ===== Mindmap tokens ===== */
+:root {
+  --mm-canvas-bg: #f5f5f7;
+  --mm-canvas-dot: rgba(0,0,0,0.06);
+  --mm-panel-bg: var(--color-surface);
+  --mm-panel-border: var(--color-border);
+  --mm-node-bg: #ffffff;
+  --mm-node-border: rgba(0,0,0,0.08);
+  --mm-node-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  --mm-node-shadow-hover: 0 2px 8px rgba(0,0,0,0.10);
+  --mm-node-text: #374151;
+  --mm-edge-stroke: rgba(148,163,184,0.5);
+  --mm-edge-active: #6366f1;
+  --mm-menu-bg: rgba(255,255,255,0.88);
+  --mm-menu-bg-dark: rgba(30,30,30,0.88);
+  --mm-menu-border: rgba(0,0,0,0.06);
+}
+.dark {
+  --mm-canvas-bg: #161b22;
+  --mm-canvas-dot: rgba(255,255,255,0.04);
+  --mm-panel-bg: var(--color-surface);
+  --mm-panel-border: var(--color-border);
+  --mm-node-bg: #1c2333;
+  --mm-node-border: rgba(255,255,255,0.08);
+  --mm-node-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  --mm-node-shadow-hover: 0 2px 8px rgba(0,0,0,0.3);
+  --mm-node-text: #c9d1d9;
+  --mm-edge-stroke: rgba(148,163,184,0.35);
+  --mm-edge-active: #818cf8;
+  --mm-menu-bg: rgba(30,30,30,0.88);
+  --mm-menu-bg-dark: rgba(30,30,30,0.88);
+  --mm-menu-border: rgba(255,255,255,0.08);
+}
+
+/* ===== 块级引用跳转高亮 ===== */
+/* BLOCK-LINKS-JUMP-01: 点击块级引用后高亮目标 heading */
+.block-link-highlight {
+  animation: block-link-highlight-fade 2s ease-out;
+}
+
+@keyframes block-link-highlight-fade {
+  0% {
+    background-color: rgba(99, 102, 241, 0.2); /* indigo-500/20 */
+    outline: 2px solid rgba(99, 102, 241, 0.4); /* indigo-500/40 */
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  100% {
+    background-color: transparent;
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+  }
+}
+
+/* 深色模式下的高亮 */
+.dark .block-link-highlight {
+  animation: block-link-highlight-fade-dark 2s ease-out;
+}
+
+@keyframes block-link-highlight-fade-dark {
+  0% {
+    background-color: rgba(129, 140, 248, 0.2); /* indigo-400/20 */
+    outline: 2px solid rgba(129, 140, 248, 0.4); /* indigo-400/40 */
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  100% {
+    background-color: transparent;
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+  }
+}
+/* Foldable inner displays use a persistent list-detail workspace. The editor remains
+   touch-oriented below the existing desktop breakpoint, but its phone-only back affordance
+   is redundant once the list is already visible beside it. */
+[data-note-workspace-window="medium"] [data-adaptive-editor-back],
+[data-note-workspace-window="medium"] [data-adaptive-editor-empty-header] {
+  display: none !important;
+}
+
+.home-page {
+  --color-bg: #f8f9fc;
+  --color-surface: #ffffff;
+  --color-border: #e3e7ef;
+  --color-text-primary: #202a40;
+  --color-text-secondary: #737d90;
+  --color-text-tertiary: #737d90;
+}
+.dark .home-page {
+  --color-bg: #171a22;
+  --color-surface: #212530;
+  --color-border: #353c4b;
+  --color-text-primary: #e6ebf5;
+  --color-text-secondary: #a0aabd;
+  --color-text-tertiary: #a0aabd;
+}
+.home-brand-mark {
+  box-shadow: 0 8px 18px color-mix(in srgb, var(--color-accent-primary) 15%, transparent);
+}
+.home-search {
+  box-shadow: 0 5px 20px color-mix(in srgb, var(--color-text-primary) 3%, transparent);
+}
+.home-page input::placeholder,
+.home-page textarea::placeholder {
+  color: var(--color-text-secondary);
+  opacity: 1;
+}
+.home-capture-tool {
+  @apply inline-flex items-center gap-1.5 rounded-md px-2 py-2 text-xs text-tx-secondary hover:bg-app-hover disabled:opacity-40;
+}
+@media (pointer: coarse) { .home-capture-tool { min-height: 44px; } }
+
+/* With the shortcut rail hidden, the brand must still clear native window controls. */
+html[data-electron="darwin"] .app-shell[data-desktop-rail-visible="false"] [data-sidebar-variant="desktop"] > header {
+  padding-left: 104px;
+}
+html[data-electron="darwin"][data-fullscreen="1"] .app-shell[data-desktop-rail-visible="false"] [data-sidebar-variant="desktop"] > header {
+  padding-left: 16px;
+}
+
+/* Native Mac unified navigation: the left menu clears traffic lights, and the panel title remains draggable. */
+html[data-electron="darwin"] .workspace-sidebar > header {
+  padding-left: 24px;
+  -webkit-app-region: drag;
+}
+html[data-electron="darwin"][data-fullscreen="1"] .workspace-sidebar > header {
+  padding-left: 12px;
+}
+
+/* Restore navigation without reserving a column or covering breadcrumb actions. */
+html[data-electron="darwin"] .workspace-navigation-restore {
+  -webkit-app-region: no-drag;
+}
+.app-shell:has([data-workspace-panel="collapsed"]) [data-editor-navigation-header] {
+  padding-left: 48px;
+}
+
+/* Menu surfaces stay readable above every skin, including macOS vibrancy. */
+[role="menu"],
+[role="listbox"] {
+  background-color: var(--color-elevated-solid) !important;
+  backdrop-filter: none;
+}

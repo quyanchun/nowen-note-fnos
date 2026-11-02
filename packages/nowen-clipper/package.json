@@ -1,0 +1,39 @@
+{
+  "name": "@nowen/clipper",
+  "version": "0.5.0",
+  "description": "Nowen Note Web Clipper — 速记、网页剪藏、选区保存和图片本地化",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gen-icons": "node scripts/gen-icons.mjs",
+    "copy-public": "node scripts/copy-public.mjs",
+    "flatten-html": "node scripts/flatten-html.mjs",
+    "prebuild": "npm run gen-icons",
+    "dev": "vite build --watch --mode development",
+    "build": "vite build && npm run flatten-html && npm run copy-public",
+    "build:chrome": "vite build && npm run flatten-html && node scripts/copy-public.mjs --browser=chrome",
+    "build:edge": "vite build && npm run flatten-html && node scripts/copy-public.mjs --browser=edge",
+    "build:firefox": "vite build && npm run flatten-html && node scripts/copy-public.mjs --browser=firefox",
+    "pack": "npm run build:chrome && node scripts/pack.mjs --browser=chrome",
+    "pack:chrome": "npm run build:chrome && node scripts/pack.mjs --browser=chrome",
+    "pack:edge": "npm run build:edge && node scripts/pack.mjs --browser=edge",
+    "pack:firefox": "npm run build:firefox && node scripts/pack.mjs --browser=firefox",
+    "pack:all": "npm run pack:chrome && npm run pack:edge && npm run pack:firefox",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/turndown": "^5.0.5",
+    "jszip": "^3.10.1",
+    "sharp": "^0.33.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  }
+}

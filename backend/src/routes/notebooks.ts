@@ -1,0 +1,892 @@
+import { Hono } from "hono";
+import { randomBytes } from "node:crypto";
+import { getDb } from "../db/schema";
+import { v4 as uuid } from "uuid";
+import {
+  getUserWorkspaceRole,
+  hasRole,
+  resolveNotebookPermission,
+  hasPermission,
+  buildVisibilityWhere,
+} from "../middleware/acl";
+import { notebookRoleToPermission } from "../services/notebook-permissions";
+import { broadcastNoteDeleted } from "../services/realtime";
+import { notebookShareLinksRepository, notebookMembersRepository } from "../repositories";
+import {
+  copyPersonalNotebookToWorkspace,
+  WorkspaceNotebookTransferError,
+} from "../services/workspaceNotebookTransfer";
+import {
+  synchronizeLegacyNoteHierarchy,
+  synchronizeLegacyNotebookHierarchy,
+} from "../services/legacyKnowledgeHierarchy";
+
+const app = new Hono();
+const notebookPerfDiagnosticsEnabled = process.env.NOTEBOOK_PERF_DIAGNOSTICS === "1";
+
+function parseNotebookMemberRole(role: unknown): "editor" | "viewer" | null {
+  return role === "editor" || role === "viewer" ? role : null;
+}
+
+function notebookMemberId(notebookId: string, userId: string) {
+  return `${notebookId}:${userId}`;
+}
+
+function generateShareToken() {
+  return randomBytes(24).toString("base64url");
+}
+
+/**
+ * 获取所有笔记本（树形结构）
+ * 支持可选 workspaceId 查询参数：
+ *   未传 → 返回个人空间 + 所有加入的工作区笔记本（用于旧客户端兼容）
+ *   传 'personal' → 仅个人空间
+ *   传 <workspaceId> → 指定工作区
+ */
+app.get("/", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const workspaceId = c.req.query("workspaceId");
+
+  let rows: any[];
+
+  // noteCount 采用「递归口径」：每个笔记本的徽标数 = 自身直属笔记 + 所有子孙笔记本下的笔记
+  // 通过递归 CTE 建立 ancestor → descendant 映射，再 JOIN notes 计数
+  //
+  // 软删除过滤（v14 起）：
+  //   - 主 WHERE 加 nb.isDeleted = 0：软删的笔记本不再出现在侧边栏；
+  //   - 递归 CTE 内的 notebooks 也加 isDeleted = 0：避免子孙笔记本被父级软删
+  //     后从 nb_tree 里漏掉父子链；
+  //   - notes 计数已经过滤了 isTrashed=0，配合上面的笔记本过滤后，软删笔记本
+  //     里被一并 isTrashed=1 的笔记不会再贡献徽标计数。
+  if (workspaceId === "personal") {
+    rows = db
+      .prepare(
+        `
+        WITH RECURSIVE nb_tree(ancestorId, descendantId) AS (
+          SELECT id, id FROM notebooks
+          WHERE userId = ? AND workspaceId IS NULL AND isDeleted = 0
+          UNION ALL
+          SELECT t.ancestorId, n.id
+          FROM nb_tree t
+          INNER JOIN notebooks n ON n.parentId = t.descendantId
+          WHERE n.userId = ? AND n.workspaceId IS NULL AND n.isDeleted = 0
+        )
+        SELECT nb.*, COALESCE(nc.noteCount, 0) AS noteCount
+        FROM notebooks nb
+        LEFT JOIN (
+          SELECT t.ancestorId AS notebookId, COUNT(notes.id) AS noteCount
+          FROM nb_tree t
+          INNER JOIN notes ON notes.notebookId = t.descendantId
+          WHERE notes.userId = ? AND notes.isTrashed = 0 AND notes.workspaceId IS NULL
+          GROUP BY t.ancestorId
+        ) nc ON nb.id = nc.notebookId
+        WHERE nb.userId = ? AND nb.workspaceId IS NULL AND nb.isDeleted = 0
+        ORDER BY nb.sortOrder ASC
+      `,
+      )
+      .all(userId, userId, userId, userId);
+  } else if (workspaceId) {
+    // 指定工作区：校验成员身份
+    const role = getUserWorkspaceRole(workspaceId, userId);
+    if (!role) return c.json({ error: "无权访问该工作区" }, 403);
+
+    rows = db
+      .prepare(
+        `
+        WITH RECURSIVE nb_tree(ancestorId, descendantId) AS (
+          SELECT id, id FROM notebooks WHERE workspaceId = ? AND isDeleted = 0
+          UNION ALL
+          SELECT t.ancestorId, n.id
+          FROM nb_tree t
+          INNER JOIN notebooks n ON n.parentId = t.descendantId
+          WHERE n.workspaceId = ? AND n.isDeleted = 0
+        )
+        SELECT nb.*, COALESCE(nc.noteCount, 0) AS noteCount
+        FROM notebooks nb
+        LEFT JOIN (
+          SELECT t.ancestorId AS notebookId, COUNT(notes.id) AS noteCount
+          FROM nb_tree t
+          INNER JOIN notes ON notes.notebookId = t.descendantId
+          WHERE notes.isTrashed = 0 AND notes.workspaceId = ?
+          GROUP BY t.ancestorId
+        ) nc ON nb.id = nc.notebookId
+        WHERE nb.workspaceId = ? AND nb.isDeleted = 0
+        ORDER BY nb.sortOrder ASC
+      `,
+      )
+      .all(workspaceId, workspaceId, workspaceId, workspaceId);
+  } else {
+    // 兼容模式：个人空间
+    rows = db
+      .prepare(
+        `
+        WITH RECURSIVE nb_tree(ancestorId, descendantId) AS (
+          SELECT id, id FROM notebooks
+          WHERE userId = ? AND workspaceId IS NULL AND isDeleted = 0
+          UNION ALL
+          SELECT t.ancestorId, n.id
+          FROM nb_tree t
+          INNER JOIN notebooks n ON n.parentId = t.descendantId
+          WHERE n.userId = ? AND n.workspaceId IS NULL AND n.isDeleted = 0
+        )
+        SELECT nb.*, COALESCE(nc.noteCount, 0) AS noteCount
+        FROM notebooks nb
+        LEFT JOIN (
+          SELECT t.ancestorId AS notebookId, COUNT(notes.id) AS noteCount
+          FROM nb_tree t
+          INNER JOIN notes ON notes.notebookId = t.descendantId
+          WHERE notes.userId = ? AND notes.isTrashed = 0 AND notes.workspaceId IS NULL
+          GROUP BY t.ancestorId
+        ) nc ON nb.id = nc.notebookId
+        WHERE nb.userId = ? AND nb.workspaceId IS NULL AND nb.isDeleted = 0
+        ORDER BY nb.sortOrder ASC
+      `,
+      )
+      .all(userId, userId, userId, userId);
+  }
+
+  return c.json(rows);
+});
+
+// User-facing collaboration entry: notebooks shared with the current user.
+//
+// Return the complete authorized descendant tree for every directly shared root. The query:
+// - never walks upward to ancestors or sideways to siblings;
+// - filters soft-deleted descendants;
+// - de-duplicates overlapping share roots;
+// - keeps the source parentId so clients can rebuild the visible tree;
+// - reports recursive note counts for every visible node.
+app.get("/shared-with-me", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+
+  const rows = db
+    .prepare(
+      `
+      WITH RECURSIVE
+      direct_shared(sharedRootId, inheritedRole) AS (
+        SELECT nb.id, nm.role
+        FROM notebook_members nm
+        JOIN notebooks nb ON nb.id = nm.notebookId
+        WHERE nm.userId = ?
+          AND nm.status = 'active'
+          AND nb.userId <> ?
+          AND nb.isDeleted = 0
+      ),
+      shared_tree(sharedRootId, descendantId, inheritedRole, depth) AS (
+        SELECT sharedRootId, sharedRootId, inheritedRole, 0
+        FROM direct_shared
+        UNION ALL
+        SELECT t.sharedRootId, child.id, t.inheritedRole, t.depth + 1
+        FROM shared_tree t
+        JOIN notebooks child ON child.parentId = t.descendantId
+        WHERE child.isDeleted = 0
+      ),
+      ranked_visible AS (
+        SELECT
+          sharedRootId,
+          descendantId,
+          inheritedRole,
+          depth,
+          ROW_NUMBER() OVER (
+            PARTITION BY descendantId
+            ORDER BY
+              CASE inheritedRole WHEN 'editor' THEN 2 ELSE 1 END DESC,
+              depth ASC,
+              sharedRootId ASC
+          ) AS rankIndex
+        FROM shared_tree
+      ),
+      visible(sharedRootId, descendantId, inheritedRole, depth) AS (
+        SELECT sharedRootId, descendantId, inheritedRole, depth
+        FROM ranked_visible
+        WHERE rankIndex = 1
+      ),
+      visible_tree(ancestorId, descendantId) AS (
+        SELECT descendantId, descendantId
+        FROM visible
+        UNION ALL
+        SELECT tree.ancestorId, child.id
+        FROM visible_tree tree
+        JOIN notebooks child ON child.parentId = tree.descendantId
+        JOIN visible authorized ON authorized.descendantId = child.id
+        WHERE child.isDeleted = 0
+      ),
+      note_counts(notebookId, noteCount) AS (
+        SELECT tree.ancestorId, COUNT(notes.id)
+        FROM visible_tree tree
+        JOIN notes ON notes.notebookId = tree.descendantId
+        WHERE notes.isTrashed = 0
+        GROUP BY tree.ancestorId
+      )
+      SELECT
+        nb.*,
+        visible.sharedRootId,
+        visible.inheritedRole,
+        visible.depth AS sharedDepth,
+        COALESCE(note_counts.noteCount, 0) AS noteCount
+      FROM visible
+      JOIN notebooks nb ON nb.id = visible.descendantId
+      LEFT JOIN note_counts ON note_counts.notebookId = nb.id
+      ORDER BY
+        visible.sharedRootId ASC,
+        visible.depth ASC,
+        nb.sortOrder ASC,
+        nb.createdAt ASC,
+        nb.id ASC
+    `,
+    )
+    .all(userId, userId) as any[];
+
+  return c.json(
+    rows.map((row) => {
+      const { permission } = resolveNotebookPermission(row.id, userId);
+      const canWrite = hasPermission(permission, "write");
+      return {
+        ...row,
+        myRole: canWrite ? "editor" : "viewer",
+        permission,
+      };
+    }),
+  );
+});
+
+app.get("/share/:token", (c) => {
+  const token = c.req.param("token");
+  const link = notebookShareLinksRepository.getByTokenWithDetails(token);
+  if (!link) return c.json({ error: "share link not found" }, 404);
+  if (link.maxUses && link.useCount >= link.maxUses) {
+    return c.json({ error: "邀请链接已达到最大加入人数", code: "SHARE_LINK_USE_LIMIT" }, 410);
+  }
+  return c.json(link);
+});
+
+app.post("/share/:token/join", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const token = c.req.param("token");
+  const link = notebookShareLinksRepository.getEnabledByToken(token);
+  if (!link) return c.json({ error: "share link not found" }, 404);
+  if (link.ownerId === userId) return c.json({ success: true, notebookId: link.notebookId, role: "owner" });
+
+  const role = parseNotebookMemberRole(link.role) || "viewer";
+  const result = db.transaction(() => {
+    const existing = db.prepare(`SELECT role, status, source, sourceId FROM notebook_members
+      WHERE notebookId = ? AND userId = ?`).get(link.notebookId, userId) as
+      | { role: string; status: string; source: string; sourceId: string | null }
+      | undefined;
+    if (existing?.status === "active") {
+      return { success: true as const, role: existing.role, counted: false };
+    }
+    const consumed = db.prepare(`UPDATE notebook_share_links SET useCount = useCount + 1, updatedAt = datetime('now')
+      WHERE id = ? AND enabled = 1 AND (maxUses IS NULL OR useCount < maxUses)`).run(link.id);
+    if (!consumed.changes) return null;
+    notebookMembersRepository.upsert({
+      id: notebookMemberId(link.notebookId, userId), notebookId: link.notebookId, userId,
+      role, invitedBy: link.createdBy, source: "invite_link", sourceId: link.id,
+    });
+    return { success: true as const, role, counted: true };
+  })();
+  if (!result) return c.json({ error: "邀请链接已达到最大加入人数", code: "SHARE_LINK_USE_LIMIT" }, 410);
+  return c.json({ ...result, notebookId: link.notebookId });
+});
+
+app.get("/:id/share-link", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) return c.json({ error: "forbidden" }, 403);
+  return c.json(notebookShareLinksRepository.getLatestEnabledByNotebook(id) || null);
+});
+
+app.post("/:id/share-link", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => ({}));
+  const role = parseNotebookMemberRole(body.role) || "viewer";
+  const expiresAt = typeof body.expiresAt === "string" && body.expiresAt.trim() ? body.expiresAt.trim() : null;
+  const maxUses = body.maxUses === null || body.maxUses === undefined || body.maxUses === ""
+    ? null : Number(body.maxUses);
+  if (maxUses !== null && (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100000)) {
+    return c.json({ error: "maxUses must be 1-100000" }, 400);
+  }
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) return c.json({ error: "forbidden" }, 403);
+
+  const previous = notebookShareLinksRepository.getLatestEnabledByNotebook(id);
+  if (previous) {
+    notebookShareLinksRepository.disableAllByNotebook(id);
+    notebookMembersRepository.removeBySource("invite_link", previous.id);
+  }
+  const linkId = uuid();
+  notebookShareLinksRepository.create({
+    id: linkId, notebookId: id, token: generateShareToken(), role, expiresAt, maxUses, createdBy: userId,
+  });
+  return c.json(notebookShareLinksRepository.getById(linkId), 201);
+});
+
+app.patch("/:id/share-link", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => ({}));
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) return c.json({ error: "forbidden" }, 403);
+  const link = notebookShareLinksRepository.getLatestEnabledByNotebook(id);
+  if (!link) return c.json({ error: "share link not found" }, 404);
+
+  const updates: Parameters<typeof notebookShareLinksRepository.update>[1] = {};
+  if (body.role !== undefined) {
+    const role = parseNotebookMemberRole(body.role);
+    if (!role) return c.json({ error: "role must be editor or viewer" }, 400);
+    updates.role = role;
+  }
+  if (body.expiresAt !== undefined) updates.expiresAt = body.expiresAt ? String(body.expiresAt) : null;
+  if (body.maxUses !== undefined) {
+    const maxUses = body.maxUses === null || body.maxUses === "" ? null : Number(body.maxUses);
+    if (maxUses !== null && (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100000)) {
+      return c.json({ error: "maxUses must be 1-100000" }, 400);
+    }
+    updates.maxUses = maxUses;
+  }
+  if (body.resetUses === true) updates.useCount = 0;
+  if (body.rotateToken === true) {
+    updates.token = generateShareToken();
+    updates.useCount = 0;
+  }
+  if (body.enabled !== undefined) updates.enabled = body.enabled ? 1 : 0;
+  if (!Object.keys(updates).length) return c.json({ error: "no changes" }, 400);
+
+  notebookShareLinksRepository.update(link.id, updates);
+  if (updates.role || updates.enabled === 0) {
+    if (updates.enabled === 0) notebookMembersRepository.removeBySource("invite_link", link.id);
+    else notebookMembersRepository.restrictBySource("invite_link", link.id, {
+      role: updates.role === "editor" ? "editor" : "viewer", allowDownload: true, allowReshare: false,
+    });
+  }
+  return c.json(notebookShareLinksRepository.getById(link.id));
+});
+
+app.delete("/:id/share-link", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) return c.json({ error: "forbidden" }, 403);
+  const link = notebookShareLinksRepository.getLatestEnabledByNotebook(id);
+  notebookShareLinksRepository.disableAllByNotebook(id);
+  const removedMembers = link ? notebookMembersRepository.removeBySource("invite_link", link.id) : 0;
+  return c.json({ success: true, removedMembers });
+});
+
+app.get("/:id/members", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+
+  const members = notebookMembersRepository.listByNotebook(id);
+
+  return c.json(members);
+});
+
+app.post("/:id/members", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json();
+  const targetUserId = String(body.userId || "").trim();
+  const role = parseNotebookMemberRole(body.role);
+
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  if (!targetUserId || !role) {
+    return c.json({ error: "userId and role are required" }, 400);
+  }
+
+  const target = db
+    .prepare("SELECT id FROM users WHERE id = ? AND isDisabled = 0")
+    .get(targetUserId) as { id: string } | undefined;
+  if (!target) return c.json({ error: "user not found" }, 404);
+
+  notebookMembersRepository.upsert({
+    id: notebookMemberId(id, targetUserId),
+    notebookId: id,
+    userId: targetUserId,
+    role,
+    invitedBy: userId,
+  });
+
+  const member = notebookMembersRepository.getByNotebookAndUser(id, targetUserId);
+  return c.json(member, 201);
+});
+
+app.patch("/:id/members/:memberUserId", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const memberUserId = c.req.param("memberUserId");
+  const body = await c.req.json();
+  const role = parseNotebookMemberRole(body.role);
+
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  if (!role) return c.json({ error: "role must be editor or viewer" }, 400);
+
+  const member = notebookMembersRepository.getRole(id, memberUserId);
+  if (!member) return c.json({ error: "member not found" }, 404);
+  if (member.role === "owner") {
+    return c.json({ error: "owner role cannot be changed here" }, 400);
+  }
+
+  notebookMembersRepository.updateRole(id, memberUserId, role);
+
+  return c.json({ success: true });
+});
+
+app.delete("/:id/members/:memberUserId", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const memberUserId = c.req.param("memberUserId");
+
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+
+  const member = notebookMembersRepository.getRole(id, memberUserId);
+  if (!member) return c.json({ error: "member not found" }, 404);
+  if (member.role === "owner") {
+    return c.json({ error: "owner cannot be removed here" }, 400);
+  }
+
+  notebookMembersRepository.remove(id, memberUserId);
+
+  return c.json({ success: true });
+});
+
+// 创建笔记本
+app.post("/", async (c) => {
+  const perfEnabled = notebookPerfDiagnosticsEnabled;
+  const routeStartedAt = perfEnabled ? performance.now() : 0;
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const body = await c.req.json();
+  const parsedAt = perfEnabled ? performance.now() : 0;
+  const workspaceId: string | null = body.workspaceId || null;
+
+  // 如果指定了工作区，必须是 editor 以上角色
+  if (workspaceId) {
+    const role = getUserWorkspaceRole(workspaceId, userId);
+    if (!hasRole(role, "editor")) {
+      return c.json({ error: "您在该工作区无创建权限" }, 403);
+    }
+  }
+  const permissionCheckedAt = perfEnabled ? performance.now() : 0;
+
+  // v14：父笔记本若已被软删（在回收站里），不允许在其下创建子笔记本——
+  // 否则新建的子笔记本会立刻 "看不见"（被父级 isDeleted 过滤掉）。
+  if (body.parentId) {
+    const parent = db
+      .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+      .get(body.parentId) as { isDeleted: number } | undefined;
+    if (!parent) return c.json({ error: "父笔记本不存在" }, 404);
+    if (parent.isDeleted === 1) {
+      return c.json(
+        { error: "父笔记本已删除，无法在其下创建", code: "PARENT_NOTEBOOK_TRASHED" },
+        400,
+      );
+    }
+  }
+  const parentCheckedAt = perfEnabled ? performance.now() : 0;
+
+  const id = uuid();
+  const legacyNotebookCreateTx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO notebooks (id, userId, workspaceId, parentId, name, icon, color, sortOrder)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      userId,
+      workspaceId,
+      body.parentId || null,
+      body.name,
+      body.icon || "📒",
+      body.color || null,
+      body.sortOrder || 0,
+    );
+    synchronizeLegacyNotebookHierarchy({
+      db,
+      notebookId: id,
+      actorUserId: userId,
+      reason: "create",
+      parentMode: "resource",
+    });
+  });
+  legacyNotebookCreateTx();
+  const insertedAt = perfEnabled ? performance.now() : 0;
+  const notebook = db.prepare("SELECT * FROM notebooks WHERE id = ?").get(id);
+  if (perfEnabled) {
+    const selectedAt = performance.now();
+    const timings = {
+      parse: parsedAt - routeStartedAt,
+      permission: permissionCheckedAt - parsedAt,
+      parent: parentCheckedAt - permissionCheckedAt,
+      insert: insertedAt - parentCheckedAt,
+      select: selectedAt - insertedAt,
+      route: selectedAt - routeStartedAt,
+    };
+    c.header(
+      "Server-Timing",
+      Object.entries(timings).map(([name, duration]) => `${name};dur=${duration.toFixed(3)}`).join(", "),
+    );
+    console.info("[phase-b:notebook-create]", JSON.stringify({ id, workspaceId, parentId: body.parentId || null, ...timings }));
+  }
+  return c.json(notebook, 201);
+});
+
+// 复制个人空间笔记本到团队空间（V1 只支持 copy，不支持 move）
+app.post("/:id/transfer", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => ({}));
+
+  try {
+    const result = copyPersonalNotebookToWorkspace({
+      actorUserId: userId,
+      sourceNotebookId: id,
+      targetWorkspaceId: String(body.targetWorkspaceId || ""),
+      targetParentId: body.targetParentId ?? null,
+      mode: body.mode || "copy",
+      includeTags: body.includeTags !== false,
+      includeAttachments: body.includeAttachments !== false,
+      includeVersions: body.includeVersions === true,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    if (err instanceof WorkspaceNotebookTransferError) {
+      return c.json({ error: err.message, code: err.code }, err.status);
+    }
+    console.error("[notebooks.transfer] failed:", err);
+    return c.json({ error: "transfer failed", code: "TRANSFER_FAILED" }, 500);
+  }
+});
+
+// 移动笔记本
+app.put("/:id/move", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json();
+
+  const newParentId: string | null | undefined = body.parentId;
+  const newSortOrder: number | undefined =
+    typeof body.sortOrder === "number" ? body.sortOrder : undefined;
+
+  const { permission, workspaceId } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "write")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+
+  // v14：禁止操作已软删（在回收站）的笔记本——视同不存在
+  const cur = db
+    .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+    .get(id) as { isDeleted: number } | undefined;
+  if (!cur || cur.isDeleted === 1) {
+    return c.json({ error: "notebook not found" }, 404);
+  }
+
+  if (newParentId !== undefined && newParentId !== null) {
+    if (newParentId === id) {
+      return c.json({ error: "cannot move notebook into itself" }, 400);
+    }
+    const parent = db
+      .prepare(
+        "SELECT id, userId, workspaceId FROM notebooks WHERE id = ? AND isDeleted = 0",
+      )
+      .get(newParentId) as { id: string; userId: string; workspaceId: string | null } | undefined;
+    if (!parent) return c.json({ error: "target parent not found" }, 404);
+
+    // 父笔记本必须和当前笔记本同属一个空间
+    if ((parent.workspaceId || null) !== (workspaceId || null)) {
+      return c.json({ error: "cannot move notebook across workspaces" }, 400);
+    }
+    const parentPerm = resolveNotebookPermission(newParentId, userId);
+    if (!hasPermission(parentPerm.permission, "write")) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+
+    // 循环引用防护
+    let cursor: string | null = newParentId;
+    const visited = new Set<string>();
+    while (cursor) {
+      if (visited.has(cursor)) break;
+      visited.add(cursor);
+      if (cursor === id) {
+        return c.json({ error: "cannot move notebook into its own descendant" }, 400);
+      }
+      const row = db.prepare("SELECT parentId FROM notebooks WHERE id = ?").get(cursor) as
+        | { parentId: string | null }
+        | undefined;
+      cursor = row?.parentId ?? null;
+    }
+  }
+
+  const sets: string[] = [];
+  const args: any[] = [];
+  if (newParentId !== undefined) {
+    sets.push("parentId = ?");
+    args.push(newParentId);
+  }
+  if (newSortOrder !== undefined) {
+    sets.push("sortOrder = ?");
+    args.push(newSortOrder);
+  }
+  sets.push("updatedAt = datetime('now')");
+  args.push(id);
+
+  const legacyNotebookMoveTx = db.transaction(() => {
+    db.prepare(`UPDATE notebooks SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+    synchronizeLegacyNotebookHierarchy({
+      db,
+      notebookId: id,
+      actorUserId: userId,
+      reason: newParentId !== undefined ? "move" : "reorder",
+      parentMode: newParentId !== undefined ? "resource" : "preserve",
+    });
+  });
+  legacyNotebookMoveTx();
+  const notebook = db.prepare("SELECT * FROM notebooks WHERE id = ?").get(id);
+  return c.json(notebook);
+});
+
+// 批量更新笔记本排序
+app.put("/reorder/batch", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const body = await c.req.json();
+  const items: { id: string; sortOrder: number }[] = body.items;
+  if (!Array.isArray(items)) return c.json({ error: "items is required" }, 400);
+
+  // 逐条校验权限
+  const stmt = db.prepare("UPDATE notebooks SET sortOrder = ? WHERE id = ?");
+  const updateMany = db.transaction((list: { id: string; sortOrder: number }[]) => {
+    for (const item of list) {
+      const { permission } = resolveNotebookPermission(item.id, userId);
+      if (hasPermission(permission, "write")) {
+        stmt.run(item.sortOrder, item.id);
+        synchronizeLegacyNotebookHierarchy({
+          db,
+          notebookId: item.id,
+          actorUserId: userId,
+          reason: "reorder",
+          parentMode: "preserve",
+        });
+      }
+    }
+  });
+  updateMany(items);
+  return c.json({ success: true });
+});
+
+// 更新笔记本
+app.put("/:id", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+  const body = await c.req.json();
+
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "write")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+
+  // v14：已软删的笔记本视同不存在，禁止重命名 / 改图标 / 改父级
+  const cur = db
+    .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+    .get(id) as { isDeleted: number } | undefined;
+  if (!cur || cur.isDeleted === 1) {
+    return c.json({ error: "notebook not found" }, 404);
+  }
+
+  const legacyNotebookUpdateTx = db.transaction(() => {
+    db.prepare(
+      `
+      UPDATE notebooks SET name = COALESCE(?, name), icon = COALESCE(?, icon),
+      color = COALESCE(?, color), parentId = COALESCE(?, parentId),
+      sortOrder = COALESCE(?, sortOrder), isExpanded = COALESCE(?, isExpanded),
+      updatedAt = datetime('now')
+      WHERE id = ?
+    `,
+    ).run(
+      body.name,
+      body.icon,
+      body.color,
+      body.parentId,
+      body.sortOrder,
+      body.isExpanded,
+      id,
+    );
+    if (body.parentId !== undefined || body.sortOrder !== undefined || body.isExpanded !== undefined) {
+      synchronizeLegacyNotebookHierarchy({
+        db,
+        notebookId: id,
+        actorUserId: userId,
+        reason: body.parentId !== undefined ? "move" : body.sortOrder !== undefined ? "reorder" : "metadata",
+        parentMode: body.parentId !== undefined ? "resource" : "preserve",
+      });
+    }
+  });
+  legacyNotebookUpdateTx();
+  const notebook = db.prepare("SELECT * FROM notebooks WHERE id = ?").get(id);
+  return c.json(notebook);
+});
+
+// 删除笔记本
+//
+// v14 起改为「软删除 + 笔记进回收站」语义：
+//   - 不再 DELETE FROM notebooks（避免 ON DELETE CASCADE 把笔记直接物理删除，
+//     导致回收站里看不到这些笔记）；
+//   - 当前笔记本及其全部子孙笔记本一并 isDeleted=1，从侧边栏消失；
+//   - 这些笔记本下的所有 notes 标记 isTrashed=1，进入回收站，等用户从回收站
+//     永久删除时再走 reclaimSpace。
+//
+// 注：
+//   - attachments 物理文件、Y.Doc 内存房间不在此处清理——笔记还在回收站，
+//     用户可能恢复，过早删文件会让恢复出来的笔记图片裂掉。统一推迟到
+//     /notes/trash/empty 与 /notes/:id（永久删除）路径处理。
+//   - 因为没有真删任何行，也不需要 reclaimSpace；磁盘体量在用户清空回收站
+//     时才发生显著变化，行为符合直觉。
+app.delete("/:id", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+
+  const { permission } = resolveNotebookPermission(id, userId);
+  if (!hasPermission(permission, "manage")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+
+  // 已经是软删态：幂等返回成功，避免重复点击导致 trashedAt 抖动。
+  const cur = db
+    .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+    .get(id) as { isDeleted: number } | undefined;
+  if (!cur) return c.json({ error: "notebook not found" }, 404);
+  if (cur.isDeleted === 1) {
+    return c.json({ success: true, removedNoteCount: 0, alreadyDeleted: true });
+  }
+
+  // 递归收集当前笔记本 + 所有子孙笔记本 id（限定 isDeleted=0，避免把之前已软删
+  // 的某个分支再次 "重新软删" 把 trashedAt 覆盖掉）。
+  let nbIds: string[] = [];
+  try {
+    nbIds = (db
+      .prepare(
+        `WITH RECURSIVE sub(id) AS (
+           SELECT id FROM notebooks WHERE id = ? AND isDeleted = 0
+           UNION ALL
+           SELECT n.id FROM notebooks n JOIN sub ON n.parentId = sub.id
+           WHERE n.isDeleted = 0
+         )
+         SELECT id FROM sub`,
+      )
+      .all(id) as { id: string }[]).map((r) => r.id);
+  } catch (e) {
+    console.warn(
+      "[notebooks.delete] collect descendant notebookIds failed:",
+      (e as Error).message,
+    );
+  }
+  if (nbIds.length === 0) nbIds = [id]; // 兜底
+
+  // 收集所有受影响的笔记 id（仅未在回收站的；已经 isTrashed=1 的不动 trashedAt）
+  let trashedNoteIds: string[] = [];
+  try {
+    const placeholders = nbIds.map(() => "?").join(",");
+    trashedNoteIds = (db
+      .prepare(
+        `SELECT id FROM notes
+          WHERE notebookId IN (${placeholders}) AND isTrashed = 0`,
+      )
+      .all(...nbIds) as { id: string }[]).map((r) => r.id);
+  } catch (e) {
+    console.warn(
+      "[notebooks.delete] collect noteIds failed:",
+      (e as Error).message,
+    );
+  }
+
+  // 一个事务内：标记笔记本 isDeleted=1 + 把直属未回收的笔记移入回收站
+  const placeholders = nbIds.map(() => "?").join(",");
+  const legacyNotebookDeleteTx = db.transaction(() => {
+    db.prepare(
+      `UPDATE notebooks
+          SET isDeleted = 1,
+              deletedAt = datetime('now'),
+              updatedAt = datetime('now')
+        WHERE id IN (${placeholders}) AND isDeleted = 0`,
+    ).run(...nbIds);
+
+    if (trashedNoteIds.length > 0) {
+      const noteIn = trashedNoteIds.map(() => "?").join(",");
+      db.prepare(
+        `UPDATE notes
+            SET isTrashed = 1,
+                trashedAt = datetime('now'),
+                updatedAt = datetime('now')
+          WHERE id IN (${noteIn})`,
+      ).run(...trashedNoteIds);
+    }
+
+    for (const notebookId of nbIds) {
+      synchronizeLegacyNotebookHierarchy({
+        db,
+        notebookId,
+        actorUserId: userId,
+        reason: "delete",
+        parentMode: "preserve",
+      });
+    }
+    for (const noteId of trashedNoteIds) {
+      synchronizeLegacyNoteHierarchy({
+        db,
+        noteId,
+        actorUserId: userId,
+        reason: "delete",
+        parentMode: "preserve",
+      });
+    }
+  });
+
+  try {
+    legacyNotebookDeleteTx();
+  } catch (e) {
+    console.error("[notebooks.delete] soft-delete tx failed:", (e as Error).message);
+    return c.json({ error: "删除失败" }, 500);
+  }
+
+  // SYNC-DELETE-01-B-R: 删除笔记本时，其下笔记被标为 isTrashed=1，
+  // 需要广播 note:deleted(trashed=true) 让其它客户端实时从列表移除
+  for (const noteId of trashedNoteIds) {
+    try { broadcastNoteDeleted(noteId, { actorUserId: userId, trashed: true }); } catch {}
+  }
+
+  return c.json({
+    success: true,
+    softDeletedNotebookCount: nbIds.length,
+    trashedNoteCount: trashedNoteIds.length,
+    trashedNoteIds,
+  });
+});
+
+export default app;
+// 保留给其他模块使用
+export { buildVisibilityWhere };

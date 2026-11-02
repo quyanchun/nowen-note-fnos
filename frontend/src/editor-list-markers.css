@@ -1,0 +1,68 @@
+/*
+ * Tiptap 3 renders TaskItem through a custom NodeView. During editor rendering
+ * that DOM can expose the configured `.task-item` class before `data-type` is
+ * present, so the generic unordered-list pseudo marker must exclude both forms.
+ *
+ * This file is imported after index.css and intentionally contains only the
+ * compatibility overrides needed by the editor/list regression fix.
+ */
+
+.ProseMirror ul > li.task-item::before,
+.shared-note-content ul > li.task-item::before {
+  content: none !important;
+}
+
+/*
+ * Give every custom bullet a stable one-em box. Centering the glyph removes the
+ * horizontal drift caused by the different font bearings of • / ◦ / ▪.
+ */
+.ProseMirror ul > li:not([data-type="taskItem"]):not(.task-item):not(.task-list-item)::before,
+.shared-note-content ul > li:not([data-type="taskItem"]):not(.task-item):not(.task-list-item)::before {
+  left: -1.25em;
+  width: 1em;
+  text-align: center;
+}
+
+/* Center the marker against the first 1.6-line-height text row. */
+.ProseMirror ul,
+.shared-note-content ul {
+  --nowen-ul-marker-top: 0.3em;
+}
+
+/* The square glyph is visually taller, so it needs a slightly smaller offset. */
+.ProseMirror ul ul ul,
+.ProseMirror ul ul ul ul ul ul,
+.ProseMirror ul ul ul ul ul ul ul ul ul,
+.shared-note-content ul ul ul,
+.shared-note-content ul ul ul ul ul ul,
+.shared-note-content ul ul ul ul ul ul ul ul ul {
+  --nowen-ul-marker-top: 0.25em;
+}
+
+/*
+ * Completed task visual state.
+ *
+ * Keep task status inside the editor node attributes and only change the
+ * presentation layer. This avoids modifying markdown content, sync payloads,
+ * and import/export behavior.
+ */
+.ProseMirror li.task-item[data-checked="true"] > div > p,
+.ProseMirror li.task-item[data-checked="true"] > p,
+.shared-note-content li.task-item[data-checked="true"] > div > p,
+.shared-note-content li.task-item[data-checked="true"] > p {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+  text-decoration-color: currentColor;
+  opacity: 0.72;
+  transition: color 0.15s ease, opacity 0.15s ease, text-decoration-color 0.15s ease;
+}
+
+/* Support Tiptap task item implementations where the checked state is on the input. */
+.ProseMirror li.task-item:has(> label input[type="checkbox"]:checked) > div > p,
+.ProseMirror li.task-item:has(> label input[type="checkbox"]:checked) > p,
+.shared-note-content li.task-item:has(> input[type="checkbox"]:checked) > div > p,
+.shared-note-content li.task-item:has(> input[type="checkbox"]:checked) > p {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+  opacity: 0.72;
+}

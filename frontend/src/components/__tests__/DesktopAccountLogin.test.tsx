@@ -1,0 +1,17 @@
+import React,{act} from "react";
+import {createRoot,type Root} from "react-dom/client";
+import {beforeEach,afterEach,it,expect,vi} from "vitest";
+import DesktopAccountLogin from "../DesktopAccountLogin";
+const mocks=vi.hoisted(()=>({info:vi.fn(),start:vi.fn(),status:vi.fn(),cancel:vi.fn(),server:vi.fn(),tokens:vi.fn()}));
+vi.mock("react-i18next",()=>({useTranslation:()=>({t:(key:string)=>key})}));
+vi.mock("@/lib/api",()=>({setServerUrl:mocks.server}));
+vi.mock("@/lib/authSession",()=>({storeAuthTokens:mocks.tokens}));
+Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});
+let root:Root,host:HTMLElement;
+beforeEach(()=>{vi.resetAllMocks();mocks.info.mockResolvedValue({available:true,serverUrl:"https://nas.test/app/nowen-note-private"});Object.assign(window,{nowenDesktop:{accountLogin:mocks}});host=document.createElement("div");document.body.appendChild(host);root=createRoot(host);});
+afterEach(()=>{act(()=>root.unmount());host.remove();Reflect.deleteProperty(window,"nowenDesktop");});
+const mount=async(login=vi.fn())=>{await act(async()=>root.render(<DesktopAccountLogin onLogin={login} onUnavailable={vi.fn()}/>));return login;};
+const button=(suffix:string)=>[...host.querySelectorAll("button")].find(node=>node.textContent?.includes("desktopAccountLogin."+suffix))!;
+it("first install offers NAS and password sign-in without a managed local account",async()=>{await mount();expect(host.querySelectorAll('[role="tab"]').length).toBe(2);expect(host.textContent).not.toMatch(/desktop@|Local Desktop|本地账号/);expect((host.querySelector("input") as HTMLInputElement).value).toBe("https://nas.test");});
+it("NAS authorization signs into the local workspace only after automatic setup succeeds",async()=>{const login={token:"local-token",refreshToken:"local-refresh",user:{id:"bound-user"},serverUrl:"http://127.0.0.1:57892"};mocks.start.mockResolvedValue({requestId:"grant"});mocks.status.mockResolvedValue({status:"connected",login});const onLogin=await mount();await act(async()=>host.querySelector("form")!.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true})));expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({method:"nas",serverUrl:"https://nas.test"}));expect(mocks.tokens).toHaveBeenCalledWith({token:"local-token",refreshToken:"local-refresh"});expect(onLogin).toHaveBeenCalledWith("local-token",login.user);expect(mocks.server).toHaveBeenCalledWith(login.serverUrl);});
+it("failed authorization preserves the login screen and does not install credentials",async()=>{mocks.start.mockResolvedValue({error:"NAS unavailable"});const onLogin=await mount();await act(async()=>host.querySelector("form")!.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true})));expect(host.querySelector('[role="alert"]')?.textContent).toBe("NAS unavailable");expect(onLogin).not.toHaveBeenCalled();expect(mocks.tokens).not.toHaveBeenCalled();await act(async()=>button("password").click());expect(host.querySelector('input[type="password"]')).not.toBeNull();});

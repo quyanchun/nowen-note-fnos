@@ -1,0 +1,556 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { ChevronDown, ChevronRight, PanelLeft, PanelLeftClose, PanelTopClose, PanelTopOpen, Settings, Tags, Trash2, X, CircleDot, Bell, Search } from "lucide-react";
+import { useTranslation } from "react-i18next";
+
+import KnowledgeTreePanel, {
+  FOCUS_KNOWLEDGE_TREE_EVENT,
+  KNOWLEDGE_TREE_CHANGED_EVENT,
+} from "@/components/KnowledgeTreeCreateMenuRuntime";
+import MobileKnowledgeTreePanel from "@/components/MobileKnowledgeTreePanel";
+import { OPEN_KNOWLEDGE_TREE_EVENT } from "@/components/KnowledgeTreeDrawer";
+import TagColorPopover from "@/components/TagColorPopover";
+import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
+import { useRailMode } from "@/hooks/useRailMode";
+import { useMobileRailHidden } from "@/hooks/useMobileRailHidden";
+import { useMobileSidebarControlsCollapsed } from "@/hooks/useMobileSidebarControlsCollapsed";
+import { useSidebarTextStyle } from "@/hooks/useSidebarTextStyle";
+import { HomeButton } from "@/components/AppHeader";
+import { useUserPreferences } from "@/hooks/useUserPreferences";
+import { api, getCurrentWorkspace } from "@/lib/api";
+import { openWorkspaceIssue, OPEN_NOTIFICATIONS_EVENT } from "@/lib/workspaceIssueNavigation";
+import { isMobileLocalMode } from "@/lib/mobileLocalMode";
+import { filterTagsByQuery } from "@/lib/tagSearch";
+import { isNavigationModuleVisible } from "@/lib/navigationVisibility";
+import { refreshKnowledgeTreeScrollbars } from "@/lib/knowledgeTreeScrollbarBridge";
+import {
+  DESKTOP_KNOWLEDGE_TREE_VIEW_MODE_CHANGED_EVENT,
+  DESKTOP_KNOWLEDGE_TREE_VIEW_MODE_STORAGE_KEY,
+  loadDesktopKnowledgeTreeViewMode,
+  type DesktopKnowledgeTreeViewMode,
+} from "@/lib/mobileKnowledgeTreeViewMode";
+import { cn } from "@/lib/utils";
+import { useApp, useAppActions } from "@/store/AppContext";
+
+interface DeleteTagTarget {
+  id: string;
+  name: string;
+  color: string;
+}
+
+interface TagColorTarget {
+  tagId: string;
+  tagName: string;
+  color: string;
+  x: number;
+  y: number;
+}
+
+/**
+ * Keep the desktop tree scrollbar discoverable even when Chromium/Windows uses
+ * auto-hiding overlay scrollbars. Mobile keeps its native touch-scrolling UI.
+ */
+export const KNOWLEDGE_TREE_SCROLLBAR_CSS = `
+[data-sidebar-variant="desktop"] [data-swipe-blocker="knowledge-tree-scroll"] {
+  overflow-y: scroll !important;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: var(--pm-scrollbar) transparent;
+}
+
+[data-sidebar-variant="desktop"] [data-swipe-blocker="knowledge-tree-scroll"]::-webkit-scrollbar {
+  width: 9px;
+}
+
+[data-sidebar-variant="desktop"] [data-swipe-blocker="knowledge-tree-scroll"]::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+[data-sidebar-variant="desktop"] [data-swipe-blocker="knowledge-tree-scroll"]::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 2.5px solid transparent;
+  border-radius: 999px;
+  background: var(--pm-scrollbar);
+  background-clip: content-box;
+  transition: border-width 140ms ease, background-color 120ms ease;
+}
+
+[data-sidebar-variant="desktop"] [data-swipe-blocker="knowledge-tree-scroll"]::-webkit-scrollbar-thumb:hover {
+  border-width: 1.5px;
+  background: var(--pm-scrollbar-hover);
+  background-clip: content-box;
+}
+`;
+
+/**
+ * Unified sidebar.
+ *
+ * 桌面端默认保留递归目录树，并可按本地偏好切换为快捷浏览；移动端默认使用快捷浏览。
+ */
+export default function Sidebar({ variant = "mobile", embedded = false }: { variant?: "desktop" | "mobile"; embedded?: boolean } = {}) {
+  const { state } = useApp();
+  const actions = useAppActions();
+  const { t } = useTranslation();
+  const { prefs: userPrefs } = useUserPreferences();
+  const [railMode, setRailMode] = useRailMode();
+  const [mobileControlsCollapsed, setMobileControlsCollapsed] = useMobileSidebarControlsCollapsed();
+  const [sidebarTextStyle] = useSidebarTextStyle();
+  const classicText = sidebarTextStyle === "classic";
+  const [mobileRailHidden, setMobileRailHidden] = useMobileRailHidden();
+  const showNotifications = variant === "mobile" && mobileRailHidden
+    && isNavigationModuleVisible("notifications", userPrefs.hiddenNavigationModules);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const tagLongPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tagLongPressFired = useRef(false);
+  const noteWorkspaceActive = !["home", "tasks", "mindmaps", "ai-chat", "diary", "files", "shares", "issues"].includes(state.viewMode);
+
+  const [tagsExpanded, setTagsExpanded] = useState(() => {
+    try {
+      const saved = localStorage.getItem("nowen-tags-expanded");
+      return saved === null ? true : saved === "true";
+    } catch {
+      return true;
+    }
+  });
+  const [tagSearchQuery, setTagSearchQuery] = useState("");
+  const filteredTags = useMemo(
+    () => filterTagsByQuery(state.tags, tagSearchQuery),
+    [state.tags, tagSearchQuery],
+  );
+  const [deleteTagTarget, setDeleteTagTarget] = useState<DeleteTagTarget | null>(null);
+  const [tagColorPopover, setTagColorPopover] = useState<TagColorTarget | null>(null);
+  const [desktopKnowledgeTreeMode, setDesktopKnowledgeTreeMode] = useState<DesktopKnowledgeTreeViewMode>(
+    () => loadDesktopKnowledgeTreeViewMode(),
+  );
+
+  useEffect(() => {
+    const syncMode = () => setDesktopKnowledgeTreeMode(loadDesktopKnowledgeTreeViewMode());
+    const syncStorage = (event: StorageEvent) => {
+      if (event.key === DESKTOP_KNOWLEDGE_TREE_VIEW_MODE_STORAGE_KEY) syncMode();
+    };
+    window.addEventListener(DESKTOP_KNOWLEDGE_TREE_VIEW_MODE_CHANGED_EVENT, syncMode);
+    window.addEventListener("storage", syncStorage);
+    return () => {
+      window.removeEventListener(DESKTOP_KNOWLEDGE_TREE_VIEW_MODE_CHANGED_EVENT, syncMode);
+      window.removeEventListener("storage", syncStorage);
+    };
+  }, []);
+
+  const refreshSidebarData = useCallback(async () => {
+    try {
+      const [notebooks, tags] = await Promise.all([api.getNotebooks(), api.getTags()]);
+      actions.setNotebooks(notebooks);
+      actions.setTags(tags);
+    } catch (error) {
+      console.error("[Sidebar] failed to refresh unified sidebar data:", error);
+    }
+  }, [actions]);
+
+  useEffect(() => {
+    void refreshSidebarData();
+    const refresh = () => void refreshSidebarData();
+    window.addEventListener("nowen:workspace-changed", refresh);
+    window.addEventListener(KNOWLEDGE_TREE_CHANGED_EVENT, refresh);
+    return () => {
+      window.removeEventListener("nowen:workspace-changed", refresh);
+      window.removeEventListener(KNOWLEDGE_TREE_CHANGED_EVENT, refresh);
+    };
+  }, [refreshSidebarData]);
+
+  useEffect(() => {
+    if (variant !== "desktop") return;
+    refreshKnowledgeTreeScrollbars();
+    return () => refreshKnowledgeTreeScrollbars();
+  }, [variant]);
+
+  useEffect(() => {
+    const focusKnowledgeTree = () => {
+      const root = rootRef.current;
+      if (!root || root.getClientRects().length === 0) return;
+      requestAnimationFrame(() => window.dispatchEvent(new Event(FOCUS_KNOWLEDGE_TREE_EVENT)));
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing) return;
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        focusKnowledgeTree();
+      }
+    };
+    window.addEventListener(OPEN_KNOWLEDGE_TREE_EVENT, focusKnowledgeTree);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener(OPEN_KNOWLEDGE_TREE_EVENT, focusKnowledgeTree);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    if (tagLongPressTimer.current) clearTimeout(tagLongPressTimer.current);
+  }, []);
+
+  const toggleTagsExpanded = () => {
+    setTagsExpanded((current) => {
+      const next = !current;
+      try { localStorage.setItem("nowen-tags-expanded", String(next)); } catch {}
+      return next;
+    });
+  };
+
+  const openTagColor = (target: TagColorTarget) => {
+    setTagColorPopover(target);
+  };
+
+  const handleTagClick = (tagId: string) => {
+    if (tagLongPressFired.current) {
+      tagLongPressFired.current = false;
+      return;
+    }
+
+    const isCurrentlyActive = state.selectedTagIds.includes(tagId);
+    actions.toggleSelectedTag(tagId);
+    actions.setSelectedNotebook(null);
+    const willHaveTags = isCurrentlyActive ? state.selectedTagIds.length > 1 : true;
+    actions.setViewMode(willHaveTags ? "tag" : "all");
+    if (variant === "mobile") actions.setMobileSidebar(false);
+  };
+
+  const deleteTag = async (target: DeleteTagTarget) => {
+    setDeleteTagTarget(null);
+    try {
+      await api.deleteTag(target.id);
+      const tags = await api.getTags();
+      actions.setTags(tags);
+
+      if (!state.selectedTagIds.includes(target.id)) return;
+      const remaining = state.selectedTagIds.filter((id) => id !== target.id);
+      if (remaining.length > 0) {
+        actions.setSelectedTags(remaining);
+      } else {
+        actions.clearSelectedTags();
+        if (state.viewMode === "tag") actions.setViewMode("all");
+      }
+    } catch (error) {
+      console.error("[Sidebar] failed to delete tag:", error);
+    }
+  };
+
+  return (
+    <aside
+      ref={rootRef}
+      className="flex h-full w-full min-w-0 flex-col overflow-hidden border-r border-app-border bg-app-sidebar text-tx-primary"
+      data-unified-sidebar=""
+      data-sidebar-variant={variant}
+    >
+      {variant === "desktop" && (
+        <style data-knowledge-tree-scrollbar="">{KNOWLEDGE_TREE_SCROLLBAR_CSS}</style>
+      )}
+
+      {variant === "desktop" && !embedded && <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-app-border px-3">
+        <HomeButton />
+        {railMode === "hidden" && <button type="button" data-directory-toggle="" onClick={actions.toggleSidebar} title={t("common.collapse")} aria-label={t("common.collapse")} aria-expanded={true} className="shrink-0 rounded-md p-2 text-tx-tertiary hover:bg-app-hover"><PanelLeftClose size={16} /></button>}
+      </header>}
+
+      {variant === "mobile" && <header
+        className="flex shrink-0 items-center justify-between border-b border-app-border px-4 py-3"
+        style={{ paddingTop: "calc(var(--safe-area-top) + 12px)" }}
+      >
+        <div className="flex min-w-0 items-center gap-1">
+          {variant === "mobile" && (
+            <button
+              type="button"
+              onClick={() => setMobileControlsCollapsed(!mobileControlsCollapsed)}
+              title={t(mobileControlsCollapsed ? "sidebar.expandMobileControls" : "sidebar.collapseMobileControls")}
+              aria-label={t(mobileControlsCollapsed ? "sidebar.expandMobileControls" : "sidebar.collapseMobileControls")}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-tx-tertiary transition-colors hover:bg-app-hover hover:text-tx-primary"
+            >
+              {mobileControlsCollapsed ? <PanelTopOpen size={16} /> : <PanelTopClose size={16} />}
+            </button>
+          )}
+          <HomeButton />
+        </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {mobileRailHidden && (
+              <button
+                type="button"
+                data-mobile-rail-show=""
+                onClick={() => setMobileRailHidden(false)}
+                title={t("sidebar.showMobileRail")}
+                aria-label={t("sidebar.showMobileRail")}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-tx-tertiary transition-colors hover:bg-app-hover hover:text-tx-primary"
+              >
+                <PanelLeft size={16} />
+              </button>
+            )}
+            {mobileRailHidden && (
+              <button
+                type="button"
+                data-mobile-sidebar-settings=""
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent("nowen:open-settings"));
+                  actions.setMobileSidebar(false);
+                }}
+                title={t("sidebar.settings")}
+                aria-label={t("sidebar.settings")}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-tx-tertiary transition-colors hover:bg-app-hover hover:text-tx-primary"
+              >
+                <Settings size={16} />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => actions.setMobileSidebar(false)}
+              title={t("common.close")}
+              aria-label={t("common.close")}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-tx-tertiary transition-colors hover:bg-app-hover hover:text-tx-primary"
+            >
+              <X size={16} />
+            </button>
+          </div>
+      </header>}
+
+      {(variant !== "mobile" || !mobileControlsCollapsed) && (
+        <div className="flex shrink-0 items-center gap-1 px-3 py-2">
+          <div className="min-w-0 flex-1"><WorkspaceSwitcher /></div>
+          {variant === "desktop" && railMode === "hidden" && (
+            noteWorkspaceActive ? (
+              <div data-note-workspace-layout-anchor="" className="h-8 w-8 shrink-0" />
+            ) : (
+              <button
+                type="button"
+                onClick={() => setRailMode("icon")}
+                title={t("sidebar.railMode.switchTo.icon")}
+                aria-label={t("sidebar.railMode.switchTo.icon")}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-tx-tertiary transition-colors hover:bg-app-hover hover:text-tx-primary"
+              >
+                <PanelLeft size={16} />
+              </button>
+            )
+          )}
+        </div>
+      )}
+
+      <section className={cn("flex min-h-0 flex-1 flex-col border-t border-app-border/60", variant === "desktop" && "pt-2")}>
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          {variant === "mobile" ? (
+            <MobileKnowledgeTreePanel />
+          ) : desktopKnowledgeTreeMode === "quick" ? (
+            <MobileKnowledgeTreePanel variant="desktop" />
+          ) : (
+            <KnowledgeTreePanel variant="desktop" />
+          )}
+        </div>
+      </section>
+
+      {!isMobileLocalMode() && (getCurrentWorkspace() !== "personal" || showNotifications) && <div className="shrink-0 border-t border-app-border px-2 py-2">
+        {getCurrentWorkspace() !== "personal" && <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-tx-secondary hover:bg-app-hover" onClick={() => { openWorkspaceIssue(null); actions.setViewMode("issues"); actions.setMobileSidebar(false); }}><CircleDot size={15} />{t("sidebar.issues")}</button>}
+        {showNotifications && <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-tx-secondary hover:bg-app-hover" onClick={() => { actions.setMobileSidebar(false); window.dispatchEvent(new Event(OPEN_NOTIFICATIONS_EVENT)); }}><Bell size={15} />{t("sidebar.notifications")}</button>}
+      </div>}
+
+      <section className="shrink-0 border-t border-app-border">
+        <button
+          type="button"
+          onClick={toggleTagsExpanded}
+          className={cn("flex w-full items-center gap-2 px-4 py-2 font-medium transition-colors hover:bg-app-hover hover:text-tx-primary", classicText ? "text-xs text-tx-tertiary" : "text-[13px] text-tx-secondary")}
+          aria-expanded={tagsExpanded}
+        >
+          {tagsExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          <Tags size={13} />
+          <span>{t("sidebar.tags")}</span>
+          <span className="ml-auto tabular-nums">{state.tags.length}</span>
+        </button>
+
+        <AnimatePresence initial={false}>
+          {tagsExpanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.16 }}
+              className="overflow-hidden"
+            >
+              {state.tags.length > 0 && (
+                <div className="px-2 pb-2">
+                  <div role="search" aria-label={t("sidebar.searchTags")} className="flex items-center gap-1.5 rounded-md border border-app-border bg-app-hover/40 px-2 focus-within:border-accent-primary">
+                    <Search size={13} className="shrink-0 text-tx-tertiary" aria-hidden="true" />
+                    <input
+                      type="text"
+                      inputMode="search"
+                      autoComplete="off"
+                      value={tagSearchQuery}
+                      onChange={(event) => setTagSearchQuery(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape" && tagSearchQuery) {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setTagSearchQuery("");
+                        }
+                      }}
+                      placeholder={t("sidebar.searchTags")}
+                      aria-label={t("sidebar.searchTags")}
+                      className="min-w-0 flex-1 bg-transparent py-1.5 text-xs text-tx-primary outline-none placeholder:text-tx-tertiary"
+                    />
+                    {tagSearchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setTagSearchQuery("")}
+                        aria-label={t("sidebar.clearTagSearch")}
+                        className="shrink-0 rounded p-0.5 text-tx-tertiary hover:bg-app-hover hover:text-tx-primary"
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+              <div className="max-h-[min(35vh,260px)] space-y-0.5 overflow-y-auto px-2 pb-2">
+                {state.tags.length === 0 ? (
+                  <p className="px-2 py-1 text-[10px] text-tx-tertiary">{t("sidebar.noTags")}</p>
+                ) : filteredTags.length === 0 ? (
+                  <p role="status" className="px-2 py-1 text-xs text-tx-tertiary">{t("sidebar.noTagMatches")}</p>
+                ) : filteredTags.map((tag) => {
+                  const active = state.selectedTagIds.includes(tag.id);
+                  return (
+                    <div
+                      key={tag.id}
+                      onClick={() => handleTagClick(tag.id)}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        openTagColor({
+                          tagId: tag.id,
+                          tagName: tag.name,
+                          color: tag.color,
+                          x: event.clientX,
+                          y: event.clientY,
+                        });
+                      }}
+                      onTouchStart={(event) => {
+                        const touch = event.touches[0];
+                        if (!touch) return;
+                        tagLongPressFired.current = false;
+                        if (tagLongPressTimer.current) clearTimeout(tagLongPressTimer.current);
+                        tagLongPressTimer.current = setTimeout(() => {
+                          tagLongPressFired.current = true;
+                          openTagColor({
+                            tagId: tag.id,
+                            tagName: tag.name,
+                            color: tag.color,
+                            x: touch.clientX,
+                            y: touch.clientY,
+                          });
+                        }, 500);
+                      }}
+                      onTouchMove={() => {
+                        if (!tagLongPressTimer.current) return;
+                        clearTimeout(tagLongPressTimer.current);
+                        tagLongPressTimer.current = null;
+                      }}
+                      onTouchEnd={() => {
+                        if (!tagLongPressTimer.current) return;
+                        clearTimeout(tagLongPressTimer.current);
+                        tagLongPressTimer.current = null;
+                      }}
+                      className={cn(
+                        "group/tag flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors",
+                        active
+                          ? "bg-app-active text-tx-primary"
+                          : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+                      )}
+                    >
+                      <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: tag.color }} />
+                      <span className="min-w-0 flex-1 truncate" title={tag.name}>{tag.name}</span>
+                      <span className="relative flex h-4 w-5 shrink-0 items-center justify-center">
+                        {tag.noteCount !== undefined && tag.noteCount > 0 && (
+                          <span className="absolute inset-0 flex items-center justify-center text-[10px] tabular-nums text-tx-tertiary transition-opacity [@media(hover:hover)]:group-hover/tag:opacity-0">
+                            {tag.noteCount}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setDeleteTagTarget({ id: tag.id, name: tag.name, color: tag.color });
+                          }}
+                          title={t("common.delete")}
+                          className="absolute inset-0 hidden items-center justify-center text-tx-tertiary transition-colors hover:text-accent-danger [@media(hover:hover)]:group-hover/tag:flex"
+                        >
+                          <X size={12} />
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </section>
+
+      <AnimatePresence>
+        {deleteTagTarget && (
+          <div className="fixed inset-0 z-[260] flex items-center justify-center p-4">
+            <motion.button
+              type="button"
+              aria-label={t("common.close")}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+              onClick={() => setDeleteTagTarget(null)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="relative w-full max-w-sm rounded-xl border border-app-border bg-app-elevated p-5 shadow-2xl"
+            >
+              <div className="mb-3 flex items-center gap-3">
+                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent-danger/10 text-accent-danger">
+                  <Trash2 size={18} />
+                </span>
+                <h4 className="text-base font-bold">{t("sidebar.deleteTagTitle")}</h4>
+              </div>
+              <p className="mb-5 flex items-center gap-2 pl-[52px] text-sm text-tx-secondary">
+                <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: deleteTagTarget.color }} />
+                <span>{t("sidebar.confirmDeleteTag", { name: deleteTagTarget.name })}</span>
+              </p>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setDeleteTagTarget(null)}
+                  className="rounded-lg px-4 py-2 text-sm text-tx-secondary hover:bg-app-hover"
+                >
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void deleteTag(deleteTagTarget)}
+                  className="rounded-lg bg-accent-danger px-4 py-2 text-sm font-medium text-white hover:bg-accent-danger/90"
+                >
+                  {t("sidebar.confirmDelete")}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {tagColorPopover && (
+        <TagColorPopover
+          x={tagColorPopover.x}
+          y={tagColorPopover.y}
+          currentColor={tagColorPopover.color}
+          title={tagColorPopover.tagName}
+          onPick={async (color) => {
+            try {
+              await api.updateTag(tagColorPopover.tagId, { color });
+              actions.setTags(await api.getTags());
+            } catch (error) {
+              console.error("[Sidebar] failed to update tag color:", error);
+            }
+          }}
+          onClose={() => setTagColorPopover(null)}
+        />
+      )}
+    </aside>
+  );
+}

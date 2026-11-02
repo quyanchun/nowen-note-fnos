@@ -1,0 +1,611 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
+import { Hono } from "hono";
+import type Database from "better-sqlite3";
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nowen-user-prefs-"));
+process.env.DB_PATH = path.join(tmpDir, "test.db");
+
+let app: Hono;
+let getDb: () => Database.Database;
+let closeDb: () => void;
+
+const USER_ID = "user-prefs";
+const OTHER_ID = "other-prefs";
+
+function db() {
+  return getDb();
+}
+
+function seedUsers() {
+  db().prepare("INSERT OR IGNORE INTO users (id, username, passwordHash) VALUES (?, ?, ?)").run(USER_ID, USER_ID, "hash");
+  db().prepare("INSERT OR IGNORE INTO users (id, username, passwordHash) VALUES (?, ?, ?)").run(OTHER_ID, OTHER_ID, "hash");
+}
+
+async function requestJson(method: string, url: string, body?: unknown, userId = USER_ID) {
+  const res = await app.request(url, {
+    method,
+    headers: {
+      "X-User-Id": userId,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json() as any };
+}
+
+function writeSetting(key: string, value: string, userId = USER_ID) {
+  db().prepare(`
+    INSERT INTO user_ai_settings (userId, key, value, updatedAt)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(userId, key) DO UPDATE SET value = excluded.value, updatedAt = datetime('now')
+  `).run(userId, key, value);
+}
+
+function readSetting(key: string, userId = USER_ID): string {
+  const row = db().prepare("SELECT value FROM user_ai_settings WHERE userId = ? AND key = ?").get(userId, key) as { value: string } | undefined;
+  return row?.value || "";
+}
+
+test.before(async () => {
+  const [prefsModule, schemaModule] = await Promise.all([
+    import("../src/routes/user-preferences"),
+    import("../src/db/schema"),
+  ]);
+  app = new Hono();
+  app.route("/user-preferences", prefsModule.default);
+  getDb = schemaModule.getDb;
+  closeDb = schemaModule.closeDb;
+  seedUsers();
+});
+
+test.beforeEach(() => {
+  db().prepare("DELETE FROM user_preferences").run();
+  db().prepare("DELETE FROM system_settings WHERE key LIKE 'ai_%'").run();
+  db().prepare("DELETE FROM user_ai_settings").run();
+});
+
+test.after(async () => {
+  closeDb();
+  for (let i = 0; i < 5; i++) {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      return;
+    } catch (err: any) {
+      if (err?.code !== "EBUSY") throw err;
+      if (i === 4) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+});
+
+test("stores user preferences per user", async () => {
+  const put = await requestJson("PUT", "/user-preferences", {
+    noteTitleAsAppTitle: true,
+    folderAutoLockMinutes: 30,
+    folderLockOnBackground: false,
+    showNotesInNotebookTree: true,
+    markdownDefaultViewMode: "split",
+  });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.noteTitleAsAppTitle, true);
+  assert.equal(put.json.folderAutoLockMinutes, 30);
+  assert.equal(put.json.folderLockOnBackground, false);
+  assert.equal(put.json.showNotesInNotebookTree, true);
+  assert.equal(put.json.markdownDefaultViewMode, "split");
+
+  const get = await requestJson("GET", "/user-preferences");
+  assert.equal(get.status, 200);
+  assert.equal(get.json.noteTitleAsAppTitle, true);
+  assert.equal(get.json.folderAutoLockMinutes, 30);
+  assert.equal(get.json.folderLockOnBackground, false);
+  assert.equal(get.json.showNotesInNotebookTree, true);
+  assert.equal(get.json.markdownDefaultViewMode, "split");
+});
+
+test("rejects unsupported folder auto-lock intervals", async () => {
+  const result = await requestJson("PATCH", "/user-preferences", {
+    folderAutoLockMinutes: 10,
+  });
+  assert.equal(result.status, 400);
+  assert.equal(result.json.code, "INVALID_USER_PREFERENCE");
+});
+
+test("does not leak preferences across users", async () => {
+  await requestJson("PUT", "/user-preferences", {
+    noteTitleAsAppTitle: true,
+    enableNoteTabs: true,
+  }, USER_ID);
+
+  const other = await requestJson("GET", "/user-preferences", undefined, OTHER_ID);
+  assert.equal(other.status, 200);
+  assert.equal(other.json.noteTitleAsAppTitle, false);
+  assert.equal(other.json.enableNoteTabs, false);
+});
+
+test("creates one masked default profile from the user's AI settings", async () => {
+  writeSetting("ai_provider", "deepseek");
+  writeSetting("ai_api_url", "https://api.deepseek.com/v1");
+  writeSetting("ai_api_key", "secret-key-1234");
+  writeSetting("ai_model", "deepseek-chat");
+
+  const result = await requestJson("GET", "/user-preferences/ai-profiles");
+
+  assert.equal(result.status, 200);
+  assert.equal(result.json.profiles.length, 1);
+  assert.equal(result.json.profiles[0].provider, "deepseek");
+  assert.equal(result.json.profiles[0].model, "deepseek-chat");
+  assert.equal(result.json.profiles[0].apiKey, "****1234");
+  assert.equal(result.json.profiles[0].apiKeySet, true);
+  assert.equal(result.json.activeProfileId, result.json.profiles[0].id);
+  assert.ok(readSetting("ai_profiles_v1"));
+});
+
+test("creates and activates a profile while keeping legacy AI callers compatible", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "通义生产",
+    provider: "qwen",
+    apiUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+    apiKey: "dash-key-5678",
+    model: "qwen-plus",
+    activate: true,
+  });
+
+  assert.equal(created.status, 201);
+  assert.equal(created.json.profile.apiKey, "****5678");
+  assert.equal(created.json.activeProfileId, created.json.profile.id);
+  assert.equal(readSetting("ai_provider"), "qwen");
+  assert.equal(readSetting("ai_api_url"), "https://dashscope.aliyuncs.com/compatible-mode/v1");
+  assert.equal(readSetting("ai_api_key"), "dash-key-5678");
+  assert.equal(readSetting("ai_model"), "qwen-plus");
+});
+
+test("does not leak AI profiles or active settings across users", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "User A only",
+    provider: "deepseek",
+    apiUrl: "https://user-a.example/v1",
+    apiKey: "user-a-secret",
+    model: "user-a-model",
+    activate: true,
+  }, USER_ID);
+  assert.equal(created.status, 201);
+
+  const other = await requestJson("GET", "/user-preferences/ai-profiles", undefined, OTHER_ID);
+  assert.equal(other.status, 200);
+  assert.equal(other.json.profiles.some((profile: any) => profile.name === "User A only"), false);
+  assert.equal(readSetting("ai_api_key", USER_ID), "user-a-secret");
+  assert.equal(readSetting("ai_api_key", OTHER_ID), "");
+});
+
+test("updating a profile with its masked key preserves the stored secret", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "OpenAI",
+    provider: "openai",
+    apiUrl: "https://api.openai.com/v1",
+    apiKey: "secret-openai-9999",
+    model: "gpt-4o-mini",
+  });
+  const profileId = created.json.profile.id as string;
+
+  const updated = await requestJson("PUT", `/user-preferences/ai-profiles/${profileId}`, {
+    name: "OpenAI 主力",
+    provider: "openai",
+    apiUrl: "https://api.openai.com/v1",
+    apiKey: "****9999",
+    model: "gpt-4o",
+  });
+
+  assert.equal(updated.status, 200);
+  assert.equal(updated.json.profile.apiKey, "****9999");
+  assert.equal(readSetting("ai_api_key"), "secret-openai-9999");
+  assert.equal(readSetting("ai_model"), "gpt-4o");
+});
+
+test("discovers and normalizes OpenAI-compatible model lists", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedAuth = "";
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(input);
+    requestedAuth = new Headers(init?.headers).get("authorization") || "";
+    return new Response(JSON.stringify({
+      data: [
+        { id: "model-b" },
+        { id: "model-a", display_name: "Model A" },
+        { id: "model-b" },
+      ],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await requestJson("POST", "/user-preferences/ai-profiles/discover-models", {
+      name: "Custom",
+      provider: "custom",
+      apiUrl: "https://example.test/v1",
+      apiKey: "key-1",
+      model: "",
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(requestedUrl, "https://example.test/v1/models");
+    assert.equal(requestedAuth, "Bearer key-1");
+    assert.deepEqual(result.json.models, [
+      { id: "model-a", name: "Model A" },
+      { id: "model-b", name: "model-b" },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("discovers Ollama models through the native tags endpoint without an API key", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    assert.equal(String(input), "http://ollama.local:11434/api/tags");
+    return new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await requestJson("POST", "/user-preferences/ai-profiles/discover-models", {
+      name: "Ollama",
+      provider: "ollama",
+      apiUrl: "http://ollama.local:11434/v1",
+      apiKey: "",
+      model: "qwen2.5:7b",
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.models, [{ id: "qwen2.5:7b", name: "qwen2.5:7b" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("tests a saved LM Studio profile while the manual AI runtime is disabled", async () => {
+  writeSetting("ai_manual_enabled", "false");
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "LAN LM Studio",
+    provider: "lmstudio",
+    apiUrl: "http://192.168.0.111:1234/v1",
+    apiKey: "",
+    model: "lmstudio-community/qwen3.5-9b",
+    activate: true,
+  });
+  const profileId = created.json.profile.id as string;
+  assert.equal(created.status, 201);
+  assert.equal(readSetting("ai_api_url"), "", "disabled runtime must remain empty");
+
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedBody: any = null;
+  let requestedAuth = "";
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(input);
+    requestedBody = JSON.parse(String(init?.body || "{}"));
+    requestedAuth = new Headers(init?.headers).get("authorization") || "";
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: "OK" } }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await requestJson("POST", `/user-preferences/ai-profiles/${profileId}/test`, {});
+    assert.equal(result.status, 200);
+    assert.equal(result.json.success, true);
+    assert.match(result.json.message, /开启顶部.*手动 AI 配置/);
+    assert.equal(requestedUrl, "http://192.168.0.111:1234/v1/chat/completions");
+    assert.equal(requestedBody.model, "lmstudio-community/qwen3.5-9b");
+    assert.equal(requestedBody.stream, false);
+    assert.equal(requestedAuth, "");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("returns actionable LAN diagnostics when the Nowen server cannot reach LM Studio", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "Offline LM Studio",
+    provider: "lmstudio",
+    apiUrl: "http://192.168.0.111:1234/v1",
+    apiKey: "",
+    model: "local-model",
+  });
+  const profileId = created.json.profile.id as string;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    const failure = new TypeError("fetch failed") as TypeError & { cause?: { code: string; message: string } };
+    failure.cause = { code: "ECONNREFUSED", message: "connect ECONNREFUSED 192.168.0.111:1234" };
+    throw failure;
+  }) as typeof fetch;
+
+  try {
+    const result = await requestJson("POST", `/user-preferences/ai-profiles/${profileId}/test`, {});
+    assert.equal(result.status, 502);
+    assert.equal(result.json.code, "AI_UPSTREAM_UNREACHABLE");
+    assert.match(result.json.error, /Serve on Local Network/);
+    assert.match(result.json.error, /1234/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("chat discovery filters embedding, rerank, and feature-extraction models", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: [
+      { id: "BAAI/bge-m3" },
+      { id: "deepseek-ai/DeepSeek-V4-Flash" },
+      { id: "BAAI/bge-reranker-v2-m3" },
+      { id: "private-vector-model", task: "feature-extraction" },
+      { id: "my-chat-model", capabilities: { chat: true, embedding: true } },
+    ],
+  }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+
+  try {
+    const result = await requestJson("POST", "/user-preferences/ai-profiles/discover-models", {
+      name: "SiliconFlow",
+      provider: "custom",
+      apiUrl: "https://api.siliconflow.cn/v1",
+      apiKey: "siliconflow-key",
+      model: "",
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.models.map((model: any) => model.id), [
+      "deepseek-ai/DeepSeek-V4-Flash",
+      "my-chat-model",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("an embedding-only provider catalog is not misreported as a network error", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: [{ id: "BAAI/bge-m3" }, { id: "BAAI/bge-reranker-v2-m3" }],
+  }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+  try {
+    const result = await requestJson("POST", "/user-preferences/ai-profiles/discover-models", {
+      name: "Vectors",
+      provider: "custom",
+      apiUrl: "https://api.siliconflow.cn/v1",
+      apiKey: "sf-secret",
+      model: "",
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.models, []);
+    assert.equal(result.json.filteredNonChatCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects embedding chat tests and activation without contacting the chat API", async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests++;
+    throw new Error("non-chat models must not reach chat API");
+  }) as typeof fetch;
+
+  try {
+    const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+      name: "Vector credential profile",
+      provider: "custom",
+      apiUrl: "https://api.siliconflow.cn/v1",
+      apiKey: "sf-secret",
+      model: "BAAI/bge-m3",
+      activate: false,
+    });
+    assert.equal(created.status, 201);
+    const profileId = created.json.profile.id;
+    assert.notEqual(created.json.activeProfileId, profileId);
+
+    const testResult = await requestJson("POST", `/user-preferences/ai-profiles/${profileId}/test`, {});
+    assert.equal(testResult.status, 400);
+    assert.equal(testResult.json.code, "AI_MODEL_NOT_CHAT");
+    assert.equal(testResult.json.action, "embedding-settings");
+    assert.match(testResult.json.error, /向量检索/);
+
+    const activated = await requestJson("PUT", `/user-preferences/ai-profiles/${profileId}/activate`);
+    assert.equal(activated.status, 400);
+    assert.equal(activated.json.code, "AI_MODEL_NOT_CHAT");
+    assert.equal(requests, 0);
+    assert.notEqual((await requestJson("GET", "/user-preferences/ai-profiles")).json.activeProfileId, profileId);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("tests a draft with the stored masked API key without saving or switching active AI settings", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "Working chat model",
+    provider: "custom",
+    apiUrl: "https://api.siliconflow.cn/v1",
+    apiKey: "saved-key-5432",
+    model: "deepseek-ai/DeepSeek-V4-Flash",
+    activate: true,
+  });
+  assert.equal(created.status, 201);
+  const profileId = created.json.profile.id;
+
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  let authorization = "";
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requests++;
+    authorization = new Headers(init?.headers).get("authorization") || "";
+    return new Response(JSON.stringify({ error: { message: "upstream rejected draft" } }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const draft = {
+      name: "Draft only",
+      provider: "custom",
+      apiUrl: "https://api.siliconflow.cn/v1",
+      apiKey: "****5432",
+      model: "new-chat-model",
+      profileId,
+    };
+    const failed = await requestJson("POST", "/user-preferences/ai-profiles/test-draft", draft);
+    assert.equal(failed.status, 502);
+    assert.equal(failed.json.success, false);
+    assert.equal(requests, 1);
+    assert.equal(authorization, "Bearer saved-key-5432");
+
+    const blocked = await requestJson("POST", "/user-preferences/ai-profiles/test-draft", {
+      ...draft,
+      model: "BAAI/bge-m3",
+    });
+    assert.equal(blocked.status, 400);
+    assert.equal(blocked.json.code, "AI_MODEL_NOT_CHAT");
+    assert.equal(requests, 1, "embedding draft should not call upstream");
+
+    const active = await requestJson("GET", "/user-preferences/ai-profiles");
+    assert.equal(active.json.activeProfileId, profileId);
+    assert.equal(active.json.profiles.find((p: any) => p.id === profileId).model, "deepseek-ai/DeepSeek-V4-Flash");
+    assert.equal(readSetting("ai_model"), "deepseek-ai/DeepSeek-V4-Flash");
+    assert.equal(readSetting("ai_api_key"), "saved-key-5432");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("refuses to replace the active chat profile model with an embedding model", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "Working chat",
+    provider: "custom",
+    apiUrl: "https://api.siliconflow.cn/v1",
+    apiKey: "sf-secret",
+    model: "deepseek-ai/DeepSeek-V4-Flash",
+    activate: true,
+  });
+  assert.equal(created.status, 201);
+  const profileId = created.json.profile.id;
+  const updated = await requestJson("PUT", `/user-preferences/ai-profiles/${profileId}`, {
+    name: "Working chat",
+    provider: "custom",
+    apiUrl: "https://api.siliconflow.cn/v1",
+    apiKey: "****cret",
+    model: "BAAI/bge-m3",
+  });
+  assert.equal(updated.status, 400);
+  assert.equal(updated.json.code, "AI_MODEL_NOT_CHAT");
+  assert.equal(readSetting("ai_model"), "deepseek-ai/DeepSeek-V4-Flash");
+});
+
+
+test("channel-only save preserves chat selection and model bindings stay independent (DCC-006)", async () => {
+  const active = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "Chat", provider: "lmstudio", apiUrl: "http://localhost:1234/v1", model: "chat-original", activate: true,
+  });
+  const channel = await requestJson("POST", "/user-preferences/ai-profiles", {
+    name: "Images", provider: "custom", apiUrl: "https://images.test/v1", apiKey: "synthetic-key", activate: false,
+  });
+  assert.equal(channel.status, 201);
+  assert.equal(channel.json.profile.model, "");
+  assert.equal(readSetting("ai_model"), "chat-original");
+  const multimodal = await requestJson("PUT", "/user-preferences/ai-profiles/model-settings/multimodal", {
+    profileId: channel.json.profile.id, model: "vision-model",
+  });
+  assert.equal(multimodal.status, 200);
+  assert.equal(readSetting("ai_model"), "chat-original");
+  const chat = await requestJson("PUT", "/user-preferences/ai-profiles/model-settings/chat", {
+    profileId: channel.json.profile.id, model: "chat-selected",
+  });
+  assert.equal(chat.status, 200);
+  assert.equal(readSetting("ai_active_profile_id"), channel.json.profile.id);
+  assert.equal(readSetting("ai_model"), "chat-selected");
+  const edited = await requestJson("PUT", `/user-preferences/ai-profiles/${channel.json.profile.id}`, { name: "Renamed", apiUrl: "https://new.test/v1" });
+  assert.equal(edited.status, 200);
+  assert.equal(readSetting("ai_model"), "chat-selected");
+  assert.equal(readSetting("ai_api_url"), "https://new.test/v1");
+  const reopened = await requestJson("GET", "/user-preferences/ai-profiles/model-settings/multimodal");
+  assert.deepEqual(reopened.json, { profileId: channel.json.profile.id, model: "vision-model" });
+  const other = await requestJson("GET", "/user-preferences/ai-profiles/model-settings/multimodal", undefined, OTHER_ID);
+  assert.deepEqual(other.json, { profileId: "", model: "" });
+  for (const kind of ["chat", "multimodal"]) {
+    const denied = await requestJson("PUT", `/user-preferences/ai-profiles/model-settings/${kind}`, { profileId: active.json.profile.id, model: "foreign" }, OTHER_ID);
+    assert.equal(denied.status, 404);
+  }
+});
+
+test("invalid model selections do not overwrite saved configuration", async () => {
+  const state = await requestJson("GET", "/user-preferences/ai-profiles");
+  const profileId = state.json.activeProfileId;
+  for (const model of ["", "bge-m3"]) {
+    const result = await requestJson("PUT", "/user-preferences/ai-profiles/model-settings/chat", { profileId, model });
+    assert.equal(result.status, 400);
+  }
+  assert.equal(readSetting("ai_multimodal_model"), "");
+  const bad = await requestJson("PUT", "/user-preferences/ai-profiles/model-settings/multimodal", { profileId: "missing", model: "vision" });
+  assert.equal(bad.status, 404);
+  const unauthenticated = await requestJson("GET", "/user-preferences/ai-profiles/model-settings/chat", undefined, "");
+  assert.equal(unauthenticated.status, 401);
+});
+
+
+test("channel catalogs include every model kind when requested for speech and multimodal selection", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => Response.json({ data: [{ id: "whisper-1" }, { id: "vision-model" }, { id: "bge-m3", task: "feature-extraction" }] });
+  try {
+    const result = await requestJson("POST", "/user-preferences/ai-profiles/discover-models", {
+      name: "Catalog", provider: "lmstudio", apiUrl: "http://localhost:1234/v1", modelKind: "all",
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.models.map((model: any) => model.id), ["bge-m3", "vision-model", "whisper-1"]);
+  } finally { global.fetch = originalFetch; }
+});
+
+test("multimodal draft test sends a synthetic image with channel Headers without saving settings", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", { name: "Vision", provider: "custom", apiUrl: "https://vision.test/v1", apiKey: "synthetic-vision-key", customHeaders: { zhixing: "synthetic-header" }, activate: false });
+  const before = readSetting("ai_profiles_v1");
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async (url, options) => {
+    calls++;
+    assert.equal(String(url), "https://vision.test/v1/chat/completions");
+    assert.equal(new Headers(options?.headers).get("zhixing"), "synthetic-header");
+    assert.equal(new Headers(options?.headers).get("authorization"), "Bearer synthetic-vision-key");
+    const body = JSON.parse(String(options?.body));
+    assert.equal(body.model, "unsaved-vision-model");
+    const image = body.messages[0].content.find((item: any) => item.type === "image_url");
+    assert.match(image.image_url.url, /^data:image\/png;base64,/);
+    assert.equal(Buffer.from(image.image_url.url.split(",")[1], "base64").subarray(1,4).toString(), "PNG");
+    return Response.json({ choices: [{ message: { content: "RED" } }] });
+  };
+  try {
+    const tested = await requestJson("POST", "/user-preferences/ai-profiles/test-multimodal", { profileId: created.json.profile.id, model: "unsaved-vision-model" });
+    assert.equal(tested.status, 200);
+    assert.equal(tested.json.success, true);
+    assert.equal(calls, 1);
+    assert.equal(readSetting("ai_profiles_v1"), before);
+    assert.equal(readSetting("ai_multimodal_model"), "");
+    const denied = await requestJson("POST", "/user-preferences/ai-profiles/test-multimodal", { profileId: created.json.profile.id, model: "foreign" }, OTHER_ID);
+    assert.equal(denied.status, 404);
+    assert.equal(calls, 1);
+  } finally { global.fetch = originalFetch; }
+});
+
+test("multimodal test rejects unsupported images, wrong answers and upstream errors without exposing credentials", async () => {
+  const created = await requestJson("POST", "/user-preferences/ai-profiles", { name: "Vision", provider: "custom", apiUrl: "https://vision.test/v1", apiKey: "synthetic-vision-key", activate: false });
+  const originalFetch = global.fetch;
+  try {
+    for (const response of [Response.json({ error: "synthetic-vision-key" }, { status: 400 }), Response.json({ choices: [{ message: { content: "I cannot read images" } }] }), Response.json({ choices: [{ message: { content: "BLUE" } }] })]) {
+      global.fetch = async () => response;
+      const tested = await requestJson("POST", "/user-preferences/ai-profiles/test-multimodal", { profileId: created.json.profile.id, model: "vision" });
+      assert.equal(tested.status, 502);
+      assert.equal(tested.json.success, false);
+      assert.ok(!JSON.stringify(tested.json).includes("synthetic-vision-key"));
+    }
+  } finally { global.fetch = originalFetch; }
+});

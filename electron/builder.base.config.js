@@ -334,6 +334,7 @@ const BACKEND_KEEP_PACKAGES = [
   "sqlite-vec-linux-arm64",
   // bonjour-service + 运行时传递依赖
   "bonjour-service",
+  "fast-deep-equal",
   "multicast-dns",
   "dns-packet",
   "@leichtgewicht",        // 整个 scope (含 ip-codec)
@@ -410,6 +411,7 @@ module.exports = {
   },
   afterPack(context) {
     if (context.electronPlatformName !== "darwin") return;
+    require("../scripts/build-quick-panel-corners.cjs").afterPack(context);
     const arch = require("builder-util").Arch[context.arch];
     const resources = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, "Contents/Resources");
     verifyMacSharp(path.join(resources, "backend/node_modules"), arch);

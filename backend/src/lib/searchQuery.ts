@@ -26,6 +26,15 @@ export function splitSearchTerms(query: string): string[] {
   return Array.from(new Set(normalized.match(/[\p{Script=Han}]+|[^\s\p{Script=Han}]+/gu) || []));
 }
 
+/** Used only after literal lookup misses, so punctuation-sensitive queries stay exact. */
+export function splitNaturalSearchTerms(query: string): string[] {
+  const stop = new Set(["的","了","吗","呢","我","你","帮","帮我","找","找找","一下","请","请问","查询","搜索","告诉","告诉我","如何","怎么","什么","哪个","哪里","笔记","记录","是","有","在"]);
+  const segmenter = new Intl.Segmenter("zh",{granularity:"word"});
+  return [...new Set(splitSearchTerms(query).flatMap(term => hasHanText(term)
+    ? [...segmenter.segment(term)].filter(part=>part.isWordLike&&!stop.has(part.segment)).map(part=>part.segment)
+    : [term]))];
+}
+
 export function hasHanText(query: string): boolean {
   return /\p{Script=Han}/u.test(normalizeSearchText(query));
 }

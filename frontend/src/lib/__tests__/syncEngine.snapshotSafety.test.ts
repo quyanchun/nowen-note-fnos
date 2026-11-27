@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import type { OfflineQueueItem } from "@/lib/offlineQueue";
 import { describe, expect, it, vi } from "vitest";
 
 // Exercise syncNow's real snapshot orchestration, not a source-text assertion.
@@ -9,7 +10,9 @@ const mocks = vi.hoisted(() => ({
   getNotes: vi.fn(async () => []),
   getTags: vi.fn(async () => []),
   getAllNotebooks: vi.fn(async () => [{ id: "cached-notebook", workspaceId: null }]),
-  getAllNotes: vi.fn(async () => []),
+  getNote: vi.fn(async (_id: string) => ({ isTrashed: 0, workspaceId: null as string | null })),
+  getQueue: vi.fn((): Partial<OfflineQueueItem>[] => []),
+  discardNoteQueueItems: vi.fn(),
   getAllTags: vi.fn(async () => [{ id: "cached-tag", workspaceId: null }]),
   deleteNotebook: vi.fn(async () => {}),
   deleteTag: vi.fn(async () => {}),
@@ -31,7 +34,7 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/lib/localStore", () => ({
   setCurrentUser: vi.fn(),
   getAllNotebooks: mocks.getAllNotebooks,
-  getAllNotes: mocks.getAllNotes,
+  getNote: mocks.getNote,
   getAllTags: mocks.getAllTags,
   deleteNotebook: mocks.deleteNotebook,
   deleteTag: mocks.deleteTag,
@@ -46,9 +49,9 @@ vi.mock("@/lib/localStore", () => ({
 
 vi.mock("@/lib/offlineQueue", () => ({
   flushQueue: vi.fn(async () => {}),
-  discardNoteQueueItems: vi.fn(),
+  discardNoteQueueItems: mocks.discardNoteQueueItems,
   getFailedQueueItems: vi.fn(() => []),
-  getQueue: vi.fn(() => []),
+  getQueue: mocks.getQueue,
   getQueueLength: vi.fn(() => 0),
   subscribe: vi.fn(() => () => {}),
 }));
@@ -70,5 +73,21 @@ describe("syncEngine snapshot deletion safety", () => {
     expect(mocks.putTags).toHaveBeenCalledWith([]);
     expect(mocks.deleteNotebook).not.toHaveBeenCalled();
     expect(mocks.deleteTag).not.toHaveBeenCalled();
+    expect(mocks.getNote).not.toHaveBeenCalled();
+  });
+
+  it("reads only conflicted updates and discards locally trashed ones in this workspace", async () => {
+    mocks.getQueue.mockReturnValueOnce([
+      { noteId: "trashed", type: "updateNote", conflict: true },
+      { noteId: "trashed", type: "updateNote", errorCode: "VERSION_CONFLICT" },
+      { noteId: "other-workspace", type: "updateNote", conflict: true },
+      { noteId: "normal", type: "updateNote" },
+      { noteId: "pending-delete", type: "deleteNote" },
+    ]);
+    mocks.getNote.mockResolvedValueOnce({ isTrashed: 1, workspaceId: null })
+      .mockResolvedValueOnce({ isTrashed: 1, workspaceId: "other" });
+    expect((await syncNow()).ok).toBe(true);
+    expect(mocks.getNote.mock.calls).toEqual([["trashed"], ["other-workspace"]]);
+    expect(mocks.discardNoteQueueItems).toHaveBeenCalledWith(["trashed"]);
   });
 });

@@ -1,3 +1,4 @@
+import { requiresCurrentPassword } from "./lib/fnos-identity";
 import { getActiveEngine } from "./sync/runtime";
 import { syncWriteNotificationMiddleware, setLocalSyncWakeup } from "./sync/write-notifications";
 import { serve } from "@hono/node-server";
@@ -774,6 +775,7 @@ app.get("/api/me", (c) => {
   if (user) {
     if (!user.role) user.role = "user";
     user.isDemo = user.isDemo === 1;
+    user.currentPasswordRequired = requiresCurrentPassword(user.id);
     // v6：把 users.personalExport/ImportEnabled 以 boolean 形式下发，
     // 前端 Sidebar / DataManager 直接按布尔判定 UI 可见性。
     // 即使列缺失（例如旧库迁移失败），也兜底为 true，保持与 DEFAULT 1 一致。

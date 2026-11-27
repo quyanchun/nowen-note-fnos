@@ -129,6 +129,17 @@ function deriveRuntimeFields(raw, mode) {
   return { runtime, syncEnabled, activeSyncProfileId, liteMigrationStatus };
 }
 
+function isQuickPanelShortcut(value) {
+  if (value === "") return true;
+  if (typeof value !== "string" || value.length > 50) return false;
+  const keys = value.split("+");
+  const primary = keys.pop();
+  return /^(?:[A-Z0-9]|Space)$/.test(primary)
+    && keys.some(key => key !== "Shift")
+    && keys.every(key => ["Control", "Command", "Alt", "Shift"].includes(key))
+    && new Set(keys).size === keys.length;
+}
+
 function normalize(raw) {
   const out = { ...DEFAULT_SETTINGS };
   if (raw && typeof raw === "object") {
@@ -150,6 +161,9 @@ function normalize(raw) {
     }
     if (typeof raw.offlineCacheMigrationSource === "string" && path.isAbsolute(raw.offlineCacheMigrationSource)) {
       out.offlineCacheMigrationSource = path.resolve(raw.offlineCacheMigrationSource);
+    }
+    if (isQuickPanelShortcut(raw.quickPanelShortcut)) {
+      out.quickPanelShortcut = raw.quickPanelShortcut;
     }
     out.windowState = normalizeStoredWindowState(raw.windowState);
   }
@@ -234,6 +248,7 @@ function needsLiteMigration(settings) {
 }
 
 module.exports = {
+  isQuickPanelShortcut,
   DEFAULT_SETTINGS,
   setSettingsPath,
   readSettings,

@@ -9,12 +9,12 @@ const root = path.resolve(__dirname, "../..");
 const updaterCode = fs.readFileSync(path.join(root, "electron/updater.js"), "utf8");
 const storeCode = fs.readFileSync(path.join(root, "electron/storeChannel.js"), "utf8");
 
-function createRuntime({ windowsStore, portable = false }) {
+function createRuntime({ windowsStore, portable = false, platform = "win32" }) {
   const handles = new Map();
   const urls = [];
   let updaterCalls = 0;
   const fakeProcess = {
-    platform: "win32", arch: "x64", windowsStore,
+    platform, arch: platform === "darwin" ? "arm64" : "x64", windowsStore,
     env: portable ? { PORTABLE_EXECUTABLE_FILE: "Nowen-Note-portable.exe" } : {},
   };
   const channelModule = { exports: {} };
@@ -79,14 +79,44 @@ test("Store package never checks GitHub or invokes NSIS installer", async () => 
   assert.deepEqual(runtime.urls, ["ms-windows-store://downloadsandupdates"]);
 });
 
-test("Direct Windows installer remains on its previous updater policy", async () => {
-  const runtime = createRuntime({ windowsStore: false });
-  assert.ok(runtime.getUpdaterCalls() > 0);
-  const store = await runtime.store();
-  assert.equal(store.ok, false);
-  assert.equal(store.reason, "not-store-build");
-  assert.deepEqual(runtime.urls, []);
-});
+for (const platform of ["darwin", "win32"]) {
+  test(`Fork ${platform} native menus have no update entry`, () => {
+    const menuModule = { exports: {} };
+    vm.runInNewContext(fs.readFileSync(path.join(root, "electron/menu.js"), "utf8"), {
+      module: menuModule,
+      process: { platform },
+      require: () => ({
+        app: { name: "Nowen Note", isPackaged: true },
+        Menu: { buildFromTemplate: (template) => template, setApplicationMenu() {} },
+      }),
+    });
+    const menu = menuModule.exports.buildMenu();
+    const labels = [];
+    const visit = (items) => items.forEach((item) => {
+      if (item.label) labels.push(item.label);
+      if (Array.isArray(item.submenu)) visit(item.submenu);
+    });
+    visit(menu);
+    assert.equal(labels.some((label) => label.includes("检查更新")), false);
+    assert.ok(labels.includes(platform === "darwin" ? "偏好设置…" : "设置"));
+  });
+
+  test(`Fork ${platform} package never checks or opens upstream updates`, async () => {
+    const runtime = createRuntime({ windowsStore: false, platform });
+    assert.equal(runtime.getUpdaterCalls(), 0);
+    const checked = await runtime.check();
+    assert.equal(checked.ok, false);
+    assert.equal(checked.reason, "fork-updates-disabled");
+    const installed = await runtime.install();
+    assert.equal(installed.ok, false);
+    assert.equal(installed.reason, "fork-updates-disabled");
+    const store = await runtime.store();
+    assert.equal(store.ok, false);
+    assert.equal(store.reason, "not-store-build");
+    assert.equal(runtime.getUpdaterCalls(), 0);
+    assert.deepEqual(runtime.urls, []);
+  });
+}
 
 test("Portable Windows variant still blocks desktop auto-updater", async () => {
   const runtime = createRuntime({ windowsStore: false, portable: true });

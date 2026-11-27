@@ -6,6 +6,7 @@ import {
   countSearchTermOccurrences,
   normalizeSearchText,
   splitSearchTerms,
+  splitNaturalSearchTerms,
 } from "../src/lib/searchQuery";
 
 test("search normalization folds width, case, whitespace and zero-width characters", () => {
@@ -27,4 +28,10 @@ test("FTS candidates are conservative tokens and never define final truth", () =
 test("occurrence counting uses the same normalization as filtering", () => {
   assert.equal(countSearchTermOccurrences("ＡＢＣ１２３ abc123", "abc123"), 2);
   assert.equal(countSearchTermOccurrences("Alpha alpha ALPHA", "alpha"), 3);
+});
+
+test("natural-language fallback segments Chinese and preserves identifiers",()=>{
+  const terms=splitNaturalSearchTerms("帮我找音乐服务器的密码");
+  assert.ok(terms.includes("密码"));assert.ok(terms.some(term=>term.includes("音乐")));assert.ok(!terms.includes("的"));
+  assert.deepEqual(splitNaturalSearchTerms("C++ foo-bar"),["c++","foo-bar"]);
 });

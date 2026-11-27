@@ -40,6 +40,7 @@ const LINUX_MAINTAINER =
 const LINUX_VENDOR = process.env.NOWEN_LINUX_VENDOR || "Nowen";
 
 module.exports = {
+  afterPack: require("../scripts/build-quick-panel-corners.cjs").afterPack,
   // appId 加 .lite 后缀 —— 关键：避免与 full 安装包互覆盖、autoUpdate 串 feed
   appId: "com.nowen.note.lite",
   productName: "Nowen Note Lite",

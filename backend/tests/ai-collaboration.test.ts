@@ -121,3 +121,68 @@ test("disabled AI cannot be bypassed by collaboration", async () => {
   try { assert.equal((await compose()).status, 409); assert.equal(calls.length, 0); }
   finally { db.prepare("DELETE FROM user_ai_settings WHERE userId='collab-a' AND key='ai_manual_enabled'").run(); }
 });
+
+test("quick panel searches first and skips generation when the scope has no matching notes", async () => {
+  const ask = (question: string) => app.request("/ai/ask", {
+    method: "POST", headers, body: JSON.stringify({ question, mode: "knowledge", presentation: "quick-panel" }),
+  });
+  const miss = await ask("qqzzxxnomatch");
+  assert.equal(miss.status, 200);
+  assert.match(await miss.text(), /"hits":\[\]/);
+  assert.equal(calls.filter(call => call.body.messages).length, 0);
+  const answer = await ask("VERIFIED");
+  const events = await answer.text();
+  assert.match(events, /"preview":"PROJECT VERIFIED STATE"/);
+  assert.match(events, /"notebook":"project"/);
+  assert.ok(events.indexOf("event: diagnostics") < events.indexOf("event: message"));
+  assert.ok(calls.some(call => call.body.messages?.[0].content.includes("Markdown")));
+});
+
+test("quick panel retries an initial bad gateway as a stream and reports an interrupted answer without replaying it", async () => {
+  const ask = () => app.request("/ai/ask", { method: "POST", headers,
+    body: JSON.stringify({ question: "VERIFIED", mode: "knowledge", presentation: "quick-panel" }) });
+  let attempts = 0;
+  let interrupt = false;
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes("/chat/completions")) return Response.json({ data: [] });
+    assert.equal(JSON.parse(String(init?.body)).stream, true);
+    assert.equal(new Headers(init?.headers).get("Accept"), "text/event-stream");
+    if (++attempts === 1) return new Response(null, { status: 502 });
+    const frames = 'data:{"choices":[{"delta":{"content":"正文"}}]}\r\n\r\n';
+    return new Response(frames + (interrupt ? "" : "data:[DONE]"), { headers: { "Content-Type": "text/event-stream" } });
+  };
+  const complete = await (await ask()).text();
+  assert.equal(attempts, 2);
+  assert.match(complete, /正文/);
+  assert.match(complete, /event: done/);
+  interrupt = true;
+  const partial = await (await ask()).text();
+  assert.equal(attempts, 3);
+  assert.match(partial, /正文/);
+  assert.match(partial, /event: error/);
+  assert.doesNotMatch(partial, /event: done/);
+});
+
+test("quick filing reuses a writable folder, creates one new root for a missing subject, and rejects invented or protected destinations", async () => {
+  let reply: Record<string, unknown> = { topic: "项目", folderPath: ["project", "project-child"] };
+  globalThis.fetch = async (_url, init) => {
+    const data = JSON.parse(String(init?.body));
+    const catalog = JSON.parse(data.messages.at(-1).content).folders;
+    assert.ok(catalog.some((parts: string[]) => parts.join("/") === "project/project-child"));
+    assert.ok(!catalog.some((parts: string[]) => parts.some(name => ["foreign", "locked-folder"].includes(name))));
+    return Response.json({choices: [{message: {content: JSON.stringify(reply)}}]});
+  };
+  const file = (suffix = "") => app.request("/ai/collaboration/quick-folder" + suffix, { method: "POST", headers, body: JSON.stringify({ title: "", text: "归档测试" }) });
+  assert.equal((await file("?workspaceId=foreign-space")).status, 403);
+  assert.deepEqual(await (await file()).json(), { notebookId: "project-child", path: "project / project-child" });
+  reply = { folderPath: ["project", "录音"] };
+  const [one, two] = await Promise.all([file(), file()]);
+  assert.equal(one.status, 200);
+  const first = await one.json() as {path: string};
+  assert.equal(first.path, "录音"); assert.deepEqual(first, await two.json());
+  assert.equal((db.prepare("SELECT COUNT(*) n FROM notebooks WHERE name='录音' AND parentId IS NULL").get() as any).n, 1);
+  for (const invalid of [{ folderPath: ["project", "locked-folder", "隐私"] }, { folderPath: ["../跳出"] }, { folderPath: ["foreign", "x"] }]) {
+    reply = invalid;
+    assert.ok([409, 502].includes((await file()).status));
+  }
+});

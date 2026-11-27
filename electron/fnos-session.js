@@ -14,10 +14,12 @@ function permittedTarget(value, origins, websocket = false, method = 'GET') {
     const suffix = url.pathname.slice(PREFIX.length);
     const settings = (['GET','PUT'].includes(method) && suffix === '/api/clipboard-settings')
       || (method === 'GET' && suffix === '/api/clipboard-settings/logs')
+      || (method === 'GET' && /^\/api\/clipboard-settings\/logs\/[^/]{1,480}$/.test(suffix))
       || (method === 'DELETE' && /^\/api\/clipboard-settings\/logs\/[^/]{1,480}$/.test(suffix))
-      || (method === 'POST' && /^\/api\/clipboard-settings\/logs\/[^/]{1,480}\/(?:force|undo)$/.test(suffix))
+      || (method === 'POST' && /^\/api\/clipboard-settings\/logs\/[^/]{1,480}\/(?:force|undo|edit)$/.test(suffix))
       || (['POST','DELETE'].includes(method) && suffix === '/api/clipboard-settings/token')
       || (method === 'POST' && suffix === '/api/clipboard-settings/token/rotate')
+      || (method === 'PUT' && suffix === '/api/clipboard-settings/token/status')
       || (method === 'GET' && suffix === '/api/notebooks');
     const sharing = (['GET','POST'].includes(method) && /^\/api\/shares\/?$/.test(suffix))
       || (method === 'POST' && suffix === '/api/shares/import-desktop')
@@ -107,7 +109,7 @@ function createFnosSessionTransport({ session, BrowserWindow, getDataPath, getPa
         let upstream = await request(target, init);
         const isBinaryRead = /\/api\/sync\/v2\/blob\//.test(target.pathname) && ['GET', 'HEAD'].includes(req.method);
         const unexpected = response => response.ok && (isBinaryRead ? !response.headers.get('x-blob-hash') : !response.headers.get('content-type')?.includes('application/json'));
-        if (unexpected(upstream) && !await healthy(target.origin)) {
+        if ((unexpected(upstream) || upstream.status === 401 || upstream.status === 403) && !await healthy(target.origin)) {
           await upstream.body?.cancel();
           if (await restoreRememberedSession(target.origin)) upstream = await request(target, init);
           else { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ code: 'AUTH_EXPIRED' })); return; }

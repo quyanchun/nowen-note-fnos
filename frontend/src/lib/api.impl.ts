@@ -1286,6 +1286,13 @@ async function requireTaskSeriesSupport(): Promise<void> {
   if (capabilities.taskRecurrenceLifecycle !== "v1") throw Object.assign(new Error("TASK_RECURRENCE_UNSUPPORTED"),{code:"TASK_RECURRENCE_UNSUPPORTED"});
 }
 
+// Search snippets escape user text and wrap matches in mark elements.
+function decodeSearchSnippet(value: string): string {
+  const text = document.createElement("textarea");
+  text.innerHTML = value.replace(/<\/?mark(?:\s[^>]*)?>/gi, "");
+  return text.value;
+}
+
 export const api = {
   trash: {
     list: (workspaceId: string) => request<{ items: import("@/features/trash/trashTypes").TrashItem[] }>(`/trash?workspaceId=${encodeURIComponent(workspaceId)}`),
@@ -1786,20 +1793,24 @@ export const api = {
    * 搜索笔记（用于笔记引用）
    * 只返回当前用户有权限访问的笔记
    */
-  searchNotes: async (query: string, limit: number = 10): Promise<Array<{ id: string; title: string; notebookId: string; updatedAt: string }>> => {
+  searchNotes: async (query: string, limit: number = 10, signal?: AbortSignal): Promise<Array<{ id: string; title: string; notebookId: string; updatedAt: string; snippet?: string; notebook?: string }>> => {
     if (!query.trim()) return [];
     const params = new URLSearchParams();
     params.set("q", query.trim());
-    const data = await request<any>(`/search?${params.toString()}`);
+    const workspace = getCurrentWorkspace();
+    if (workspace !== "personal") params.set("workspaceId", workspace);
+    const data = await request<any>(`/search?${params.toString()}`, { signal });
     // 后端返回数组或 { items: [...] }，兼容处理
     const items = Array.isArray(data) ? data : (data?.items || []);
     return items
       .filter((item: { resourceType?: string }) => item?.resourceType !== "mindmap" && item?.resourceType !== "sheet")
       .slice(0, limit)
-      .map((item: { id: string; title: string; notebookId: string; updatedAt: string }) => ({
-      id: item.id,
-      title: item.title,
-      notebookId: item.notebookId,
+      .map((item: { id: string; title: string; notebookId: string; updatedAt: string; contentFormat?: string; snippetHtml?: string; snippet?: string; previewText?: string; notebookName?: string }) => ({
+        id: item.id,
+        title: item.title,
+        notebookId: item.notebookId,
+        notebook: item.notebookName || "",
+        snippet: item.contentFormat?.startsWith("encrypted-") ? "" : item.previewText || decodeSearchSnippet(item.snippetHtml || item.snippet || ""),
         updatedAt: item.updatedAt,
       }));
   },
@@ -2217,7 +2228,7 @@ export const api = {
   //      同时下发一张新 token 给当前请求方。前端必须把新 token 写回 localStorage，
   //      否则当前 tab 的下次请求会被当成"旧 token"拒绝。
   updateSecurity: async (data: {
-    currentPassword: string;
+    currentPassword?: string;
     newUsername?: string;
     newPassword?: string;
     newEmail?: string | null;

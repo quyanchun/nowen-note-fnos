@@ -31,6 +31,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       if(reply?.raw){res.end(reply.raw);return;}
       res.end(JSON.stringify(reply||{choices:[{message:{content:"红色方块，纯色背景，用于图片上传验收。"}}]}));return;
     }
+    if(body.messages[0]?.content?.includes('你是剪贴板内容过滤器')) {res.end(JSON.stringify({choices:[{message:{content:'{"collect":true}'}}]}));return;}
     reads++;afterModel?.();afterModel=null;
     const plan=plans.length>1?plans.shift():plans[0];
     res.end(JSON.stringify({choices:[{message:{content:JSON.stringify(plan)}}]}));
@@ -43,20 +44,24 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
   const plan=(folderPath:string[],notebookId:string|null=null)=>({action:"create",notebookId,noteId:null,folderPath,title:"图片资料",content:"# 图片资料\n\n![图片](nowen-image-0)"});
   const submit=async(id:string,extra:any={})=>{
     const value=integration.clipboardSubmissionSchema.parse({requestId:id,content:"合成资料",...extra});
-    const queued=integration.submitClipboard(actor,value);await captures.drainCaptures();
+    let queued;
+    if(value.noteId && /^(?:https?:|file:|\.\/|\/|[A-Z]:)/.test(value.content)) {
+      queued=captures.presentCapture(captures.submitCapture(actor,captures.captureInput.parse({requestId:id,content:value.content,minFolderDepth:1})).job);
+    }else queued=integration.submitClipboard(actor,value);
+    await captures.drainCaptures();
     return captures.presentCapture(captures.getCapture(actor,queued.id));
   };
   try {
     await t.test("empty catalogs repair invalid IDs and create a meaningful 2-level path",async()=>{
-      plans=[plan([],"deleted-id"),plan(["技术资料","数据库"])];
+      plans=[plan([],"deleted-id"),plan(["技术","数据库"])];
       const result=await submit("empty-catalog");assert.equal(result.status,"completed");assert.equal(reads,2);
-      assert.match(result.result.path,/技术资料 \/ 数据库/);
+      assert.match(result.result.path,/技术 \/ 数据库/);
     });
     await t.test("a deleted automatic target is re-planned without restoring it",async()=>{
       const old=createKnowledgeChild({actorUserId:"owner",workspaceId:null,parentId:null,nodeType:"folder",title:"待删除目录"});
       plans=[plan([],old.resourceId),plan(["研发","移动端","iOS"])]
       afterModel=()=>{db.prepare("UPDATE notebooks SET isDeleted=1 WHERE id=?").run(old.resourceId);db.prepare("UPDATE knowledge_tree_nodes SET isDeleted=1 WHERE resourceId=?").run(old.resourceId);};
-      const result=await submit("target-deleted");assert.equal(result.status,"completed");assert.match(result.result.path,/研发 \/ 移动端 \/ iOS/);
+      const result=await submit("target-deleted");assert.equal(result.status,"completed");assert.match(result.result.path,/技术 \/ 移动端 \/ iOS/);
       assert.equal((db.prepare("SELECT isDeleted FROM notebooks WHERE id=?").get(old.resourceId) as any).isDeleted,1);
     });
     await t.test("a null model parent is anchored to the explicit authorized folder",async()=>{
@@ -69,10 +74,10 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       const tree=listKnowledgeTree({userId:"owner",workspaceId:null});
       assert.ok(!tree.some(node=>node.title==="新增分类"&&node.parentId===null));
     });
-    await t.test("a bare file path stays a path even if the model writes a document",async()=>{
+    await t.test("a manually targeted file path stays literal even if the model writes a document",async()=>{
       const original="/Users/example/Documents/接口文档 V2.1.pdf";
       plans=[{...plan(["资料","文件路径"]),title:"接口文档 V2.1",content:"# 接口文档\n\n本文涵盖通信协议、接口定义及数据格式。\n\n## 主要内容\n\n请参考原始PDF。"}];
-      const result=await submit("path-no-expansion",{content:original});
+      const result=await submit("path-no-expansion",{content:original,noteId:(db.prepare("SELECT id FROM notes LIMIT 1").get() as any).id});
       assert.equal(result.status,"completed");assert.equal(result.originalContent,original);
       assert.equal(result.result.content,original);
       assert.ok(result.result.path.endsWith(" / 接口文档 V2.1.pdf"));
@@ -81,7 +86,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       const references=[String.raw`C:\Documents\design V2.pdf`,"file:///Users/example/design.pdf","./images/photo.png","https://docs.example.test/guide?id=729&version=2"];
       for(const [index,original] of references.entries()) {
         plans=[{...plan(["资料","链接"]),title:"虚构的项目 2025-03-25",content:"# 不应该出现的文章\n\n这里是扩写的介绍。"}];
-        const result=await submit(`reference-no-expansion-${index}`,{content:original});
+        const result=await submit(`reference-no-expansion-${index}`,{content:original,noteId:(db.prepare("SELECT id FROM notes LIMIT 1").get() as any).id});
         assert.equal(result.status,"completed");assert.equal(result.result.content,original);
         assert.ok(!result.result.path.includes("2025-03-25"));
       }
@@ -108,7 +113,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       }
       assert.equal((db.prepare("SELECT count(*) n FROM notes").get() as any).n,count);
       plans=[plan([],inbox.resourceId)];
-      const explicit=await submit("explicit-inbox",{content:"明确指定保存的技术资料",notebookId:inbox.resourceId});
+      const explicit=await submit("explicit-inbox",{content:"明确指定保存的技术",notebookId:inbox.resourceId});
       assert.equal(explicit.status,"completed");assert.equal(explicit.result.notebookId,inbox.resourceId);
     });
     await t.test("a late skip decision still rechecks revoked collection authority (DCC-006)",async()=>{
@@ -120,7 +125,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       } finally {db.prepare("UPDATE api_tokens SET revokedAt=NULL WHERE id=?").run(actor.tokenId);}
     });
     await t.test("different account entries append without replacing the first entry",async()=>{
-      plans=[{...plan(["个人资料","账号"]),title:"账号密码本",content:"服务：GitHub\n账号：synthetic-alice\n密码：fake-alpha"}];
+      plans=[{...plan(["生活","账号"]),title:"账号密码本",content:"服务：GitHub\n账号：synthetic-alice\n密码：fake-alpha"}];
       const first=await submit("account-collection-first",{content:"GitHub 账号 synthetic-alice 密码 fake-alpha"});
       assert.equal(first.status,"completed");
       plans=[{action:"append",notebookId:first.result.notebookId,noteId:first.result.noteId,folderPath:[],title:"账号密码本",content:"服务：GitLab\n账号：synthetic-bob\n密码：fake-beta"}];
@@ -139,12 +144,12 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
     const markdown="![原说明](./images/red.png)";
     const image={source:"./images/red.png",markdown,alt:"原说明",mimeType:"image/png",data:png.toString("base64")};
     await t.test("transient image HTTP failures retry once before saving",async()=>{
-      plans=[plan(["视觉资料","图片"])];visionResponses=[{status:503}];const before=visionReads;
+      plans=[plan(["生活","图片"])];visionResponses=[{status:503}];const before=visionReads;
       const result=await submit("image-transient",{content:markdown,images:[image]});
       assert.equal(result.status,"completed",JSON.stringify(result));assert.equal(visionReads,before+2);
     });
     await t.test("image output truncation increases the budget without indexing reasoning",async()=>{
-      plans=[plan(["视觉资料","图片"])];
+      plans=[plan(["生活","图片"])];
       visionResponses=[{choices:[{finish_reason:"length",message:{content:null,reasoning_content:"private synthetic reasoning"}}]}];
       const before=visionTokenLimits.length;
       const result=await submit("image-truncated",{content:markdown,images:[image]});
@@ -167,7 +172,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       assert.equal((db.prepare("SELECT count(*) n FROM notes").get() as any).n,count);
     });
     await t.test("image bytes, <=200-character description, Markdown and searchable text are saved together",async()=>{
-      plans=[plan(["视觉资料","图片"])]
+      plans=[plan(["生活","图片"])]
       const original=`  图片原文\n${markdown}\n  `;
       const result=await submit("image-create",{content:original,images:[image]});assert.equal(result.status,"completed",JSON.stringify(result));assert.equal(result.originalContent,original);
       const stored=db.prepare("SELECT content,contentText FROM notes WHERE id=?").get(result.result.noteId) as any;
@@ -195,7 +200,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
     await t.test("receipt failure rolls back image metadata, note and files; original-ID retry creates four levels once",async()=>{
       const blue=await sharp({create:{width:32,height:32,channels:3,background:"blue"}}).png().toBuffer();
       const value=integration.clipboardSubmissionSchema.parse({requestId:"image-rollback",content:markdown,images:[{...image,data:blue.toString("base64")}]});
-      plans=[plan(["文档","研发","移动端","iOS"])];
+      plans=[plan(["技术","客户端","移动端","iOS"])];
       const queued=integration.submitClipboard(actor,value);
       const notes=(db.prepare("SELECT count(*) n FROM notes").get() as any).n,attachments=(db.prepare("SELECT count(*) n FROM attachments").get() as any).n;
       const files=()=>fs.readdirSync(path.join(directory,"attachments"),{recursive:true,withFileTypes:true}).filter(item=>item.isFile()).length;
@@ -205,7 +210,7 @@ test("clipboard folder recovery, image durability and account logs (DCC-001 DCC-
       assert.equal(captures.getCapture(actor,queued.id).status,"failed");assert.equal((db.prepare("SELECT count(*) n FROM notes").get() as any).n,notes);
       assert.equal((db.prepare("SELECT count(*) n FROM attachments").get() as any).n,attachments);assert.equal(files(),before);
       captures.retryCapture(actor,queued.id);await captures.drainCaptures();const done=captures.presentCapture(captures.getCapture(actor,queued.id));
-      assert.equal(done.status,"completed");assert.match(done.result.path,/文档 \/ 研发 \/ 移动端 \/ iOS/);
+      assert.equal(done.status,"completed");assert.match(done.result.path,/技术 \/ 客户端 \/ 移动端 \/ iOS/);
       assert.equal((db.prepare("SELECT count(*) n FROM notes").get() as any).n,notes+1);assert.equal(files(),before+1);
     });
     await t.test("bad image bytes retain original and never create a note",async()=>{

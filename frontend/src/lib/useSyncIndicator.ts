@@ -1,3 +1,4 @@
+import { pollVisibleStatus } from "./visiblePolling";
 import { useEffect, useState } from "react";
 import { isAndroidNativeRuntime } from "./mobileLocalMode";
 import { MOBILE_SYNC_STATUS_CHANGED_EVENT } from "./mobileSyncStatus";
@@ -88,8 +89,9 @@ export function useSyncIndicator(refreshKey?: unknown): SyncIndicatorSnapshot {
     let cancelled = false;
     let refreshing = false;
 
+    const desktop = !!(window as Window & { nowenDesktop?: { isDesktop?: boolean } }).nowenDesktop?.isDesktop;
     const tick = async () => {
-      if (refreshing) return;
+      if (refreshing || (desktop && document.hidden)) return;
       refreshing = true;
       try {
         const settings = await fetchSyncSettings();
@@ -144,8 +146,9 @@ export function useSyncIndicator(refreshKey?: unknown): SyncIndicatorSnapshot {
       }
     };
 
-    void tick();
-    const timer = setInterval(tick, isAndroidNativeRuntime() ? 5000 : POLL_INTERVAL_MS);
+    const stopPolling = desktop ? pollVisibleStatus(tick, POLL_INTERVAL_MS) : undefined;
+    const timer = desktop ? undefined : setInterval(tick, isAndroidNativeRuntime() ? 5000 : POLL_INTERVAL_MS);
+    if (!desktop) void tick();
 
     // 网络恢复时立即刷新一次，让指示灯不必等下个周期。
     const onOnline = () => { void tick(); };
@@ -155,6 +158,7 @@ export function useSyncIndicator(refreshKey?: unknown): SyncIndicatorSnapshot {
 
     return () => {
       cancelled = true;
+      stopPolling?.();
       clearInterval(timer);
       if (typeof window !== "undefined") window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOnline);

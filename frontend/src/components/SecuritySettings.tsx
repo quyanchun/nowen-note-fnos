@@ -155,6 +155,7 @@ export default function SecuritySettings() {
 // ====================================================================
 function PasswordSection() {
   const { t } = useTranslation();
+  const [currentPasswordRequired, setCurrentPasswordRequired] = useState(true);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newUsername, setNewUsername] = useState("");
   const [email, setEmail] = useState("");
@@ -176,6 +177,7 @@ function PasswordSection() {
     let cancelled = false;
     api.getMe().then((user) => {
       if (cancelled) return;
+      setCurrentPasswordRequired(user.currentPasswordRequired !== false);
       const nextEmail = user.email || "";
       const nextDisplayName = user.displayName || "";
       setEmail(nextEmail);
@@ -198,7 +200,7 @@ function PasswordSection() {
     e.preventDefault();
     setError("");
 
-    if (!currentPassword) {
+    if (currentPasswordRequired && !currentPassword) {
       return triggerShake(t('securitySettings.currentPasswordRequired'));
     }
     const trimmedEmail = email.trim();
@@ -224,7 +226,7 @@ function PasswordSection() {
       const changedPassword = !!newPassword;
       // api.updateSecurity 会自动把新 token 写回 localStorage（后端改密会 bump tokenVersion）
       await api.updateSecurity({
-        currentPassword,
+        currentPassword: currentPasswordRequired ? currentPassword : undefined,
         newUsername: newUsername.trim() || undefined,
         newEmail: emailChanged ? (trimmedEmail || null) : undefined,
         newDisplayName: displayNameChanged ? (trimmedDisplayName || null) : undefined,
@@ -265,7 +267,7 @@ function PasswordSection() {
         <Shield className="w-4 h-4 text-indigo-500" />
         <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">{t('securitySettings.title')}</h3>
       </div>
-      <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">{t('securitySettings.description')}</p>
+      {currentPasswordRequired && <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">{t('securitySettings.description')}</p>}
 
       <motion.form
         onSubmit={handleSubmit}
@@ -274,6 +276,7 @@ function PasswordSection() {
         transition={shake ? { duration: 0.5 } : {}}
       >
         {/* 当前密码 */}
+        {currentPasswordRequired && <>
         <div className="space-y-1.5">
           <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
             {t('securitySettings.currentPassword')} <span className="text-red-500">*</span>
@@ -304,6 +307,8 @@ function PasswordSection() {
         </div>
 
         <div className="h-px w-full bg-zinc-200 dark:bg-zinc-800" />
+
+        </>}
 
         {/* 新用户名 */}
         <div className="space-y-1.5">

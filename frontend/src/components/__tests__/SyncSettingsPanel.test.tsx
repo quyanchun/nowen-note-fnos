@@ -47,6 +47,15 @@ const enable = (engineRunning = true) => {
 };
 
 describe("desktop sync settings actions", () => {
+  it("shows credentials only for direct service and submits fnOS through authorization",async()=>{
+    Object.assign(window,{nowenDesktop:{startBrowserAuth:mocks.browserStart}});
+    mocks.browserStart.mockResolvedValue({error:"测试取消"});
+    await mount();expect(host.querySelector('input[type="password"]')).toBeTruthy();
+    await click("飞牛 NAS 网关");expect(host.querySelector('input[type="password"]')).toBeNull();
+    await fill("服务器地址","https://nas.example.com");await submit();
+    expect(mocks.browserStart).toHaveBeenCalledWith("https://nas.example.com");expect(mocks.login).not.toHaveBeenCalled();
+    await click("笔记服务直连");expect(host.querySelector('input[autocomplete="username"]')).toBeTruthy();expect(host.querySelector('input[type="password"]')).toBeTruthy();
+  });
   it("switches an authorized connection to direct service without disconnecting or borrowing its cursor (DCC-006)",async()=>{
     settings={mode:"server",activeProfile:{...profile,serverUrl:"https://nas.example/app/nowen-note-private",connectionMode:"fnos"},profiles:[{...profile,serverUrl:"https://nas.example/app/nowen-note-private",connectionMode:"fnos"}],authorized:true,authorizationState:"ready",engineRunning:true};
     Object.assign(window,{nowenDesktop:{startBrowserAuth:mocks.browserStart}});
@@ -72,6 +81,9 @@ describe("desktop sync settings actions", () => {
     mocks.browserStatus.mockImplementation(async () => { enable(false); return { status: "connected", result: { bootstrapRequired: true } }; });
     mocks.bootstrap.mockImplementation(async () => { enable(true); return { status: "ready", engineRunning: true }; });
     await mount(); await click("飞牛 NAS 网关"); await fill("服务器地址", "https://nas.example.com/app/nowen-note-private/");
+    expect(host.querySelector('input[autocomplete="username"]')).toBeNull();
+    expect(host.querySelector('input[type="password"]')).toBeNull();
+    expect(button("登录并开启同步")).toBeUndefined();
     await click("使用飞牛账号授权登录");
     expect(mocks.browserStart).toHaveBeenCalledWith("https://nas.example.com/app/nowen-note-private/");
     expect(mocks.login).not.toHaveBeenCalled();
@@ -214,7 +226,7 @@ describe("desktop sync settings actions", () => {
     enable(); settings = { ...settings, authorized: false, authorizationState: "expired" };
     await mount();
     expect(host.textContent).toContain("需要重新登录");
-    expect(host.textContent).toContain("未同步修改仍保留在本机");
+    expect(button("登录并开启同步")).toBeTruthy();
     expect(button("登录并开启同步")).toBeTruthy();
     expect(host.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe(profile.serverUrl);
   });

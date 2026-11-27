@@ -26,7 +26,8 @@ test("capture HTTP workflow creates folders/notes, appends all text formats and 
   const db = getDb();
   initApiTokensTable(db); initCaptures();
   const { initAuditTables } = await import("../src/services/audit.js");
-  const { setSyncBroadcaster } = await import("../src/sync/notify.js");
+  // Match the service's CJS instance under tsx; ESM import creates a separate listener.
+  const { setSyncBroadcaster } = require("../src/sync/notify");
   const notices: Array<{ userId: string; message: any }> = [];
   setSyncBroadcaster((userId, message) => notices.push({ userId, message }));
   initAuditTables();
@@ -109,7 +110,7 @@ test("capture HTTP workflow creates folders/notes, appends all text formats and 
       assert.ok(getDb().prepare("SELECT 1 FROM sync_changes_v2 WHERE entityType='note' AND entityId=?").get(first.result.noteId));
       assert.ok(getDb().prepare("SELECT 1 FROM sync_changes_v2 WHERE entityType='knowledge_tree_node' AND entityId=?").get(child!.id));
       const committedSequence=(getDb().prepare("SELECT MAX(sequence) sequence FROM sync_changes_v2 WHERE userId=?").get(owner) as any).sequence;
-      assert.ok(notices.some(notice=>notice.userId===owner && notice.message.type==="sync.changed" && notice.message.sequence===committedSequence));
+      assert.ok(notices.some(notice=>notice.userId===owner && notice.message.type==="sync.changed" && notice.message.sequence===committedSequence),JSON.stringify({committedSequence,notices}));
       assert.match(first.result.path,/技术资料 \/ PostgreSQL \/ 索引笔记/);
       closeDb();
       assert.equal(note(first.result.noteId).version,first.result.version);
@@ -208,6 +209,45 @@ test("capture HTTP workflow creates folders/notes, appends all text formats and 
       const result=await done((await submit({requestId:"provider-recovery",content:"网络恢复测试"})).id);
       assert.equal(result.status,"completed");assert.equal(modelCalls-before,3);
       assert.equal((getDb().prepare("SELECT COUNT(*) n FROM notes WHERE title='渠道恢复后只保存一次'").get() as any).n,1);
+    });
+    await t.test("a per-attempt timeout and a reset recover automatically with one note", async () => {
+      const originalFetch = globalThis.fetch;
+      const originalTimeout = AbortSignal.timeout;
+      const deadlines: number[] = [];
+      let attempts = 0;
+      AbortSignal.timeout = ms => { deadlines.push(ms); return originalTimeout(ms); };
+      globalThis.fetch = async (url, init) => {
+        if (String(url).startsWith(`http://127.0.0.1:${address.port}/v1/`)) {
+          attempts++;
+          if (attempts === 1) throw new DOMException("deadline reached", "TimeoutError");
+          if (attempts === 2) throw new TypeError("terminated", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+        }
+        return originalFetch(url, init);
+      };
+      try {
+        nextPlan = plan(root.resourceId, [], "断线恢复回归");
+        const result = await done((await submit({ requestId: "timeout-reset", content: "连接中断回归测试" })).id);
+        assert.equal(result.status, "completed"); assert.equal(attempts, 3);
+        assert.equal(deadlines.filter(ms => ms === 180_000).length, 3);
+        assert.equal((getDb().prepare("SELECT count(*) n FROM notes WHERE title='断线恢复回归'").get() as any).n, 1);
+      } finally { globalThis.fetch = originalFetch; AbortSignal.timeout = originalTimeout; }
+    });
+    await t.test("persistent timeouts stop after three attempts and permanent HTTP errors fail immediately", async () => {
+      const originalFetch = globalThis.fetch;
+      try {
+        for (const [name, status, expected] of [["timeout", 0, 3], ["unauthorized", 401, 1]] as const) {
+          let attempts = 0;
+          globalThis.fetch = async (url, init) => {
+            if (!String(url).startsWith(`http://127.0.0.1:${address.port}/v1/`)) return originalFetch(url, init);
+            attempts++;
+            if (status) return new Response(null, { status });
+            throw new DOMException("deadline reached", "TimeoutError");
+          };
+          const result = await done((await submit({ requestId: "bounded-" + name, content: "未完成的原文" })).id);
+          assert.equal(attempts, expected); assert.equal(result.status, "failed");
+          assert.equal(result.originalContent, "未完成的原文"); assert.equal(result.result, null);
+        }
+      } finally { globalThis.fetch = originalFetch; }
     });
     await t.test("restricted token sees only its granted folders and notes",async () => {
       const restricted=issue("restricted-pat",owner,scopes,"restricted");

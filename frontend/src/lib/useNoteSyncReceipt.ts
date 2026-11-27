@@ -1,3 +1,4 @@
+import { pollVisibleStatus } from "./visiblePolling";
 import { getServerUrl } from "./api";
 import { isElectronFullLocalRuntime } from "./uploadRequest";
 import { useEffect, useState } from "react";
@@ -16,8 +17,10 @@ export function useNoteSyncReceipt(noteId?: string, syncEnabled = false): NoteRe
     if (!noteId || !syncEnabled) { setPhase("unverified"); return; }
     let disposed = false;
     let requestId = 0;
+    const desktop = isElectronFullLocalRuntime(getServerUrl(), Boolean((window as any).nowenDesktop?.isDesktop));
     const refresh = () => {
-      if (isAndroidNativeRuntime() || isElectronFullLocalRuntime(getServerUrl(), Boolean((window as any).nowenDesktop?.isDesktop))) {
+      if (desktop && document.hidden) return;
+      if (isAndroidNativeRuntime() || desktop) {
         const current = ++requestId;
         void fetchNoteSyncReceipt(noteId).then((receipt) => {
           if (!disposed && requestId === current) setPhase(receipt.phase);
@@ -30,9 +33,9 @@ export function useNoteSyncReceipt(noteId?: string, syncEnabled = false): NoteRe
       const next = resolveNoteReceiptPhase(getNoteSyncReceipt(noteId), queue);
       setPhase(getNoteSyncConflict(noteId) ? "conflict" : next);
     };
-    refresh();
+    const stopPolling = desktop ? pollVisibleStatus(refresh, 1000) : undefined;
+    if (!desktop) refresh();
     const unsubscribe = subscribe(refresh);
-    const timer = isElectronFullLocalRuntime(getServerUrl(), Boolean((window as any).nowenDesktop?.isDesktop)) ? setInterval(refresh, 1000) : null;
     const onReceipt = (event: Event) => {
       if ((event as CustomEvent<{ noteId: string }>).detail?.noteId === noteId) refresh();
     };
@@ -40,7 +43,7 @@ export function useNoteSyncReceipt(noteId?: string, syncEnabled = false): NoteRe
     window.addEventListener(MOBILE_SYNC_STATUS_CHANGED_EVENT, refresh);
     return () => {
       disposed = true; ++requestId; unsubscribe();
-      if(timer) clearInterval(timer);
+      stopPolling?.();
       window.removeEventListener(NOTE_SYNC_RECEIPT_CHANGED_EVENT, onReceipt);
       window.removeEventListener(MOBILE_SYNC_STATUS_CHANGED_EVENT, refresh);
     };

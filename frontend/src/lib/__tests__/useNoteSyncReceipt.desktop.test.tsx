@@ -18,3 +18,21 @@ it('Electron waits for its exact backend body receipt instead of using local RES
  mock.receipt.mockResolvedValue({phase:'confirmed'});await act(async()=>vi.advanceTimersByTime(1000));expect(host.textContent).toBe('confirmed');
  mock.receipt.mockRejectedValue(new Error('offline'));await act(async()=>vi.advanceTimersByTime(1000));expect(host.textContent).toBe('unverified');
 });
+
+it('suspends receipt polling while hidden and refreshes immediately on return', async () => {
+  mock.receipt.mockResolvedValue({phase:'confirmed'});
+  const visibility = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+  try {
+    await act(async () => root.render(<Receipt/>));
+    mock.receipt.mockClear();
+    visibility.mockReturnValue(true);
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(mock.receipt).not.toHaveBeenCalled();
+    visibility.mockReturnValue(false);
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    expect(mock.receipt).toHaveBeenCalledTimes(1);
+  } finally { visibility.mockRestore(); }
+});

@@ -237,6 +237,7 @@ export function useNetworkStatus({ signalRecovery = true }: UseNetworkStatusOpti
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     const interval = setInterval(() => {
+      if (document.hidden && onlineRef.current && !offlineObservedRef.current && getQueueLength() === 0) return;
       void confirmReachability();
     }, PROBE_INTERVAL);
 

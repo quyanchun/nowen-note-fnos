@@ -7,6 +7,7 @@ import type { SearchSession } from "@/components/SearchCenter";
 import HomePage from "@/components/HomePage";
 import WorkspaceSidebar from "@/components/WorkspaceSidebar";
 import { isMacDesktopWorkspace, usesUnifiedNoteNavigation, workspaceNavigationTab } from "@/lib/workspaceNavigation";
+import { useMacQuickPanel } from "@/hooks/useMacQuickPanel";
 import { getHomeCaptureScope } from "@/lib/homeCapture";
 import WorkspaceIssues from "@/components/issues/WorkspaceIssues";
 import NotificationCenter from "@/components/issues/NotificationCenter";
@@ -14,21 +15,13 @@ import CommentManagementCenter from "@/components/CommentManagementCenter";
 import { openNoteComment } from "@/lib/noteCommentNavigation";
 import { openWorkspaceIssue, parseIssueAppPath } from "@/lib/workspaceIssueNavigation";
 import NavRail from "@/components/NavRail";
-import SettingsModal from "@/components/SettingsModal";
 import { useRailMode } from "@/hooks/useRailMode";
 import { useMobileRailHidden } from "@/hooks/useMobileRailHidden";
 import NoteList from "@/components/NoteList";
-import EditorPane from "@/components/EditorPane";
-import EditorSplitView from "@/components/EditorSplitView";
 import TaskCenter from "@/components/TaskCenter";
 import TrashPage from "@/features/trash/TrashPage";
-import MindMapCenter from "@/components/MindMapEditor";
-import SheetEditor from "@/components/SheetEditor";
-import AIChatPanel from "@/components/AIChatPanel";
-import DiaryCenter from "@/components/DiaryCenter";
 import FileManager from "@/components/FileManager";
 import ShareManagementPage from "@/components/ShareManagementPage";
-import SharedNoteView from "@/components/SharedNoteView";
 import NotebookShareJoinView from "@/components/NotebookShareJoinView";
 import LoginPage from "@/components/LoginPage";
 import DesktopAccountLogin from "@/components/DesktopAccountLogin";
@@ -107,6 +100,14 @@ import {
   isMobileLocalMode,
 } from "@/lib/mobileLocalMode";
 
+const EditorPane = React.lazy(() => import("@/components/EditorPane"));
+const EditorSplitView = React.lazy(() => import("@/components/EditorSplitView"));
+const MindMapCenter = React.lazy(() => import("@/components/MindMapEditor"));
+const SheetEditor = React.lazy(() => import("@/components/SheetEditor"));
+const AIChatPanel = React.lazy(() => import("@/components/AIChatPanel"));
+const DiaryCenter = React.lazy(() => import("@/components/DiaryCenter"));
+const SettingsModal = React.lazy(() => import("@/components/SettingsModal"));
+const SharedNoteView = React.lazy(() => import("@/components/SharedNoteView"));
 const SearchCenter = React.lazy(() => import("@/components/SearchCenter"));
 
 const AUTH_USER_CACHE_PREFIX = "nowen-auth-user:";
@@ -708,7 +709,10 @@ function AppLayout() {
   });
 
   // Alt+N 全局快捷键 / 桌面端菜单"新建笔记"共用同一入口
+  const panelNavigation = useRef(0);
   const quickCreateNote = useCallback(async () => {
+    const sequence = panelNavigation.current;
+    const scope = getHomeCaptureScope();
     const { toast } = await import("@/lib/toast");
     // 无笔记本时给出提示
     if (state.notebooks.length === 0) {
@@ -724,6 +728,8 @@ function AppLayout() {
     try {
       const { api } = await import("@/lib/api");
       const note = await api.createNote({ notebookId, title: t('common.untitledNote') });
+      if (getHomeCaptureScope() !== scope) return;
+      if (panelNavigation.current !== sequence) { actions.refreshNotebooks(); return; }
       markNewNoteForImmediateEdit(note.id);
       actions.setActiveNote(note);
       actions.setSelectedNotebook(notebookId);
@@ -859,11 +865,12 @@ function AppLayout() {
   });
 
   const openHomeNote = async (id: string) => {
+    const sequence = panelNavigation.current;
     const scope = getHomeCaptureScope();
     try {
       const { api } = await import("@/lib/api");
       const note = await api.getNote(id);
-      if (getHomeCaptureScope() !== scope) return;
+      if (getHomeCaptureScope() !== scope || sequence !== panelNavigation.current) return;
       actions.setActiveNote(note);
       actions.setSelectedNotebook(note.notebookId);
       actions.setViewMode("notebook");
@@ -871,6 +878,26 @@ function AppLayout() {
     } catch (error) { toast.error((error as Error).message || t("noteList.loadErrorTitle")); }
   };
 
+
+  useMacQuickPanel(({ text }) => {
+    ++panelNavigation.current;
+    setCommandPaletteOpen(false);
+    setSettingsOpen(false);
+    if (sheetRoute.matched || mindMapRoute.matched || issueRoute.matched) replaceAppPathState("/");
+    void openHomeNote(text);
+  }, () => {
+    actions.refreshNotebooks();
+    actions.refreshNotes();
+  });
+  function startNoteSearch(query: string) {
+    setSearchReturn(null);
+    actions.setSearchQuery(query);
+    actions.setViewMode("search");
+  }
+  function startKnowledgeQuestion(question: string) {
+    setHomeQuestion({ id: crypto.randomUUID(), question, scope: getHomeCaptureScope() });
+    actions.setViewMode("ai-chat");
+  }
 
   const searchBackButton = searchReturn?.scope === getHomeCaptureScope() && (
     (state.viewMode === "notebook" && state.activeNote?.id === searchReturn.id)
@@ -946,10 +973,11 @@ function AppLayout() {
       {noteNavigationSurface && !state.editorFullscreen && !state.sidebarCollapsed && <SidebarResizeHandle />}
 
       {/* ===== 主内容区 ===== */}
+      <React.Suspense fallback={null}>
       {isHomeView ? (
-        <HomePage key={getHomeCaptureScope()} scope={getHomeCaptureScope()} refreshToken={state.notesRefreshToken} onOpenNote={id => void openHomeNote(id)} onSearch={query => { setSearchReturn(null); actions.setSearchQuery(query); actions.setViewMode("search"); }} onAsk={question=>{setHomeQuestion({id:crypto.randomUUID(),question,scope:getHomeCaptureScope()});actions.setViewMode("ai-chat");}} />
+        <HomePage key={getHomeCaptureScope()} scope={getHomeCaptureScope()} refreshToken={state.notesRefreshToken} onOpenNote={id => void openHomeNote(id)} onSearch={startNoteSearch} onAsk={startKnowledgeQuestion} />
       ) : state.viewMode === "search" ? (
-        <React.Suspense fallback={null}><SearchCenter key={getHomeCaptureScope()} session={searchReturn?.scope === getHomeCaptureScope() ? searchReturn.session : undefined} onOpenResult={(result, session) => setSearchReturn({ scope: getHomeCaptureScope(), id: result.id, resourceType: result.resourceType, session })} onExit={() => setSearchReturn(null)} /></React.Suspense>
+        <SearchCenter key={getHomeCaptureScope()} session={searchReturn?.scope === getHomeCaptureScope() ? searchReturn.session : undefined} onOpenResult={(result, session) => setSearchReturn({ scope: getHomeCaptureScope(), id: result.id, resourceType: result.resourceType, session })} onExit={() => setSearchReturn(null)} />
       ) : state.viewMode === "trash" ? (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <TrashPage />
@@ -1061,6 +1089,8 @@ function AppLayout() {
         </div>
       )}
 
+      </React.Suspense>
+
       <CommentManagementCenter onOpenComment={handleOpenComment} />
       <NotificationCenter onUnreadChange={setNotificationCount} onOpenComment={handleOpenComment} onOpenIssue={(issueId, workspaceId) => { openWorkspaceIssue(issueId, workspaceId); actions.setViewMode("issues"); actions.setMobileSidebar(false); }} />
 
@@ -1073,9 +1103,11 @@ function AppLayout() {
         onClose={() => setCommandPaletteOpen(false)}
       />
 
-      <AnimatePresence>
-        {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
-      </AnimatePresence>
+      <React.Suspense fallback={null}>
+        <AnimatePresence>
+          {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+        </AnimatePresence>
+      </React.Suspense>
 
       {/* 无 UI 的网络探活、离线队列重放与同步后数据刷新 */}
       <OfflineSyncRuntime />
@@ -1611,7 +1643,7 @@ function App() {
   if (shareMatch) {
     return (
       <ThemeProvider>
-        <SharedNoteView shareToken={shareMatch[1]} />
+        <React.Suspense fallback={null}><SharedNoteView shareToken={shareMatch[1]} /></React.Suspense>
         <Toaster />
       </ThemeProvider>
     );

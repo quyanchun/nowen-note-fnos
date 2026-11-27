@@ -1,10 +1,10 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { CaptureError, getCapture, presentCapture, retryCapture, type CaptureActor } from "../services/captures.js";
-import { authenticateClipboard, clipboardSettingsSchema, clipboardSubmissionSchema, copyClipboardToken, getClipboardSettings, revokeClipboardToken, saveClipboardSettings, submitClipboard, listClipboardLogs } from "../services/clipboard-integration.js";
-import { isDesktopClipboard, desktopClipboardSettings, saveDesktopClipboardSettings, copyDesktopClipboardToken, revokeDesktopClipboardToken, desktopClipboardLogs, desktopClipboardLogAction } from "../services/desktop-clipboard";
+import { authenticateClipboard, clipboardSettingsSchema, clipboardSubmissionSchema, copyClipboardToken, getClipboardSettings, revokeClipboardToken, saveClipboardSettings, submitClipboard, listClipboardLogs, setClipboardTokenEnabled } from "../services/clipboard-integration.js";
+import { isDesktopClipboard, desktopClipboardSettings, saveDesktopClipboardSettings, copyDesktopClipboardToken, revokeDesktopClipboardToken, desktopClipboardLogs, desktopClipboardLogAction, desktopClipboardLogContent, setDesktopClipboardTokenEnabled } from "../services/desktop-clipboard";
 
-import {deleteClipboardLog,forceClipboardLog,undoClipboardLog} from "../services/clipboard-log-actions";
+import {deleteClipboardLog,forceClipboardLog,undoClipboardLog,getClipboardLogContent,editClipboardLog,editClipboardLogSchema} from "../services/clipboard-log-actions";
 
 function errors(app: Hono<any>,maxSize=160*1024) {
   app.onError((error,c) => error instanceof CaptureError ? c.json({ error: error.message, code: error.code }, error.status as 400)
@@ -23,16 +23,30 @@ clipboardSettingsRouter.get("/",async c=>c.json(isDesktopClipboard()
   : getClipboardSettings(c.req.header("X-User-Id")!)));
 clipboardSettingsRouter.get("/logs",async c=>{
   const offset=Number(c.req.query("offset")||0);
+  const status=c.req.query("status")||"all";
   if(!Number.isSafeInteger(offset)||offset<0||offset>100000)return c.json({error:"无效分页"},400);
+  if(status!=="all"&&status!=="completed"&&status!=="filtered")return c.json({error:"无效记录状态"},400);
   const userId=c.req.header("X-User-Id")!;
-  return c.json(isDesktopClipboard()?await desktopClipboardLogs(userId,offset):listClipboardLogs(userId,offset));
+  return c.json(isDesktopClipboard()?await desktopClipboardLogs(userId,offset,status):listClipboardLogs(userId,offset,status));
 });
 
-for(const action of ["delete","force","undo"] as const) {
+clipboardSettingsRouter.get("/logs/:requestId",async c=>{
+  const userId=c.req.header("X-User-Id")!,requestId=c.req.param("requestId");
+  if(!requestId||requestId.length>160)return c.json({error:"无效记录编号"},400);
+  return c.json(isDesktopClipboard()?await desktopClipboardLogContent(userId,requestId):getClipboardLogContent(userId,requestId));
+});
+for(const action of ["delete","force","undo","edit"] as const) {
   const handler=async(c:any)=>{
     const userId=c.req.header("X-User-Id")!,requestId=c.req.param("requestId");
-    if(!requestId||requestId.length>160)return c.json({error:"无效日志编号"},400);
-    if(isDesktopClipboard())return c.json(await desktopClipboardLogAction(userId,requestId,action));
+    if(!requestId||requestId.length>160)return c.json({error:"无效记录编号"},400);
+    let edit;
+    if(action==="edit"){
+      const parsed=editClipboardLogSchema.safeParse(await c.req.json().catch(()=>null));
+      if(!parsed.success)return c.json({error:"请填写完整内容，最多32000字符",code:"CAPTURE_INVALID_INPUT"},400);
+      edit=parsed.data;
+    }
+    if(isDesktopClipboard())return c.json(await desktopClipboardLogAction(userId,requestId,action,edit));
+    if(action==="edit")return c.json(await editClipboardLog(userId,requestId,edit!));
     const result=action==="delete"?deleteClipboardLog(userId,requestId):action==="force"?forceClipboardLog(userId,requestId):await undoClipboardLog(userId,requestId);
     return c.json(result);
   };
@@ -50,6 +64,12 @@ clipboardSettingsRouter.post("/token",async c=>c.json(isDesktopClipboard()
   ? await copyDesktopClipboardToken(c.req.header("X-User-Id")!) : copyClipboardToken(c.req.header("X-User-Id")!)));
 clipboardSettingsRouter.post("/token/rotate",async c=>c.json(isDesktopClipboard()
   ? await copyDesktopClipboardToken(c.req.header("X-User-Id")!,true) : copyClipboardToken(c.req.header("X-User-Id")!,true)));
+clipboardSettingsRouter.put("/token/status",async c=>{
+  const body=await c.req.json().catch(()=>null);
+  if(typeof body?.enabled!=="boolean")return c.json({error:"无效 Token 状态"},400);
+  const userId=c.req.header("X-User-Id")!;
+  return c.json(isDesktopClipboard()?await setDesktopClipboardTokenEnabled(userId,body.enabled):setClipboardTokenEnabled(userId,body.enabled));
+});
 clipboardSettingsRouter.delete("/token",async c=>{
   if(isDesktopClipboard()) return c.json(await revokeDesktopClipboardToken(c.req.header("X-User-Id")!));
   revokeClipboardToken(c.req.header("X-User-Id")!);return c.json({success:true});

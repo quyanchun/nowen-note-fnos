@@ -33,6 +33,8 @@ import {
   setShortcutOverride,
   shortcutChordFromKeyboardEvent,
 } from "@/lib/shortcutOverrides";
+import { getQuickPanel } from "@/lib/desktopBridge";
+import MacQuickShortcut from "./MacQuickShortcut";
 import { cn } from "@/lib/utils";
 
 const CATEGORY_ORDER: readonly ShortcutCategory[] = [
@@ -72,12 +74,13 @@ export default function ShortcutSettingsPanel() {
       ].join(" ").toLowerCase().includes(needle));
   }, [query, revision, surface]);
 
+  const showQuickShortcut = !!getQuickPanel() && "全局快速搜索快捷键 全局搜索 聚焦搜索 ctrl 空格".includes(query.trim().toLowerCase());
   const groups = useMemo(() => CATEGORY_ORDER
     .map((category) => ({
       category,
       commands: availableCommands.filter((command) => command.category === category),
     }))
-    .filter((group) => group.commands.length > 0), [availableCommands]);
+    .filter((group) => group.commands.length > 0 || (group.category === "global" && showQuickShortcut)), [availableCommands, showQuickShortcut]);
 
   const applyBinding = (commandId: string, chord: ShortcutChord) => {
     setShortcutOverride(commandId, platform, [chord]);
@@ -240,6 +243,7 @@ export default function ShortcutSettingsPanel() {
               {SHORTCUT_CATEGORY_LABELS[group.category]}
             </h4>
             <div className="overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+              {group.category === "global" && showQuickShortcut && <MacQuickShortcut />}
               {group.commands.map((command, index) => {
                 const current = getShortcutChords(command.id, platform, surface);
                 const defaults = getDefaultShortcutChords(command.id, platform, surface);
@@ -247,7 +251,7 @@ export default function ShortcutSettingsPanel() {
                 const currentLabel = current[0] ? formatShortcutChord(current[0], platform) : "未绑定";
                 const defaultLabel = defaults[0] ? formatShortcutChord(defaults[0], platform) : "无默认键位";
                 return (
-                  <div key={command.id} className={cn("px-4 py-3", index > 0 && "border-t border-zinc-200 dark:border-zinc-800")}>
+                  <div key={command.id} className={cn("px-4 py-3", (index > 0 || (group.category === "global" && showQuickShortcut)) && "border-t border-zinc-200 dark:border-zinc-800")}>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2 text-sm font-medium text-zinc-900 dark:text-zinc-100">

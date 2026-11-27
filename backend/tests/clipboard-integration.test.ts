@@ -12,14 +12,14 @@ test("single-token clipboard settings, filtering and capture isolation (DCC-001 
  const {getDb,closeDb}=await import("../src/db/schema.js");
  const {getFnosAccount}=await import("../src/lib/fnos-identity.js");
  const {clipboardPublicRouter,clipboardSettingsRouter}=await import("../src/routes/clipboard.js");
- const {clipboardSettingsSchema,getClipboardSettings,saveClipboardSettings,copyClipboardToken,authenticateClipboard,revokeClipboardToken}=await import("../src/services/clipboard-integration.js");
+ const {clipboardSettingsSchema,getClipboardSettings,saveClipboardSettings,copyClipboardToken,authenticateClipboard,revokeClipboardToken,setClipboardTokenEnabled}=await import("../src/services/clipboard-integration.js");
  const {drainCaptures}=await import("../src/services/captures.js");
  const {setUserAISettings}=await import("../src/services/user-ai-settings.js");
  const {createKnowledgeChild}=await import("../src/services/knowledgeTree.js");
  const {resolveApiToken}=await import("../src/lib/api-tokens.js");
  const db=getDb();const owner=getFnosAccount({uid:"2101",username:"clipboard-test",isAdmin:false}).id;const other=getFnosAccount({uid:"2102",username:"clipboard-other",isAdmin:false}).id;
- let nextPlan:any;let calls=0;let messages:any[]=[];let filterReply:any={collect:true};let filterCalls=0;let duringFilter:(()=>void)|null=null;let transientFilterFailures=0;
- const model=createServer(async(req,res)=>{const chunks=[];for await(const chunk of req)chunks.push(chunk);messages=JSON.parse(Buffer.concat(chunks).toString()).messages;calls++;const filtering=messages[0]?.content?.includes("你是剪贴板内容过滤器");if(filtering){filterCalls++;duringFilter?.();duringFilter=null;}const reply=filtering?filterReply:nextPlan;if(reply==="provider-error"||(filtering&&transientFilterFailures-- > 0)){res.writeHead(503);res.end("synthetic unavailable");return;}res.setHeader("Content-Type","application/json");res.end(JSON.stringify({choices:[{message:{content:typeof reply==="string"?reply:JSON.stringify(reply)}}]}));});
+ let nextPlan:any;let planReplies:any[]=[];let calls=0;let messages:any[]=[];let filterReply:any={collect:true};let filterCalls=0;let duringFilter:(()=>void)|null=null;let transientFilterFailures=0;
+ const model=createServer(async(req,res)=>{const chunks=[];for await(const chunk of req)chunks.push(chunk);messages=JSON.parse(Buffer.concat(chunks).toString()).messages;calls++;const filtering=messages[0]?.content?.includes("你是剪贴板内容过滤器");if(filtering){filterCalls++;duringFilter?.();duringFilter=null;}const reply=filtering?filterReply:planReplies.length?planReplies.shift():nextPlan;if(reply==="provider-error"||(filtering&&transientFilterFailures-- > 0)){res.writeHead(503);res.end("synthetic unavailable");return;}res.setHeader("Content-Type","application/json");res.end(JSON.stringify({choices:[{message:{content:typeof reply==="string"?reply:JSON.stringify(reply)}}]}));});
  await new Promise<void>(resolve=>model.listen(0,"127.0.0.1",resolve));
  setUserAISettings(owner,[{key:"ai_api_url",value:`http://127.0.0.1:${(model.address() as any).port}/v1`},{key:"ai_api_key",value:"synthetic"},{key:"ai_model",value:"fixture"}]);
  const app=new Hono();app.route("/api/clipboard",clipboardPublicRouter);
@@ -47,7 +47,7 @@ test("single-token clipboard settings, filtering and capture isolation (DCC-001 
    const response=await app.request("/api/clipboard-settings",{method:"PUT",headers:{Authorization:"Bearer fixture-login","Content-Type":"application/json"},body:JSON.stringify(clipboardSettingsSchema.parse({enabled:true,systemPrompt:"请使用简洁中文标题",instruction:"保留单位和数字"}))});assert.equal(response.status,200,await response.text());
   });
   await t.test("single Bearer creates folders/note without Cookie and ignores forged account headers",async()=>{
-   nextPlan=plan(null,["剪贴板验收","数据库"]);const response=await call("/captures","POST",{requestId:"create",content:original},raw,{"X-User-Id":other,"X-Trim-Userid":"2102"});assert.equal(response.status,202,await response.clone().text());first=await completed((await response.json() as any).id);assert.equal(first.status,"completed",JSON.stringify(first));assert.equal(first.originalContent,original);assert.match(first.result.path,/剪贴板验收 \/ 数据库 \/ 索引调优/);assert.equal((db.prepare("SELECT userId FROM notes WHERE id=?").get(first.result.noteId) as any).userId,owner);assert.ok(messages.some(m=>m.role==="system"&&m.content==="请使用简洁中文标题"));root=db.prepare("SELECT * FROM notebooks WHERE name='剪贴板验收' AND userId=?").get(owner);
+   nextPlan=plan(null,["技术","数据库"]);const response=await call("/captures","POST",{requestId:"create",content:original},raw,{"X-User-Id":other,"X-Trim-Userid":"2102"});assert.equal(response.status,202,await response.clone().text());first=await completed((await response.json() as any).id);assert.equal(first.status,"completed",JSON.stringify(first));assert.equal(first.originalContent,original);assert.match(first.result.path,/技术 \/ 数据库 \/ 索引调优/);assert.equal((db.prepare("SELECT userId FROM notes WHERE id=?").get(first.result.noteId) as any).userId,owner);assert.ok(messages.some(m=>m.role==="system"&&m.content==="请使用简洁中文标题"));root=db.prepare("SELECT * FROM notebooks WHERE name='技术' AND userId=?").get(owner);
   });
   await t.test("automatic append preserves prior content",async()=>{const before=db.prepare("SELECT * FROM notes WHERE id=?").get(first.result.noteId) as any;nextPlan={...plan(before.notebookId),action:"append",noteId:before.id,content:"新增EXPLAIN ANALYZE说明"};const done=await completed((await(await submit("append")).json() as any).id);assert.equal(done.status,"completed",JSON.stringify(done));assert.equal(done.result.action,"append");const after=db.prepare("SELECT * FROM notes WHERE id=?").get(before.id) as any;assert.ok(after.content.startsWith(before.content));assert.match(after.content,/EXPLAIN ANALYZE/);});
   await t.test("request remains idempotent after settings change",async()=>{saveClipboardSettings(owner,clipboardSettingsSchema.parse({enabled:true,minChars:32000,instruction:"新规则"}));const before=calls;const response=await submit("create");assert.equal(response.status,200);assert.equal((await response.json() as any).id,first.id);await drainCaptures();assert.equal(calls,before);assert.equal((await submit("create",{content:"不同内容"})).status,409);});
@@ -61,7 +61,7 @@ test("single-token clipboard settings, filtering and capture isolation (DCC-001 
   ] as const)await t.test(`filters ${name} before AI; repeats without changing result`,async()=>{saveClipboardSettings(owner,clipboardSettingsSchema.parse({enabled:true,...settings}));const before=calls;const response=await submit(`filter-${name}`,input);assert.equal(response.status,200);const result=await response.json() as any;assert.equal(result.status,"filtered");assert.equal(result.reasonCode,reason);assert.equal((await(await submit(`filter-${name}`,input)).json() as any).duplicate,true);await drainCaptures();assert.equal(calls,before);});
   await t.test("folder scope allows subfolder/note creation and denies sibling",async()=>{
    saveClipboardSettings(owner,clipboardSettingsSchema.parse({enabled:true,notebookId:root.id}));const sibling=createKnowledgeChild({actorUserId:owner,workspaceId:null,parentId:null,nodeType:"folder",title:"未授权目录"});assert.equal((await submit("forbidden",{notebookId:sibling.resourceId})).status,403);
-   nextPlan=plan(root.id,["运维"],"备份计划");const done=await completed((await(await submit("child")).json() as any).id);assert.equal(done.status,"completed",JSON.stringify(done));assert.match(done.result.path,/剪贴板验收 \/ 运维 \/ 备份计划/);
+   nextPlan=plan(root.id,["运维"],"备份计划");const done=await completed((await(await submit("child")).json() as any).id);assert.equal(done.status,"completed",JSON.stringify(done));assert.match(done.result.path,/技术 \/ 运维 \/ 备份计划/);
    nextPlan=plan(root.id,[],"Redis缓存");const second=await completed((await(await submit("existing")).json() as any).id);assert.equal(second.status,"completed");assert.equal(second.result.notebookId,root.id);
   });
   await t.test("explicit note append with organize=false preserves exact added text",async()=>{const content="  原样追加\r\n  数值 123.45 ";nextPlan={...plan(first.result.notebookId),action:"append",noteId:first.result.noteId,content:"模型试图改写"};const done=await completed((await(await submit("raw",{content,organize:false,noteId:first.result.noteId})).json() as any).id);assert.equal(done.status,"completed",JSON.stringify(done));assert.equal(done.result.content,content);assert.equal(done.originalContent,content);});
@@ -72,15 +72,45 @@ test("single-token clipboard settings, filtering and capture isolation (DCC-001 
    const content="sk-synthetic-no-service-0123456789abcdef";
    const before=calls;
    const response=await submit("bare-key",{content});assert.equal(response.status,200);
-   const result=await response.json() as any;assert.equal(result.status,"filtered");assert.equal(result.reasonCode,"CAPTURE_UNCLEAR_PURPOSE");
+   const result=await response.json() as any;assert.equal(result.status,"filtered");assert.equal(result.reasonCode,"CAPTURE_CONTEXT_REQUIRED");
    await drainCaptures();assert.equal(calls,before);
    const {listClipboardLogs}=await import("../src/services/clipboard-integration.js");
    const row=listClipboardLogs(owner).items.find(item=>item.requestId==="bare-key");
-   assert.equal(row?.code,"CAPTURE_UNCLEAR_PURPOSE");assert.ok(!row?.preview.includes(content));
+   assert.equal(row?.code,"CAPTURE_CONTEXT_REQUIRED");
+   assert.equal((db.prepare("SELECT originalInput FROM clipboard_submissions WHERE requestId='bare-key'").get() as any).originalInput,null);
+   assert.equal(row?.canForce,false);assert.ok(!row?.preview.includes(content));
   });
   await t.test("AI filtering defaults off and cannot be enabled without a prompt",async()=>{
    assert.equal(getClipboardSettings(owner).settings.aiFilterEnabled,false);
    const response=await app.request("/api/clipboard-settings",{method:"PUT",headers:{Authorization:"Bearer fixture-login","Content-Type":"application/json"},body:JSON.stringify({...getClipboardSettings(owner).settings,aiFilterEnabled:true,aiFilterPrompt:"  "})});assert.equal(response.status,400);
+  });
+  await t.test("automatic credentials require a service and always append to the same password book",async()=>{
+   saveClipboardSettings(owner,clipboardSettingsSchema.parse({enabled:true}));filterReply={collect:true};
+   for(const [index,content] of ["账号：admin\n密码：Synthetic-42!","密码：Synthetic-42!","账号：me@example.test\n密码：Synthetic-42!"].entries()) {
+    const r=await(await submit(`context-missing-${index}`,{content})).json() as any;assert.equal(r.status,'filtered');assert.equal(r.reasonCode,'CAPTURE_CONTEXT_REQUIRED');
+    assert.equal((db.prepare('SELECT originalInput FROM clipboard_submissions WHERE requestId=?').get(`context-missing-${index}`) as any).originalInput,null);
+   }
+   nextPlan={invalid:'must not select another credential target'};
+   const first=await completed((await(await submit('context-complete-1',{content:'服务：演示平台\n账号：admin\n密码：Synthetic-42!'})).json() as any).id);
+   const second=await completed((await(await submit('context-complete-2',{content:'https://demo.example.test\n账号：other\n密码：Synthetic-43!'})).json() as any).id);
+   assert.equal(first.status,'completed',JSON.stringify(first));assert.equal(second.status,'completed',JSON.stringify(second));assert.equal(first.result.noteId,second.result.noteId);
+   const book=db.prepare('SELECT content,title FROM notes WHERE id=?').get(first.result.noteId) as any;assert.equal(book.title,'账号密码本');assert.ok(book.content.includes('演示平台'));assert.ok(book.content.includes('Synthetic-42!'));assert.ok(book.content.includes('Synthetic-43!'));
+   const raw='服务：原样保存平台\n账号：demo-raw\n密码：Synthetic-44!';const preserved=await completed((await(await submit('context-raw',{content:raw,organize:false})).json() as any).id);assert.equal(preserved.status,'completed');assert.equal(preserved.result.content,raw);
+  });
+  await t.test("automatic folder aliases reuse the existing taxonomy and arbitrary roots cannot be created",async()=>{
+   filterReply={collect:true};nextPlan=plan(null,['技术','AI'],'模型设置');
+   const first=await completed((await(await submit('folder-canonical')).json() as any).id);assert.equal(first.status,'completed',JSON.stringify(first));
+   nextPlan=plan(null,['技术学习','AI与机器学习'],'推理配置');
+   const second=await completed((await(await submit('folder-alias')).json() as any).id);assert.equal(second.status,'completed',JSON.stringify(second));assert.equal(first.result.notebookId,second.result.notebookId);
+   assert.equal((db.prepare("SELECT count(*) n FROM notebooks WHERE name IN ('技术学习','AI与机器学习')").get() as any).n,0);
+   nextPlan=plan(null,['临时想法','随意分类']);const invalid=await completed((await(await submit('folder-unapproved')).json() as any).id);assert.equal(invalid.status,'failed');assert.equal((db.prepare("SELECT count(*) n FROM notebooks WHERE name='临时想法'").get() as any).n,0);
+  });
+  await t.test("a useful project schedule is re-planned instead of discarded for lacking an existing folder",async()=>{
+   saveClipboardSettings(owner,clipboardSettingsSchema.parse({enabled:true}));filterReply={collect:true};
+   planReplies=[{action:'skip',reason:'unclear_purpose'},plan(null,['工作','项目管理'],'任务平台工作排期')];
+   const before=filterCalls,result=await completed((await(await submit('approved-schedule',{content:'任务平台项目排期：周一设计接口，周三迁移，周五联调。'})).json() as any).id);
+   assert.equal(result.status,'completed',JSON.stringify(result));assert.equal(filterCalls,before+1);assert.match(result.result.path,/工作 \/ 项目管理/);
+   assert.ok(messages.some(message=>message.role==='system'&&message.content.includes('前置过滤已确认')));
   });
   await t.test("fixed rules run before optional AI filtering",async()=>{
    saveClipboardSettings(owner,clipboardSettingsSchema.parse({enabled:true,notebookId:root.id,aiFilterEnabled:true,aiFilterPrompt:"只收集技术资料",excludeKeywords:["skip"]}));
@@ -94,11 +124,11 @@ test("single-token clipboard settings, filtering and capture isolation (DCC-001 
    const repeat=await submit("ai-reject",{content:"今晚买一瓶酱油"});assert.equal(repeat.status,200);assert.equal((await repeat.json() as any).status,"filtered");await drainCaptures();assert.equal(filterCalls,before+1);
    assert.equal((await call(`/captures/${queued.id}/retry`,"POST",{})).status,409);
   });
-  await t.test("AI permits collection and disabled AI ignores its saved prompt",async()=>{
+  await t.test("AI permits collection and disabling custom filtering retains the built-in quality gate",async()=>{
    filterReply={collect:true};nextPlan=plan(root.id,[],"AI放行笔记");let before=calls;
    let result=await completed((await(await submit("ai-allow")).json() as any).id);assert.equal(result.status,"completed",JSON.stringify(result));assert.equal(calls,before+2);
    saveClipboardSettings(owner,{...getClipboardSettings(owner).settings,aiFilterEnabled:false});filterReply={collect:false};before=calls;
-   result=await completed((await(await submit("ai-disabled")).json() as any).id);assert.equal(result.status,"completed");assert.equal(calls,before+1);
+   result=await completed((await(await submit("ai-disabled")).json() as any).id);assert.equal(result.status,"filtered");assert.equal(calls,before+1);
   });
   await t.test("invalid AI verdict fails safely; retry preserves the original filter snapshot",async()=>{
    saveClipboardSettings(owner,{...getClipboardSettings(owner).settings,aiFilterEnabled:true});filterReply="invalid provider text";
@@ -144,6 +174,18 @@ test("single-token clipboard settings, filtering and capture isolation (DCC-001 
    const script=`import fs from 'node:fs'; const p=JSON.parse(fs.readFileSync(0,'utf8')); const im=await import('./src/services/clipboard-integration.ts'); const integration=im.default||im; const cm=await import('./src/services/captures.ts'); const capture=cm.default||cm; if(integration.copyClipboardToken(p.userId).token!==p.token)throw new Error('Token changed'); const actor=integration.authenticateClipboard(p.token); if(actor.userId!==p.userId || capture.getCapture(actor,p.captureId).status!=='completed')throw new Error('Persistence mismatch'); console.log('RESTART_TOKEN_OK');`;
    const result=spawnSync(process.execPath,["--import","tsx","--input-type=module","-e",script],{cwd:process.cwd(),env:process.env,input:JSON.stringify({userId:owner,token:raw,captureId:first.id}),encoding:"utf8",timeout:20000});
    assert.equal(result.status,0,result.stderr);assert.match(result.stdout,/RESTART_TOKEN_OK/);
+  });
+  await t.test("clipboard tokens never expire by default and can pause and resume without rotation",async()=>{
+   const token=copyClipboardToken(owner).token;
+   assert.equal(getClipboardSettings(owner).tokenExpiresAt,null);
+   assert.equal(setClipboardTokenEnabled(owner,false).tokenEnabled,false);
+   assert.equal(copyClipboardToken(owner).token,token);
+   assert.equal(getClipboardSettings(owner).tokenEnabled,false);
+   assert.equal((await call("/policy","GET",undefined,token)).status,401);
+   assert.equal(setClipboardTokenEnabled(owner,true).tokenEnabled,true);
+   assert.equal(copyClipboardToken(owner).token,token);
+   assert.equal((await call("/policy","GET",undefined,token)).status,200);
+   assert.equal((await app.request("/api/clipboard-settings/token/status",{method:"PUT",headers:{Authorization:"Bearer fixture-login","X-Auth-Mode":"api-token","Content-Type":"application/json"},body:'{"enabled":false}'})).status,403);
   });
   await t.test("disable, account disable, rotation and revocation reject tokens and queued writes",async()=>{const saved=getClipboardSettings(owner).settings;saveClipboardSettings(owner,{...saved,enabled:false});assert.equal((await call("/policy")).status,401);saveClipboardSettings(owner,saved);db.prepare("UPDATE users SET isDisabled=1 WHERE id=?").run(owner);assert.equal((await call("/policy")).status,401);db.prepare("UPDATE users SET isDisabled=0 WHERE id=?").run(owner);nextPlan=plan(root.id);const queued=await(await submit("revoked-queue")).json() as any;const previous=raw;raw=copyClipboardToken(owner,true).token;assert.notEqual(raw,previous);assert.equal((await call("/policy","GET",undefined,previous)).status,401);assert.equal((await call(`/captures/${first.id}`)).status,404);const before=calls;await drainCaptures();assert.equal(calls,before);assert.equal((db.prepare("SELECT errorCode FROM capture_jobs WHERE id=?").get(queued.id) as any).errorCode,"CAPTURE_TOKEN_INVALID");revokeClipboardToken(owner);assert.equal((await call("/policy")).status,401);assert.equal(getClipboardSettings(owner).tokenSet,false);});
  }finally{await new Promise<void>(resolve=>model.close(()=>resolve()));closeDb();fs.rmSync(directory,{recursive:true,force:true});}

@@ -576,8 +576,8 @@ export default function ContextMenu({
       const gap = 8;
       const minX = viewportLeft + gap;
       const minY = viewportTop + gap;
-      const maxX = Math.max(minX, viewportLeft + viewportWidth - rect.width - gap);
-      const maxY = Math.max(minY, viewportTop + viewportHeight - rect.height - gap);
+      const maxX = Math.max(minX, viewportLeft + viewportWidth - (el.offsetWidth || rect.width) - gap);
+      const maxY = Math.max(minY, viewportTop + viewportHeight - (el.offsetHeight || rect.height) - gap);
       const newX = Math.min(Math.max(x, minX), maxX);
       const newY = Math.min(Math.max(y, minY), maxY);
       setAdjustedPos((current) => (

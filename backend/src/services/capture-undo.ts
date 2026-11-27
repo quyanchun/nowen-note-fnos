@@ -5,6 +5,16 @@ import {projectMarkdownForUser} from "../lib/markdownUserContent";
 import {encryptedBlocksInContent,isEncryptedNoteFormat} from "../lib/encryptedNotes";
 import {canViewNoteThroughFolderPasswords} from "../lib/knowledgeTreePasswordAccess";
 import {notifySyncChanged} from "../sync/notify";
+import {randomUUID} from "node:crypto";
+import {syncNoteBlocks} from "../lib/noteBlocks";
+import {syncReferences} from "../lib/attachmentRefs";
+import {syncNoteLinks} from "../lib/noteLinks";
+import {synchronizeLegacyNoteHierarchy} from "./legacyKnowledgeHierarchy";
+import {noteVersionsRepository} from "../repositories";
+import {rebuildBlockAuthorityStore} from "../lib/blockAuthorityStore";
+import {rebuildYjsSubdocumentsIfEnabled} from "./yjs-subdocuments";
+import {yReplaceContentAsUpdate} from "./yjs";
+import {broadcastYjsUpdate,broadcastNoteDeleted,broadcastNoteUpdated} from "./realtime";
 
 type Note=Record<string,any>;
 const visible=(note:Note)=>note.contentFormat==="markdown"?projectMarkdownForUser(note.content):note.content;
@@ -40,9 +50,9 @@ function legacyBefore(note:Note,result:any,plan:any,jobId:string):Note|null {
   }
   throw new CaptureError("CAPTURE_UNDO_UNAVAILABLE","这条旧记录没有完整撤销快照，无法安全还原；笔记保持不变。",409);
 }
-export async function undoCapture(actor:CaptureActor,id:string) {
+export function prepareCaptureUndo(actor:CaptureActor,id:string) {
   initCaptures();const db=getDb(),job=getCapture(actor,id);
-  if(job.undoneAt)return {undone:true,noteId:JSON.parse(job.result!).noteId};
+  if(job.undoneAt)throw new CaptureError("CAPTURE_ALREADY_UNDONE","此项已撤销",409);
   if(job.status!=="completed"||!job.result)throw new CaptureError("CAPTURE_NOT_COMPLETED","只有已成功收集的内容可以撤销",409);
   const result=JSON.parse(job.result),current=db.prepare("SELECT * FROM notes WHERE id=? AND userId=? AND workspaceId IS NULL").get(result.noteId,actor.userId) as Note|undefined;
   if(!current||current.isTrashed||current.isLocked||isEncryptedNoteFormat(current.contentFormat)
@@ -60,15 +70,64 @@ export async function undoCapture(actor:CaptureActor,id:string) {
     }
     body={isTrashed:1,version:current.version};
   }else body={content:remainingContent(before!,after,current),version:current.version};
-  const request=new Request(`http://nowen.internal/${encodeURIComponent(current.id)}`,{method:"PUT",headers:{"Content-Type":"application/json","X-User-Id":actor.userId},body:JSON.stringify(body)});
-  registerCaptureReceipt(request,()=>{
-    const updated=db.prepare("UPDATE capture_jobs SET undoneAt=datetime('now'),updatedAt=datetime('now') WHERE id=? AND userId=? AND undoneAt IS NULL AND status='completed'").run(id,actor.userId);
-    if(!updated.changes)throw new CaptureError("CAPTURE_ALREADY_UNDONE","此项已撤销",409);
-  },false,()=>{
-    const latest=db.prepare("SELECT content,contentFormat,version FROM notes WHERE id=? AND userId=?").get(current.id,actor.userId) as Note;
+  const validate=()=>{
+    const latest=db.prepare("SELECT * FROM notes WHERE id=? AND userId=?").get(current.id,actor.userId) as Note;
+    if(!latest||latest.isTrashed||latest.isLocked||isEncryptedNoteFormat(latest.contentFormat)||!canViewNoteThroughFolderPasswords(db,current.id,new Set()))throw new CaptureError("CAPTURE_TARGET_FORBIDDEN","笔记已删除、锁定或受保护，未执行撤销",409);
     if(!latest||latest.version!==current.version||latest.content!==current.content||latest.contentFormat!==current.contentFormat)throw changed();
     if(getCapture(actor,id).undoneAt)throw new CaptureError("CAPTURE_ALREADY_UNDONE","此项已撤销",409);
-  });
+  };
+  const markUndone=()=>{
+    const updated=db.prepare("UPDATE capture_jobs SET undoneAt=datetime('now'),updatedAt=datetime('now') WHERE id=? AND userId=? AND undoneAt IS NULL AND status='completed'").run(id,actor.userId);
+    if(!updated.changes)throw new CaptureError("CAPTURE_ALREADY_UNDONE","此项已撤销",409);
+  };
+  return {current,body,validate,markUndone};
+}
+
+/** Runs inside the replacement note's transaction; both notes and receipts commit together. */
+export function commitCaptureReplacement(actor:CaptureActor,undo:ReturnType<typeof prepareCaptureUndo>,sameNote:boolean) {
+  if(!sameNote) {
+    undo.validate();
+    const db=getDb(),note=undo.current;
+    noteVersionsRepository.create({id:randomUUID(),noteId:note.id,userId:actor.userId,title:note.title,content:note.content,contentText:note.contentText,contentFormat:note.contentFormat,version:note.version,changeType:'edit'});
+    if(undo.body.isTrashed) {
+      db.prepare("UPDATE notes SET isTrashed=1,trashedAt=datetime('now'),version=version+1 WHERE id=?").run(note.id);
+      synchronizeLegacyNoteHierarchy({db,noteId:note.id,actorUserId:actor.userId,reason:'delete',parentMode:'preserve'});
+    }else {
+      const canonical=syncNoteBlocks(db,note.id,String(undo.body.content),note.contentFormat);
+      db.prepare("UPDATE notes SET content=?,contentText=?,version=version+1,updatedAt=datetime('now') WHERE id=?").run(canonical.content,canonical.contentText,note.id);
+      syncReferences(db,note.id,canonical.content);
+      syncNoteLinks(db,actor.userId,note.id,canonical.content);
+      if(['markdown','tiptap-json'].includes(note.contentFormat)) {
+        rebuildBlockAuthorityStore(db,note.id,canonical.content,note.contentFormat,{noteVersion:note.version+1,operationType:'whole-save'});
+        rebuildYjsSubdocumentsIfEnabled(db,note.id,canonical.content,note.contentFormat);
+      }
+    }
+  }
+  undo.markUndone();
+}
+
+export function finishCaptureReplacement(actor:CaptureActor,undo:ReturnType<typeof prepareCaptureUndo>) {
+  const note=getDb().prepare("SELECT * FROM notes WHERE id=?").get(undo.current.id) as Note;
+  if(note.isTrashed)broadcastNoteDeleted(note.id,{actorUserId:actor.userId,trashed:true});
+  else {
+    if(note.contentFormat==='markdown') {
+      const update=yReplaceContentAsUpdate(note.id,note.content,actor.userId);
+      if(update)broadcastYjsUpdate(note.id,update.updateBase64);
+    }
+    broadcastNoteUpdated(note.id,{version:note.version,updatedAt:note.updatedAt,title:note.title,contentText:note.contentText,actorUserId:actor.userId});
+  }
+  notifySyncChanged(getDb(),actor.userId,'personal');
+}
+
+export async function undoCapture(actor:CaptureActor,id:string,commit?:()=>void) {
+  initCaptures();const db=getDb(),job=getCapture(actor,id);
+  if(job.undoneAt){if(commit)throw new CaptureError("CAPTURE_ALREADY_UNDONE","此项已撤销",409);return {undone:true,noteId:JSON.parse(job.result!).noteId};}
+  const {current,body,validate,markUndone}=prepareCaptureUndo(actor,id);
+  const request=new Request(`http://nowen.internal/${encodeURIComponent(current.id)}`,{method:"PUT",headers:{"Content-Type":"application/json","X-User-Id":actor.userId},body:JSON.stringify(body)});
+  registerCaptureReceipt(request,()=>{
+    markUndone();
+    commit?.();
+  },false,validate);
   const router=(await import("../routes/notes")).default;
   const response=await router.fetch(request);
   if(!response.ok) {

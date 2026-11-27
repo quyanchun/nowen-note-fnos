@@ -95,7 +95,8 @@ function updaterDisabledReason() {
   if (!app.isPackaged) return "development-build";
   if (isPortableBuild()) return "portable-build";
   if (isUnsupportedLinuxPackage()) return "linux-package-not-supported";
-  return null;
+  // 定制版通过本仓库构建部署，禁止上游更新覆盖本地改动。
+  return "fork-updates-disabled";
 }
 
 function sanitizeError(error) {
@@ -458,8 +459,8 @@ function registerIpc(opts, disabled) {
   });
 
   ipcMain.handle("updater:quit-and-install", () =>
-    disabled === "microsoft-store-managed"
-      ? { ok: false, reason: "microsoft-store-managed", state: publicState() }
+    disabled
+      ? { ok: false, reason: disabled, state: publicState() }
       : installNow(opts));
 
   // Fixed, allowlisted URI: the renderer cannot substitute an arbitrary external URL.

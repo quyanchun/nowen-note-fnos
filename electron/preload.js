@@ -30,6 +30,21 @@ const allowedChannels = new Set([
 ]);
 
 contextBridge.exposeInMainWorld("nowenDesktop", {
+  quickPanel: process.platform === "darwin" ? {
+    shortcut: key => ipcRenderer.invoke("quick:shortcut", key),
+    ready: value => ipcRenderer.send("quick:ready", value),
+    results: data => ipcRenderer.send("quick:results", data),
+    onQuery: callback => {
+      const listener = (_event, data) => callback(data);
+      ipcRenderer.on("quick:query", listener);
+      return () => ipcRenderer.removeListener("quick:query", listener);
+    },
+    onAction: callback => {
+      const listener = (_event, data) => callback(data);
+      ipcRenderer.on("quick:action", listener);
+      return () => ipcRenderer.removeListener("quick:action", listener);
+    },
+  } : undefined,
   accountLogin: {
     info: () => ipcRenderer.invoke("desktop:login-info"),
     start: (input) => ipcRenderer.invoke("desktop:login-start", input),

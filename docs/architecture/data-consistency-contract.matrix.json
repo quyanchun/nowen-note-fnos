@@ -407,6 +407,10 @@
       "status": "covered",
       "checks": [
         {
+          "file": "backend/tests/fnos-password-setup.test.ts",
+          "case": "fnOS first password setup requires a live owned session and preserves local password verification (DCC-006)"
+        },
+        {
           "file": "backend/tests/clipboard-media.test.ts",
           "case": "clipboard folder recovery, image durability and account logs (DCC-001 DCC-003 DCC-004 DCC-006 DCC-007)"
         },
@@ -609,6 +613,10 @@
         {
           "file": "backend/tests/clipboard-log-actions.test.ts",
           "case": "clipboard log actions preserve ownership, receipts and later edits (DCC-001 DCC-002 DCC-003 DCC-004 DCC-006 DCC-007)"
+        },
+        {
+          "file": "backend/tests/ai-hybrid.test.ts",
+          "case": "knowledge answers combine exact and vector recall and retain scope (DCC-006)"
         }
       ]
     },

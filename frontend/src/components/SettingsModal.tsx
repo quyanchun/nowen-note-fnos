@@ -1317,6 +1317,7 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
   function SettingsModal({ onClose, defaultTab = "appearance" }, ref) {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<TabId>(defaultTab === "plugins" ? "appearance" : defaultTab);
+  const actions=useAppActions();
   const { siteConfig } = useSiteSettings();
   const shortcutSurface = detectShortcutSurface();
   const [currentUser, setCurrentUser] = useState<{ id: string; role?: string; username?: string; displayName?: string | null } | null>(null);
@@ -1565,7 +1566,7 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
               {!isMobileLocalMode() && <SecuritySettings />}
               {isAdmin && !isDesktop() && <FnosWebLoginSettings />}
             </div>}
-            {activeTab === "clipboard" && <ClipboardIntegrationPanel />}
+            {activeTab === "clipboard" && <ClipboardIntegrationPanel onOpenSync={()=>setActiveTab("sync")} onOpenNote={note=>{actions.setActiveNote(note);actions.setSelectedNotebook(note.notebookId);actions.setViewMode("notebook");actions.setMobileView("editor");onClose();}} />}
             {activeTab === "tokens" && <div className="space-y-6"><McpConnectionPanel /><TokenManagement /></div>}
                   {activeTab === "users" && isAdmin && <UserManagement currentUserId={currentUser?.id ?? null} />}
                   {activeTab === "workspaces" && isAdmin && <WorkspaceManagement />}

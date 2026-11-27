@@ -1,0 +1,82 @@
+// @vitest-environment jsdom
+import layout from "../../../../electron/quick-panel/panel.html?raw";
+import script from "../../../../electron/quick-panel/panel.js?raw";
+import { expect, it, vi } from "vitest";
+
+it("retains each mode's draft, late answer and open note across repeated switches", () => {
+  document.body.innerHTML = new DOMParser().parseFromString(layout, "text/html").body.innerHTML;
+  const palette = { draft: vi.fn(), query: vi.fn(), height: vi.fn(), submit: vi.fn(), onClear: vi.fn(), onReset: vi.fn(), onResults: vi.fn() };
+  vi.stubGlobal("palette", palette);
+  vi.stubGlobal("ResizeObserver", class { observe() {} });
+  const click = (id: string) => document.getElementById(id)!.click();
+  const field = document.querySelector<HTMLInputElement>("form input")!;
+  function enter(text: string) {
+    field.value = text;
+    field.dispatchEvent(new Event("input"));
+    document.querySelector("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+  }
+  try {
+    new Function(script)();
+    palette.onReset.mock.calls[0][0]({});
+    const render = palette.onResults.mock.calls[0][0];
+    enter("布展");
+    render({ kind: "search", query: "布展", rows: [{ id: "schedule", title: "日程", snippet: "周五上午", notebook: "工作" }] });
+    click("search-item-0");
+    expect(palette.submit).toHaveBeenLastCalledWith("detail", "schedule");
+    render({ kind: "detail", query: "schedule", detail: { title: "日程", html: "<p>周五上午</p>", notice: "" } });
+    click("ask");
+    const question = "现场安排如何".repeat(144);
+    enter(question);
+    expect(document.querySelector("#ask-status")!.textContent).toContain("检索");
+    render({ kind: "ask", query: question, rows: [{ id: "schedule", title: "日程", snippet: "九点签到", notebook: "展览" }] });
+    expect(document.querySelector("#refs button")).toBeNull();
+    expect(document.getElementById("sources")!.hidden).toBe(true);
+    render({ kind: "ask", query: question, answerHtml: "<h2>计划</h2><p>九</p>" });
+    const heading = document.querySelector("#answer h2");
+    expect(document.getElementById("answer-label")!.textContent).toContain("正在回答");
+    render({ kind: "ask", query: question, answerHtml: "<h2>计划</h2><p>九点</p>" });
+    expect(document.querySelector("#answer h2")).toBe(heading);
+    expect(document.querySelector("#refs button")).toBeNull();
+    click("search");
+    render({ kind: "ask", query: question, answerHtml: "<p><strong>九点</strong>签到</p>", done: true });
+    expect(field.value).toBe("布展");
+    expect(document.getElementById("note-body")!.textContent).toBe("周五上午");
+    expect(document.getElementById("search-item-0")!.getAttribute("aria-selected")).toBe("true");
+    click("ask");
+    click("ask");
+    expect(field.value).toBe(question);
+    expect(document.getElementById("question")!.textContent).toBe(question);
+    expect(document.getElementById("answer-label")!.hidden).toBe(false);
+    expect(document.querySelector("#answer strong")!.textContent).toBe("九点");
+    expect(palette.submit.mock.calls.map(([action]) => action)).toEqual(["search", "detail", "ask"]);
+    expect(document.querySelector("#refs .snippet")!.textContent).toBe("九点签到");
+    expect(document.querySelector("#refs .meta")!.textContent).toBe("展览");
+    expect(document.getElementById("sources")!.hidden).toBe(false);
+    enter("第二题");
+    render({ kind: "ask", query: "第二题", rows: [{ id: "other", title: "另一篇笔记" }] });
+    render({ kind: "ask", query: "第二题", answerHtml: "<p>尚未完成</p>" });
+    render({ kind: "ask", query: "第二题", error: "回答中途断开" });
+    expect(document.querySelector("#refs button")).toBeNull();
+    expect(document.querySelector("#answer")!.textContent).toBe("尚未完成");
+    expect(document.querySelector("#answer-label")!.textContent).toBe("部分回答");
+    enter("第二题");
+    render({ kind: "ask", query: "第二题", rows: [] });
+    render({ kind: "ask", query: "第二题", answerHtml: "", done: true });
+    expect(document.getElementById("sources")!.hidden).toBe(true);
+    click("new");
+    const body = document.querySelector<HTMLTextAreaElement>("#note-text")!;
+    body.value = "手写正文";
+    body.dispatchEvent(new Event("input"));
+    click("organize");
+    const [saveAction, draftId] = palette.submit.mock.calls.at(-1)!;
+    expect(saveAction).toBe("organize");
+    click("save");
+    expect(palette.submit.mock.calls.at(-1)).toEqual([saveAction, draftId]);
+    render({ kind: "save", query: draftId, error: "归类失败" });
+    expect(body.value).toBe("手写正文");
+    click("save");
+    expect(palette.submit).toHaveBeenLastCalledWith("save", draftId);
+    render({ kind: "save", query: draftId, saved: draftId, folder: "收集箱" });
+    expect(document.getElementById("side-label")!.textContent).toContain("收集箱");
+  } finally { vi.unstubAllGlobals(); document.body.replaceChildren(); }
+});

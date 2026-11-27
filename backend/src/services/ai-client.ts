@@ -31,6 +31,7 @@ export interface CallAIOptions {
   max_tokens?: number;
   timeout_ms?: number;
   signal?: AbortSignal;
+  requireStreamEnd?: boolean;
 }
 
 const FINAL_MARKER_RE = /(?:^|\n)\s*(最终答案|最终标题|标题|答案|Final|Answer|Result)\s*[:：]\s*/gi;
@@ -208,7 +209,7 @@ export async function* callAIChatStream(
   options: CallAIOptions = {},
 ): AsyncGenerator<string, void, undefined> {
   const baseUrl = settings.ai_api_url.replace(/\/+$/, "");
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "text/event-stream" };
   if (settings.ai_api_key) {
     headers["Authorization"] = `Bearer ${settings.ai_api_key}`;
   }
@@ -225,14 +226,20 @@ export async function* callAIChatStream(
     method: "POST",
     headers, customHeaders: settings.ai_custom_headers,
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(options.timeout_ms ?? 60000),
+    signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeout_ms ?? 60000)]) : AbortSignal.timeout(options.timeout_ms ?? 60000),
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
-    throw new Error(
+    throw Object.assign(new Error(
       `AI 服务错误 (${settings.ai_provider}): ${res.status} ${sanitizeError(redactAIHeaderValues(errText, settings.ai_custom_headers))}`,
-    );
+    ), { status: res.status });
+  }
+
+  if (res.headers.get("content-type")?.includes("application/json")) {
+    const answer = normalizeAiAssistantMessage(await res.json() as Record<string, unknown>);
+    if (answer) yield answer;
+    return;
   }
 
   const reader = res.body?.getReader();
@@ -243,43 +250,28 @@ export async function* callAIChatStream(
   const decoder = new TextDecoder();
   let buffer = "";
 
+  let receivedFinish = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: !done });
       const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
+      buffer = done ? "" : lines.pop() || "";
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-        const data = trimmed.slice(6);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
         if (data === "[DONE]") return;
-        try {
-          const json = JSON.parse(data);
-          const content = parseOpenAIStreamDelta(json);
-          if (content) yield content;
-        } catch {
-          // skip malformed JSON
-        }
+        let frame;
+        try { frame = JSON.parse(data); } catch { continue; }
+        if (!frame || typeof frame !== "object") continue;
+        if (frame.error) throw new Error("模型返回了流式响应错误");
+        if (frame.choices?.[0]?.finish_reason) receivedFinish = true;
+        const content = parseOpenAIStreamDelta(frame);
+        if (content) yield content;
       }
+      if (done) break;
     }
-    // 收尾 buffer
-    if (buffer.trim()) {
-      const trimmed = buffer.trim();
-      if (trimmed.startsWith("data: ")) {
-        const data = trimmed.slice(6);
-        if (data !== "[DONE]") {
-          try {
-            const json = JSON.parse(data);
-            const content = parseOpenAIStreamDelta(json);
-            if (content) yield content;
-          } catch { /* skip */ }
-        }
-      }
-    }
+    if (options.requireStreamEnd && !receivedFinish) throw new Error("模型回答中途断开");
   } finally {
     reader.releaseLock();
   }

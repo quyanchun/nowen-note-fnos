@@ -21,7 +21,6 @@ import CameraCaptureBridge from "./components/CameraCaptureBridge";
 import EditorImageTransformBridge from "./components/EditorImageTransformBridge";
 import ImageClipboardBridge from "./components/ImageClipboardBridge";
 import MarkdownMobileViewControlsBridge from "./components/MarkdownMobileViewControlsBridge";
-import DesktopUpdateCenter from "./components/DesktopUpdateCenter";
 import DockerUpdateCenter from "./components/DockerUpdateCenter";
 import TwoFactorLoginChallengeCenter from "./components/TwoFactorLoginChallengeCenter";
 import AndroidShareImportCenter from "./components/AndroidShareImportCenter";
@@ -240,7 +239,6 @@ function renderApplication() {
             <EditorImageTransformBridge />
             <ImageClipboardBridge />
             <MarkdownMobileViewControlsBridge />
-            <DesktopUpdateCenter />
             <DockerUpdateCenter />
             <TwoFactorLoginChallengeCenter />
             <AndroidShareImportCenter />

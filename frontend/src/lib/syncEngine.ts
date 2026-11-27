@@ -9,7 +9,7 @@ import {
   putTags,
   setMeta,
   getMeta,
-  getAllNotes,
+  getNote as getCachedNote,
   isReady as localStoreReady,
 } from "@/lib/localStore";
 import {
@@ -103,32 +103,20 @@ async function resolveConfiguredVersionConflicts(): Promise<void> {
   }
 }
 
-export function findLocallyDeletedQueuedNoteIds(
-  localNotes: ReadonlyArray<{ id: string; isTrashed: number }>,
-  queuedItems: ReadonlyArray<Pick<OfflineQueueItem, "noteId" | "type" | "conflict" | "errorCode">>,
-): string[] {
-  // Only discard obsolete UPDATE conflicts on locally trashed notes.
-  // Keep pending delete/create mutations and other unsent changes.
-  const queuedIds = new Set(queuedItems
-    .filter((item) => item.type === "updateNote" && (item.conflict || item.errorCode === "VERSION_CONFLICT"))
-    .map((item) => item.noteId));
-  return localNotes
-    .filter((note) => note.isTrashed === 1 && queuedIds.has(note.id))
-    .map((note) => note.id);
+type QueueConflictEntry = Pick<OfflineQueueItem, "noteId" | "type" | "conflict" | "errorCode">;
+
+function conflictedUpdates(items: ReadonlyArray<QueueConflictEntry>): Set<string> {
+  return new Set(items
+    .filter(item => item.type === "updateNote" && (item.conflict || item.errorCode === "VERSION_CONFLICT"))
+    .map(item => item.noteId));
 }
 
 export async function findServerDeletedQueuedNoteIds(
   remoteNoteIds: ReadonlySet<string>,
-  queuedItems: ReadonlyArray<Pick<OfflineQueueItem, "noteId" | "type" | "conflict" | "errorCode">>,
+  queuedItems: ReadonlyArray<QueueConflictEntry>,
   fetchNote: (noteId: string) => Promise<{ isTrashed?: number }>,
 ): Promise<string[]> {
-  const candidates = [...new Set(queuedItems
-    .filter((item) => (
-      item.type === "updateNote"
-      && (item.conflict || item.errorCode === "VERSION_CONFLICT")
-      && !remoteNoteIds.has(item.noteId)
-    ))
-    .map((item) => item.noteId))];
+  const candidates = [...conflictedUpdates(queuedItems)].filter(id => !remoteNoteIds.has(id));
   const deleted: string[] = [];
 
   for (const noteId of candidates) {
@@ -190,10 +178,12 @@ async function pullServerSnapshot(): Promise<void> {
   }
 
   if (notesResult.status === "fulfilled") {
-    const local = (await getAllNotes()).filter(isCurrentScope);
-    // 兼容修复前遗留状态：本地缓存已经明确记录为回收站的笔记，不应继续保留
-    // 它此前的更新冲突。不能仅根据远端普通列表缺失来判断，避免误删离线新建内容。
-    const locallyDeletedQueueIds = findLocallyDeletedQueuedNoteIds(local, getOfflineQueue());
+    // Read only conflicted notes. A full cache scan also materializes every offline note body.
+    const locallyDeletedQueueIds: string[] = [];
+    for (const id of conflictedUpdates(getOfflineQueue())) {
+      const note = await getCachedNote(id);
+      if (note?.isTrashed === 1 && isCurrentScope(note)) locallyDeletedQueueIds.push(id);
+    }
     discardNoteQueueItems(locallyDeletedQueueIds);
     const remoteIds = new Set(notesResult.value.map((note) => note.id));
     // 历史版本可能在删除成功后仍留下冲突队列。对列表中缺失的冲突做轻量确认：
@@ -204,13 +194,7 @@ async function pullServerSnapshot(): Promise<void> {
       (noteId) => api.getNoteSlim(noteId),
     );
     discardNoteQueueItems(serverDeletedQueueIds);
-    const queuedIds = await getQueuedNoteIds();
-    // A filtered remote list is not an authoritative deletion feed. Never silently
-    // erase the only surviving local copy just because its ID is missing here.
-    const missingLocalCount = local.filter((note) => !remoteIds.has(note.id) && !queuedIds.has(note.id)).length;
-    if (missingLocalCount > 0) {
-      console.warn("[syncEngine] retaining local notes absent from remote listing", { count: missingLocalCount });
-    }
+    // A filtered listing is not a deletion feed. Only upsert returned notes.
     await putNoteListItems(notesResult.value);
   } else {
     console.warn("[syncEngine] pull notes list failed:", notesResult.reason);
@@ -317,14 +301,6 @@ export async function syncNow(): Promise<{
       lastSyncAt: lastSyncAtCache ?? undefined,
       error: message,
     };
-  }
-}
-
-async function getQueuedNoteIds(): Promise<Set<string>> {
-  try {
-    return new Set(getOfflineQueue().map((item) => item.noteId));
-  } catch {
-    return new Set();
   }
 }
 

@@ -21,7 +21,7 @@ export async function withAbortableAiFetch<T>(
 ): Promise<T> {
   const previousFetch = globalThis.fetch;
   const wrappedFetch: typeof fetch = (input, init) => {
-    if (!isAiAskRequest(input)) return previousFetch.call(globalThis, input, init);
+    if (init?.signal || !isAiAskRequest(input)) return previousFetch.call(globalThis, input, init);
     return previousFetch.call(globalThis, input, {
       ...init,
       signal: controller.signal,

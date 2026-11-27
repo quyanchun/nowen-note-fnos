@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import * as syncEngine from "@/lib/syncEngine";
 import {
   countVersionConflicts,
-  findLocallyDeletedQueuedNoteIds,
 } from "@/lib/syncEngine";
 
 describe("syncEngine sync summary", () => {
@@ -13,22 +12,6 @@ describe("syncEngine sync summary", () => {
       { errorCode: "NETWORK_ERROR" },
       {},
     ])).toBe(2);
-  });
-
-  it("finds queued notes that the local cache already marks as trashed", () => {
-    expect(findLocallyDeletedQueuedNoteIds(
-      [
-        { id: "trashed-conflict", isTrashed: 1 },
-        { id: "active-conflict", isTrashed: 0 },
-        { id: "trashed-without-queue", isTrashed: 1 },
-        { id: "trashed-delete", isTrashed: 1 },
-      ],
-      [
-        { noteId: "trashed-conflict", type: "updateNote", conflict: true },
-        { noteId: "active-conflict", type: "updateNote", conflict: true },
-        { noteId: "trashed-delete", type: "deleteNote" },
-      ],
-    )).toEqual(["trashed-conflict"]);
   });
 
   it("retains ambiguous 404 conflicts and only cleans explicit tombstones", async () => {

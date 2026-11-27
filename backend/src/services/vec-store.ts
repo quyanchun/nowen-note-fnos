@@ -308,20 +308,24 @@ export function knnSearch(
   const db = getDb();
   const buf = Buffer.from(new Float32Array(queryVec).buffer);
 
-  // 有 notebookId 过滤时提高 k，避免小范围笔记本被全库稀释
   const effectiveK = notebookIds && notebookIds.length > 0 ? Math.max(k, 300) : k;
-  // sqlite-vec KNN 语法：MATCH 给查询向量，k=? 控制返回数
-  // 注意：vec0 的 MATCH 只支持单一查询向量；不支持 WHERE 复合条件
-  // 所以我们多取一些（k 个），再在外层用 note_embeddings.userId/workspaceId 过滤
+  const scopeSql = workspaceId ? "e.workspaceId=?" : "e.userId=? AND e.workspaceId IS NULL";
+  const scopeParams: unknown[] = [workspaceId || userId];
+  const folderSql = notebookIds?.length ? ` AND n.notebookId IN (${notebookIds.map(()=>"?").join(",")})` : "";
+  if(notebookIds?.length)scopeParams.push(...notebookIds);
+  // Filter authorized rowids before top-k, so another scope cannot consume the budget.
   let vecRows: { rowid: number; distance: number }[] = [];
   try {
     vecRows = db.prepare(`
       SELECT rowid, distance
       FROM vec_note_chunks
-      WHERE embedding MATCH ?
+      WHERE embedding MATCH ? AND rowid IN (
+        SELECT e.id FROM note_embeddings e JOIN notes n ON n.id=e.noteId
+        WHERE ${scopeSql} AND n.isTrashed=0 AND e.dim=?${folderSql}
+      )
       ORDER BY distance
       LIMIT ?
-    `).all(buf, effectiveK) as { rowid: number; distance: number }[];
+    `).all(buf, ...scopeParams.slice(0,1), queryVec.length, ...scopeParams.slice(1), effectiveK) as { rowid: number; distance: number }[];
   } catch (e: any) {
     console.warn("[vec-store] knnSearch failed:", e?.message || e);
     return [];

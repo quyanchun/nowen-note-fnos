@@ -1,16 +1,19 @@
 import { normalizeAICustomHeaders, maskAICustomHeaders, redactAIHeaderValues } from "../services/ai-custom-headers.js";
 import { aiOutboundFetch, getAIOutboundProxyStatus } from "../services/ai-outbound-fetch.js";
 import { Hono } from "hono";
+import searchRouter from "./search";
+import {extractSearchableText} from "../lib/searchIndex";
+import {getEffectiveExcludedNotebookIds} from "../services/searchNotebookExclusions";
+import {hasKnowledgeCapability,resolveResourceKnowledgeAccess} from "../services/knowledgeCapabilities";
+import {isEncryptedNoteFormat} from "../lib/encryptedNotes";
 import { streamSSE } from "hono/streaming";
 import { getDb } from "../db/schema";
 import {
   getEmbeddingStats,
   rebuildAllEmbeddings,
-  embedQuery,
 } from "../services/embedding-worker";
 import {
   isVecAvailable,
-  knnSearch,
   reindexAllVectors,
 } from "../services/vec-store";
 import { getUserWorkspaceRole } from "../middleware/acl";
@@ -424,70 +427,7 @@ ai.post("/chat", async (c) => {
   }
 });
 
-// ===== ③ 文档智能解析 =====
-/**
- * 从用户问题中提取检索关键词。
- *
- * 为什么要专门写：原实现只按空白/标点 split，对中文几乎不可用——中文句子
- * 通常整句没空格，split 后得到整句一个 token，然后用这个长 token 去做
- * FTS5 MATCH 或 LIKE %...% 基本永远命中不了任何笔记，导致"AI 无法根据笔记
- * 本库读取笔记"。
- *
- * 新策略：
- *   1. 拆分 CJK 字符块和 ASCII 词
- *   2. CJK 块做 bigram（相邻两字滑窗）展开，比如"前端性能" → ["前端","端性","性能"]
- *      —— 这是在 unicode61 默认 tokenizer 不支持中文分词前提下最通用的做法，
- *      大多数 2 字词都能覆盖，FTS5 前缀通配符再做一次兜底。
- *   3. 过滤停用词（语气词/疑问代词等对检索无贡献的词）
- *   4. 去重、截断到合理数量
- */
-const STOP_WORDS = new Set([
-  // 中文停用词（问答/口语）
-  "的", "了", "和", "是", "在", "有", "我", "你", "他", "她", "它", "我们", "你们",
-  "什么", "怎么", "如何", "为啥", "为什么", "哪个", "哪些", "哪里", "谁", "吗", "呢",
-  "吧", "啊", "呀", "哦", "嗯", "一下", "一些", "这个", "那个", "这些", "那些",
-  "请", "帮我", "给我", "告诉", "总结", "帮忙", "可以", "能", "要", "想", "知道",
-  // 英文停用词
-  "the", "a", "an", "is", "are", "was", "were", "do", "does", "did", "to", "of",
-  "in", "on", "at", "for", "and", "or", "but", "with", "by", "from", "as", "it",
-  "this", "that", "these", "those", "what", "how", "why", "where", "which", "who",
-  "can", "could", "should", "would", "will", "please", "tell", "me", "my", "i",
-]);
-
-function extractKeywords(question: string): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-
-  const add = (w: string) => {
-    const lw = w.toLowerCase();
-    if (lw.length < 2) return;
-    if (STOP_WORDS.has(lw)) return;
-    if (seen.has(lw)) return;
-    seen.add(lw);
-    out.push(lw);
-  };
-
-  // 正则同时匹配 CJK 连续块 与 ASCII 单词/数字串
-  const re = /[\u4e00-\u9fff\u3400-\u4dbf]+|[a-zA-Z][a-zA-Z0-9_-]*|\d+/g;
-  const matches = question.match(re) || [];
-
-  for (const chunk of matches) {
-    if (/^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(chunk)) {
-      // 中文块：整块 + bigram 展开
-      if (chunk.length >= 2) add(chunk.length <= 4 ? chunk : chunk.slice(0, 4));
-      for (let i = 0; i + 2 <= chunk.length; i++) {
-        add(chunk.slice(i, i + 2));
-      }
-    } else {
-      // ASCII / 数字：直接加
-      add(chunk);
-    }
-  }
-
-  // 限制规模，避免 FTS 查询过长
-  return out.slice(0, 8);
-}
-
+// ===== ③ 知识库问答 =====
 ai.post("/ask", async (c) => {
   const settings = getAISettings(c);
   if (!settings.ai_api_url) {
@@ -505,175 +445,29 @@ ai.post("/ask", async (c) => {
     return c.json({ error: "请输入问题" }, 400);
   }
 
-  // 1. 检索相关笔记
-  //
-  //   优先级：向量召回（语义） > FTS5（关键词精确） > LIKE 兜底（容错） > 最近笔记（兜底兜底）
-  //
-  //   - 向量召回需要：sqlite-vec 加载成功 + embedding 配置完整 + 至少 indexed 过几篇笔记
-  //   - 命中阈值：只要 vec 拿到 ≥1 个 hit 就直接用，不再触发后面的关键词路径
-  //     （语义命中 1 篇通常远优于 FTS 命中 N 篇但都偏题）
-  //   - 拿不到/失败时静默降级，与 Phase 1 行为完全一致
-  //
-  // 空间隔离（v7）：
-  //   /ask 严格按 scope = (userId, workspaceId|null) 收敛检索范围：
-  //     - 个人空间：仅命中当前用户在 workspaceId IS NULL 下的笔记
-  //     - 工作区  ：仅命中该工作区下的笔记（不限作者，工作区成员共享）
-  //   未通过 resolveScope 的成员校验直接 403，杜绝"用 query 偷看其他工作区"。
+  // Share the ordinary search path: exact/keyword and vector recall always compete.
   const db = getDb();
   const scope = resolveKnowledgeScope(c, { notebookId, includeChildren });
   if ("error" in scope) return scope.error;
   const { userId, workspaceId, notebookIds } = scope;
-
-  // 共享的 scope SQL 片段：notes 表与 ai 路由用相同列名
-  // workspaceId 为 null 时用 IS NULL（不能用 = ?），所以分两套
-  const wsClause = workspaceId === null ? "workspaceId IS NULL" : "workspaceId = ?";
-  const wsParams: any[] = workspaceId === null ? [] : [workspaceId];
-
-  // 笔记本范围 SQL 片段
-  const nbClause = notebookIds ? `notebookId IN (${notebookIds.map(() => "?").join(",")})` : "";
-  const nbParams: any[] = notebookIds ? [...notebookIds] : [];
-
-  // relatedNotes 的 kind：
-  //   - 'note'       普通笔记命中
-  //   - 'attachment' 附件内容命中（v8 RAG Phase 3）
-  // 前端"引用列表"会根据 kind 渲染不同图标；后端拼 prompt 时会用 `📎` 前缀
-  // 让 LLM 明确这段内容来自附件，便于回答时区分"笔记原文"与"附件内容"。
-  let relatedNotes: {
-    id: string;
-    title: string;
-    snippet: string;
-    kind?: "note" | "attachment";
-    attachmentId?: string | null;
-    attachmentFilename?: string | null;
-  }[] = [];
-  let retrieval: "vector" | "fts" | "like" | "recent" | "none" = "none";
-
-  // ---- 路径 A：向量召回 ----
-  if (isVecAvailable()) {
-    try {
-      const qvec = await embedQuery(userId, question);
-      if (qvec) {
-        // maxNotes 从 5 提到 8：附件 + 笔记混排时，让两类各自都能出现
-        const hits = knnSearch(qvec, userId, workspaceId, notebookIds ? 300 : 30, 8, notebookIds);
-        if (hits.length > 0) {
-          relatedNotes = hits.map((h) => ({
-            id: h.noteId,
-            // 附件命中：title 展示为"笔记名 › 附件名"，便于用户定位
-            title:
-              h.entityType === "attachment" && h.attachmentFilename
-                ? `${h.title || "(未命名笔记)"} › ${h.attachmentFilename}`
-                : h.title,
-            snippet: (h.chunkText || "").slice(0, 600),
-            kind: h.entityType,
-            attachmentId: h.attachmentId || null,
-            attachmentFilename: h.attachmentFilename || null,
-          }));
-          retrieval = "vector";
-        }
-      }
-    } catch (e) {
-      console.warn("[/ask] vector retrieval failed, falling back:", e);
-    }
-  }
-
-  const keywords = extractKeywords(question);
-
-  // ---- 路径 B：FTS5（仅当 vec 未命中时走）----
-  //
-  // 隔离规则：
-  //   - 个人空间：notes_fts 路径 + WHERE userId = ? AND workspaceId IS NULL
-  //   - 工作区  ：WHERE workspaceId = ?  （不限 userId，工作区共享）
-  // notes_fts 没有 workspaceId 列，所以隔离在外层 notes JOIN 时做。
-  if (relatedNotes.length === 0 && keywords.length > 0) {
-    // FTS5 查询：每个关键词加前缀通配符 *，用 OR 连接，提高命中率
-    // 例如：「"前端"* OR "性能"* OR "优化"*」
-    const ftsQuery = keywords
-      .map(k => `"${k.replace(/"/g, "")}"*`)
-      .join(" OR ");
-    try {
-      const ftsResults = db.prepare(`
-        SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?
-      `).all(ftsQuery) as { rowid: number }[];
-
-      if (ftsResults.length > 0) {
-        const rowids = ftsResults.map(r => r.rowid).slice(0, 30);
-        const placeholders = rowids.map(() => "?").join(",");
-        const userClause = workspaceId === null ? "userId = ? AND " : "";
-        const userParams = workspaceId === null ? [userId] : [];
-        const notes = db.prepare(`
-          SELECT id, title, contentText FROM notes
-          WHERE rowid IN (${placeholders}) AND ${userClause}${wsClause} AND isTrashed = 0 ${nbClause ? `AND ${nbClause}` : ``}
-          ORDER BY updatedAt DESC
-          LIMIT 5
-        `).all(...rowids, ...userParams, ...wsParams, ...nbParams) as { id: string; title: string; contentText: string }[];
-
-        relatedNotes = notes.map(n => ({
-          id: n.id,
-          title: n.title,
-          snippet: (n.contentText || "").slice(0, 500),
-        }));
-        retrieval = "fts";
-      }
-    } catch {
-      // FTS query failed, continue without context
-    }
-  }
-
-  // 如果 FTS 没结果，尝试 LIKE 模糊匹配（同时匹配 title 与 contentText，提高召回）
-  if (relatedNotes.length === 0 && keywords.length > 0) {
-    try {
-      const topKeywords = keywords.slice(0, 5);
-      const likeClauses = topKeywords
-        .map(() => "(contentText LIKE ? OR title LIKE ?)")
-        .join(" OR ");
-      const likeParams: string[] = [];
-      for (const k of topKeywords) {
-        likeParams.push(`%${k}%`, `%${k}%`);
-      }
-      const userClause = workspaceId === null ? "userId = ? AND " : "";
-      const userParams = workspaceId === null ? [userId] : [];
-      const notes = db.prepare(`
-        SELECT id, title, contentText FROM notes
-        WHERE ${userClause}${wsClause} AND isTrashed = 0 ${nbClause ? `AND ${nbClause}` : ``} AND (${likeClauses})
-        ORDER BY updatedAt DESC
-        LIMIT 5
-      `).all(...userParams, ...wsParams, ...nbParams, ...likeParams) as { id: string; title: string; contentText: string }[];
-
-      relatedNotes = notes.map(n => ({
-        id: n.id,
-        title: n.title,
-        snippet: (n.contentText || "").slice(0, 500),
-      }));
-      if (relatedNotes.length > 0) retrieval = "like";
-    } catch {
-      // fallback failed
-    }
-  }
-
-  // 最终兜底：关键词完全没命中（比如用户问"总结我最近的笔记"这种不含具体
-  // 内容词的问题），或所有检索路径都失败时，取最近更新的若干篇笔记作为上下文。
-  // 没有这档兜底时，AI 只会回答"你的知识库中没有相关内容"——给人"AI 读不到
-  // 笔记"的错觉。
-  if (relatedNotes.length === 0) {
-    try {
-      const userClause = workspaceId === null ? "userId = ? AND " : "";
-      const userParams = workspaceId === null ? [userId] : [];
-      const notes = db.prepare(`
-        SELECT id, title, contentText FROM notes
-        WHERE ${userClause}${wsClause} AND isTrashed = 0 ${nbClause ? `AND ${nbClause}` : ``}
-        ORDER BY updatedAt DESC
-        LIMIT 5
-      `).all(...userParams, ...wsParams, ...nbParams) as { id: string; title: string; contentText: string }[];
-
-      relatedNotes = notes.map(n => ({
-        id: n.id,
-        title: n.title,
-        snippet: (n.contentText || "").slice(0, 500),
-      }));
-      if (relatedNotes.length > 0) retrieval = "recent";
-    } catch {
-      // nothing to do
-    }
+  const query = new URLSearchParams({q:question,semantic:"1",workspaceId:workspaceId || "personal"});
+  for(const id of notebookIds || [])query.append("notebookId",id);
+  const response = await searchRouter.request(`/?${query}`,{headers:{"X-User-Id":userId}});
+  const matches = response.ok ? await response.json() as any[] : [];
+  let relatedNotes: {id:string;title:string;snippet:string;kind?:"note"|"attachment";attachmentId?:string|null;attachmentFilename?:string|null}[] = matches
+    .filter(row=>row.resourceType==="note" && (workspaceId ? row.workspaceId===workspaceId : row.userId===userId && !row.workspaceId))
+    .slice(0,8).map(row=>({id:row.id,title:row.title,snippet:extractSearchableText(row.snippetHtml || row.snippet || "","html").slice(0,1200),kind:"note" as const}));
+  let retrieval: "hybrid" | "recent" | "none" = relatedNotes.length ? "hybrid" : "none";
+  // Recent notes are relevant only when the question explicitly asks for them.
+  if(!relatedNotes.length && /(?:最近|近期|近几天|recent|latest).*(?:笔记|记录|notes)|(?:笔记|notes).*(?:最近|recent|latest)/i.test(question)) {
+    const excluded=getEffectiveExcludedNotebookIds(userId,db);
+    const rows=db.prepare(`SELECT id,title,contentText,contentFormat,notebookId FROM notes
+      WHERE ${workspaceId?"workspaceId=?":"userId=? AND workspaceId IS NULL"} AND isTrashed=0 AND isArchived=0
+      ORDER BY updatedAt DESC LIMIT 100`).all(workspaceId || userId) as any[];
+    relatedNotes=rows.filter(row=>!excluded.has(row.notebookId) && (!notebookIds || notebookIds.includes(row.notebookId))
+      && !isEncryptedNoteFormat(row.contentFormat) && hasKnowledgeCapability(resolveResourceKnowledgeAccess("note",row.id,userId,db),"canView"))
+      .slice(0,8).map(row=>({id:row.id,title:row.title,snippet:row.contentText.slice(0,1200),kind:"note" as const}));
+    if(relatedNotes.length)retrieval="recent";
   }
 
   // 2. 构建 RAG prompt

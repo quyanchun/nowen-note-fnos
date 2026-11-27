@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Cloud,
-  HardDrive,
+  CheckCircle2,
+  Circle,
   Info,
   Loader2,
   RefreshCw,
@@ -298,9 +299,8 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
         <div className="space-y-3 rounded-md border p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-sm font-medium">
-              {mode === "server" ? <Cloud className="h-4 w-4" /> : <HardDrive className="h-4 w-4" />}
-              当前状态
-              <span className="rounded bg-muted px-2 py-0.5 text-xs" role="status">{status}</span>
+              {status==="已开启"?<CheckCircle2 className="h-4 w-4 text-emerald-500"/>:authorizationExpired||status==="等待登录"||status==="待完成首次同步"?<AlertTriangle className="h-4 w-4 text-amber-500"/>:<Circle className="h-4 w-4 text-muted-foreground"/>}
+              <span className="text-xs" role="status">{status}</span>
             </div>
             {mode === "server" ? (
               <button type="button" onClick={() => { void handleDisable(); }} disabled={busy} className="rounded border px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-50">
@@ -308,16 +308,8 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
               </button>
             ) : null}
           </div>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            {authorizationExpired ? "同步授权已失效，请重新登录。未同步修改仍保留在本机。"
-              : mode === "device-only" ? "笔记保存在此设备上，没有服务器或网络也能继续使用。开启同步后，可在其他设备访问笔记。"
-                : !settings.authorized ? "服务器已配置，登录后才能开启同步。未同步修改仍保留在本机。"
-                  : settings.engineRunning ? "后台同步已开启。笔记优先保存到本机，断网时可继续编辑，联网后自动重试。"
-                    : "账号已登录，请继续完成首次同步。未同步修改仍保留在本机。"}
-          </p>
           {activeProfile ? <p className="break-all text-xs text-muted-foreground">{activeProfile.connectionMode === "fnos" || /\/app\/nowen-note-private\/?$/.test(activeProfile.serverUrl) ? "飞牛 NAS 网关" : "笔记服务直连"}：{activeProfile.serverUrl}</p> : null}
           {settings.authorized ? <button type="button" disabled={busy} onClick={() => setChangingConnection(!changingConnection)} className="text-xs text-primary">{changingConnection ? "取消更换连接" : "更换同步连接"}</button> : null}
-          {mode === "server" ? <p className="text-xs text-muted-foreground">关闭同步不会删除本机笔记和待同步修改，再次开启需要登录。</p> : null}
           {settings.authorized && mode === "server" && !settings.engineRunning ? (
             <button type="button" onClick={() => { void handleBootstrap(); }} disabled={busy} className="rounded bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50">
               {action === "bootstrap" ? progressLabel : "继续首次同步"}
@@ -337,7 +329,7 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
         </div>
 
         {showLogin ? (
-          <form className="space-y-3 rounded-md border p-4" onSubmit={(event) => { event.preventDefault(); void handleConnect(); }}>
+          <form className="space-y-3 rounded-md border p-4" onSubmit={(event) => { event.preventDefault(); if(connectionMode==="fnos")void handleBrowserLogin();else void handleConnect(); }}>
             <h4 className="flex items-center gap-2 text-sm font-medium"><Server className="h-4 w-4" />连接我的 Nowen Server</h4>
             <div className="flex gap-2" role="group" aria-label="同步连接方式">
               {(["fnos", "service"] as const).map(value => <button key={value} type="button" aria-pressed={connectionMode === value} disabled={busy || !!twoFactorTicket} onClick={() => {
@@ -346,9 +338,7 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
                 setServerUrl(saved?.serverUrl || "");
               }} className={`rounded border px-3 py-2 text-xs ${connectionMode === value ? "border-primary bg-primary/5 text-primary" : "text-muted-foreground"}`}>{value === "fnos" ? "飞牛 NAS 网关" : "笔记服务直连"}</button>)}
             </div>
-            <p className="text-xs text-muted-foreground">{connectionMode === "fnos" ? "通过飞牛 /app 入口同步，使用飞牛登录会话。" : "填写笔记服务自身地址，使用笔记账号登录，无需飞牛会话。"}</p>
             {changingConnection ? <p className="text-xs text-muted-foreground">登录成功后切换连接；原连接的待同步修改和冲突会保留，各连接分别建立同步进度。</p> : null}
-            <p className="text-xs leading-relaxed text-muted-foreground">填写你部署的服务器地址和账号，登录后开启同步。</p>
             <label className="block space-y-1.5 text-xs">
               <span>服务器地址</span>
               <input
@@ -361,16 +351,16 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
                 required
               />
             </label>
-            {connectionMode === "fnos" && desktop?.startBrowserAuth && !twoFactorTicket ? (
+            {connectionMode === "fnos" && !twoFactorTicket ? (
               <div className="space-y-2 rounded-md bg-muted/40 p-3">
-                <button type="button" onClick={() => { void handleBrowserLogin(); }} disabled={busy || !serverUrl.trim()} className="rounded bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-50">
+                <button type="button" onClick={() => { void handleBrowserLogin(); }} disabled={busy || !serverUrl.trim() || !desktop?.startBrowserAuth} className="rounded bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-50">
                   {action === "browser" ? "等待浏览器授权…" : "使用飞牛账号授权登录"}
                 </button>
                 {browserRequest ? <button type="button" onClick={() => { void handleCancelBrowserLogin(); }} className="ml-3 text-xs text-muted-foreground">取消授权</button> : null}
-                <p className="text-xs text-muted-foreground">NAS 部署推荐使用浏览器授权，无需填写下面的账号密码。支持 HTTPS 域名和应用前缀。</p>
+                {!desktop?.startBrowserAuth&&<p className="text-xs text-muted-foreground">请使用桌面客户端完成飞牛授权</p>}
               </div>
             ) : null}
-            {twoFactorTicket ? (
+            {connectionMode==="service"&&(twoFactorTicket ? (
               <label className="block space-y-1.5 text-xs">
                 <span>双重验证代码或恢复码</span>
                 <input
@@ -410,8 +400,8 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
                   />
                 </label>
               </div>
-            )}
-            <div className="flex flex-wrap items-center gap-2">
+            ))}
+            {connectionMode==="service"&&<div className="flex flex-wrap items-center gap-2">
               <button type="submit" disabled={busy} className="inline-flex items-center gap-2 rounded bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-50">
                 {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
                 {busy ? progressLabel : twoFactorTicket ? "验证并开启同步" : "登录并开启同步"}
@@ -426,7 +416,7 @@ export function SyncSettingsPanel({ refreshKey = 0, onConnectionChanged }: { ref
                   返回账号密码
                 </button>
               ) : null}
-            </div>
+            </div>}
           </form>
         ) : null}
 

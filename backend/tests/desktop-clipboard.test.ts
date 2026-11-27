@@ -26,6 +26,7 @@ test("desktop clipboard settings belong to the signed-in NAS account and never p
   const credential = { profileId: profile.id, serverUrl, token: noteToken, remoteUserId: "remote-owner", localUserId: "local-owner", transport: "fnos-session" as const, refreshToken: "fixture-refresh" };
   saveRemoteCredential(credential);
   let token = "ncc_" + "A".repeat(43), revoked = false, unavailable = false, missing = false;
+  let expiredPath: string | null = null, expiredStatus = 401;
   let settings = clipboardSettingsSchema.parse({ enabled: true, excludeKeywords: ["excluded"] });
   const calls: Array<{ target: string; method?: string; authorization?: string; body: any }> = [];
   const bridge = createServer(async (req, res) => {
@@ -39,6 +40,7 @@ test("desktop clipboard settings belong to the signed-in NAS account and never p
     if (missing) { res.writeHead(404); res.end('not found'); return; }
     if (unavailable) { res.writeHead(503); res.end(JSON.stringify({ code: "NETWORK_UNAVAILABLE", error: "synthetic offline" })); return; }
     const route = target.slice(serverUrl.length);
+    if (route === expiredPath) { res.writeHead(expiredStatus); res.end('{"code":"AUTH_EXPIRED"}'); return; }
     if (route.startsWith("/api/clipboard-settings") || route === "/api/notebooks") {
       assert.equal(req.headers.authorization, "Bearer " + noteToken);
       if (route === "/api/notebooks") res.end(JSON.stringify([{id:"nas-folder",name:"NAS folder"},{id:"team",name:"team",workspaceId:"team"}]));
@@ -80,13 +82,26 @@ test("desktop clipboard settings belong to the signed-in NAS account and never p
       await assert.rejects(service.desktopClipboardLogs("local-owner",0), /HTTP 404.*飞牛应用中心/);
       missing=false;
     });
+    await t.test("expired settings or folder authorization has a recoverable code (DCC-003 DCC-006)",async()=>{
+      try {
+        for (expiredStatus of [401,403]) for (expiredPath of ["/api/clipboard-settings","/api/notebooks"]) {
+          await assert.rejects(service.desktopClipboardSettings("local-owner"), (error:any) => {
+            assert.equal(error.code,"DESKTOP_NAS_AUTH_EXPIRED");assert.equal(error.status,409);return true;
+          });
+        }
+      } finally { expiredPath=null; }
+      assert.equal((await service.desktopClipboardSettings("local-owner")).delivery,"desktop");
+      assert.equal((db.prepare("SELECT count(*) n FROM notes").get() as any).n,0);
+    });
     await t.test("direct sync manages server clipboard settings and logs without the fnOS bridge",async()=>{
       const original=globalThis.fetch;
       const direct=createProfile(db,{name:"Direct",serverUrl:"https://notes.test",remoteUserId:"remote-owner"});
       setProfileEnabled(db,profile.id,false);setProfileEnabled(db,direct.id,true);
       saveRemoteCredential({...credential,profileId:direct.id,serverUrl:direct.serverUrl,transport:"direct"});
       const count=calls.length;
+      let folderOffline=false;
       globalThis.fetch=(async(url:string,init:RequestInit)=>{
+        if(folderOffline&&url.endsWith("/notebooks"))throw new TypeError("synthetic folder timeout");
         assert(url.startsWith("https://notes.test/api/"));
         assert.equal(new Headers(init?.headers).get("Authorization"),"Bearer "+noteToken);
         assert.equal(new Headers(init?.headers).has("X-Nowen-Bridge"),false);
@@ -94,12 +109,18 @@ test("desktop clipboard settings belong to the signed-in NAS account and never p
       }) as typeof fetch;
       try {
         const state=await service.desktopClipboardSettings("local-owner");assert.equal(state.endpoint,"https://notes.test/api/clipboard/captures");
+        folderOffline=true;
+        await assert.rejects(service.desktopClipboardSettings("local-owner"),(error:any)=>error.code==="DESKTOP_NAS_NETWORK"&&error.status===502);
+        folderOffline=false;
         assert.deepEqual((await service.desktopClipboardLogs("local-owner",0)).items,[]);
         await assert.rejects(service.desktopClipboardSettings("local-other"));assert.equal(calls.length,count);
       }finally {globalThis.fetch=original;setProfileEnabled(db,direct.id,false);setProfileEnabled(db,profile.id,true);}
     });
     await t.test("log mutations use the active NAS account with encoded IDs, never capture relay",async()=>{
-      for(const action of ["delete","force","undo"] as const){await service.desktopClipboardLogAction("local-owner","request/id with space",action);const call=calls.at(-1)!;assert.equal(call.target,serverUrl+"/api/clipboard-settings/logs/request%2Fid%20with%20space"+(action==="delete"?"":"/"+action));assert.equal(call.method,action==="delete"?"DELETE":"POST");}
+      await service.desktopClipboardLogs("local-owner",30,"completed");assert.equal(calls.at(-1)!.target,serverUrl+"/api/clipboard-settings/logs?offset=30&status=completed");
+      for(const action of ["delete","force","undo","edit"] as const){await service.desktopClipboardLogAction("local-owner","request/id with space",action,{jobId:"old-job",requestId:"operation",content:"合成内容"});const call=calls.at(-1)!;assert.equal(call.target,serverUrl+"/api/clipboard-settings/logs/request%2Fid%20with%20space"+(action==="delete"?"":"/"+action));assert.equal(call.method,action==="delete"?"DELETE":"POST");if(action==="edit")assert.equal(call.body.content,"合成内容");}
+      await service.desktopClipboardLogContent("local-owner","request/id with space");assert.equal(calls.at(-1)!.method,"GET");
+      await service.setDesktopClipboardTokenEnabled("local-owner",false);assert.equal(calls.at(-1)!.method,"PUT");assert.deepEqual(calls.at(-1)!.body,{enabled:false});
       const count=calls.length;await assert.rejects(service.desktopClipboardLogAction("local-other","anything","force"));assert.equal(calls.length,count);
     });
     await t.test("NAS outage and logout do not fall back to a different account",async()=>{

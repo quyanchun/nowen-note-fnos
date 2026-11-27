@@ -36,7 +36,7 @@ import jwt from "jsonwebtoken";
 import { disconnectUser } from "../services/realtime";
 import { getAttachmentStorageInfo } from "../services/attachment-storage";
 
-import { getFnosAccount, getFnosGatewayIdentity, getLinkedFnosUid, type FnosIdentity } from "../lib/fnos-identity";
+import { getFnosAccount, getFnosGatewayIdentity, getLinkedFnosUid, requiresCurrentPassword, markLocalPasswordSet, type FnosIdentity } from "../lib/fnos-identity";
 import { createFnosWebAuthRoutes } from "../services/fnos-web-auth";
 
 const auth = new Hono();
@@ -671,16 +671,12 @@ auth.post("/change-password", async (c) => {
 
   const body = await c.req.json();
   const { currentPassword, newUsername, newPassword, newEmail, newDisplayName } = body as {
-    currentPassword: string;
+    currentPassword?: string;
     newUsername?: string;
     newPassword?: string;
     newEmail?: string | null;
     newDisplayName?: string | null;
   };
-
-  if (!currentPassword) {
-    return c.json({ error: "必须提供当前密码" }, 400);
-  }
 
   if (!newUsername && !newPassword && newEmail === undefined && newDisplayName === undefined) {
     return c.json({ error: "请填写要修改的账号资料或新密码" }, 400);
@@ -709,9 +705,12 @@ auth.post("/change-password", async (c) => {
 
   const db = getDb();
   const user = db
-    .prepare("SELECT id, username, email, displayName, passwordHash FROM users WHERE id = ?")
+    .prepare("SELECT id, username, email, displayName, passwordHash, isDisabled FROM users WHERE id = ?")
     .get(userId) as any;
   if (!user) return c.json({ error: "用户不存在" }, 404);
+  if (user.isDisabled) return c.json({ error: "账号已禁用", code: "ACCOUNT_DISABLED" }, 403);
+  const passwordRequired = requiresCurrentPassword(userId);
+  if (passwordRequired && !currentPassword) return c.json({ error: "必须提供当前密码" }, 400);
 
   if (
     process.env.ELECTRON_LOCAL_ACCOUNT_SECRET
@@ -724,7 +723,7 @@ auth.post("/change-password", async (c) => {
     }, 409);
   }
 
-  if (!verifyPasswordCompat(currentPassword, user.passwordHash)) {
+  if (passwordRequired && !verifyPasswordCompat(currentPassword!, user.passwordHash)) {
     return c.json({ error: "当前密码错误" }, 403);
   }
 
@@ -760,7 +759,16 @@ auth.post("/change-password", async (c) => {
   params.push(userId);
 
   try {
-    db.prepare(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+    const applied = db.transaction(() => {
+      // Hashing yields to other requests; do not overwrite a concurrent setup/reset or revoked session.
+      const latest = db.prepare("SELECT passwordHash, isDisabled FROM users WHERE id = ?").get(userId) as any;
+      if (!latest || latest.isDisabled || latest.passwordHash !== user.passwordHash
+        || requiresCurrentPassword(userId) !== passwordRequired || extractUserId(c) !== userId) return false;
+      db.prepare(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+      if (newPassword) markLocalPasswordSet(userId);
+      return true;
+    })();
+    if (!applied) return c.json({ error: "账号状态已变更，请刷新后重试", code: "ACCOUNT_STATE_CHANGED" }, 409);
   } catch (e: any) {
     if (String(e?.code || "").startsWith("SQLITE_CONSTRAINT")) {
       const msg = String(e?.message || "");
@@ -914,6 +922,7 @@ auth.post("/factory-reset", async (c) => {
            updatedAt = datetime('now')
        WHERE id = ?`,
     ).run(defaultHash, userId);
+    markLocalPasswordSet(userId);
   });
 
   try {

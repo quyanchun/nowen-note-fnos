@@ -10,7 +10,7 @@ test('fnOS share management stays within note reads and explicit sharing endpoin
 });
 test('fnOS log actions allow only explicit management methods and preserve the capture boundary',()=>{
  const base='https://nas.example/app/nowen-note-private';
- for(const [route,method] of [['/api/clipboard-settings/logs/request%2Fid','DELETE'],['/api/clipboard-settings/logs/request%2Fid/force','POST'],['/api/clipboard-settings/logs/id/undo','POST']])assert.ok(permittedTarget(base+route,origins,false,method));
+ for(const [route,method] of [['/api/clipboard-settings/logs/request%2Fid','DELETE'],['/api/clipboard-settings/logs/request%2Fid/force','POST'],['/api/clipboard-settings/logs/id/undo','POST'],['/api/clipboard-settings/logs/id','GET'],['/api/clipboard-settings/logs/id/edit','POST'],['/api/clipboard-settings/token/status','PUT']])assert.ok(permittedTarget(base+route,origins,false,method));
  for(const [route,method] of [['/api/clipboard-settings/logs/id','PUT'],['/api/clipboard-settings/logs/id/undo','DELETE'],['/api/clipboard-settings/logs/id/other','POST'],['/api/clipboard/captures','POST'],['/api/clipboard-settings/logs/id/force/extra','POST']])assert.equal(permittedTarget(base+route,origins,false,method),null);
 });
 test('fnOS bridge allows settings management but rejects clipboard submission and receipts', () => {
@@ -91,4 +91,32 @@ test('restart restores the remembered NAS session through its own sandboxed port
     const response=await fetch(env.NOWEN_FNOS_BRIDGE_URL,{headers:{'X-Nowen-Bridge':env.NOWEN_FNOS_BRIDGE_TOKEN,'X-Nowen-Target':'https://nas.example/app/nowen-note-private/api/sync/v2/scopes'}});
     assert.equal(response.status,200);assert.deepEqual(await response.json(),{scopes:[]});assert.equal(hidden,true);assert.equal(closed,true);
   } finally {await transport.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+for(const rejection of [401,403])test(`expired gateway HTTP ${rejection} restores the remembered session and retries`,async()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nowen-nas-expiry-'));
+ let expired=false,restored=0,scopeRequests=0;
+ const ses={setCertificateVerifyProc(){},setPermissionRequestHandler(){},flushStorageData(){},cookies:{get:async()=>[{name:'osrt',session:false}],flushStore:async()=>{}},fetch:async url=>{
+  if(url.endsWith('/health'))return expired?new Response('login required',{status:rejection}):Response.json({service:'nowen-note',status:'ok'});
+  scopeRequests++;return expired?Response.json({code:'NAS_LOGIN_REQUIRED'},{status:rejection}):Response.json({scopes:[]});
+ }};
+ class Window{constructor(options){assert.equal(options.show,false);assert.equal(options.webPreferences.sandbox,true);this.webContents={setWindowOpenHandler(){},on(){}};}loadURL(){expired=false;restored++;return Promise.resolve();}isDestroyed(){return false;}destroy(){}}
+ const transport=createFnosSessionTransport({session:{fromPartition:()=>ses},BrowserWindow:Window,getDataPath:()=>dir,WebSocket:require('../../backend/node_modules/ws')});
+ const env=await transport.start();
+ try{
+  await transport.prepareServer('https://nas.example');expired=true;
+  const response=await fetch(env.NOWEN_FNOS_BRIDGE_URL,{headers:{'X-Nowen-Bridge':env.NOWEN_FNOS_BRIDGE_TOKEN,'X-Nowen-Target':'https://nas.example/app/nowen-note-private/api/sync/v2/scopes'}});
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{scopes:[]});assert.equal(restored,1);assert.equal(scopeRequests,2);
+ }finally{await transport.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+test('a live gateway does not restore revoked application credentials',async()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nowen-nas-revoked-'));let windows=0;
+ const ses={setCertificateVerifyProc(){},setPermissionRequestHandler(){},fetch:async url=>url.endsWith('/health')?Response.json({service:'nowen-note',status:'ok'}):Response.json({code:'TOKEN_REVOKED'},{status:401})};
+ class Window{constructor(){windows++;}}
+ const transport=createFnosSessionTransport({session:{fromPartition:()=>ses},BrowserWindow:Window,getDataPath:()=>dir,WebSocket:require('../../backend/node_modules/ws')});
+ const env=await transport.start();
+ try{
+  await transport.prepareServer('https://nas.example');
+  const response=await fetch(env.NOWEN_FNOS_BRIDGE_URL,{headers:{'X-Nowen-Bridge':env.NOWEN_FNOS_BRIDGE_TOKEN,'X-Nowen-Target':'https://nas.example/app/nowen-note-private/api/sync/v2/scopes'}});
+  assert.equal(response.status,401);assert.equal((await response.json()).code,'TOKEN_REVOKED');assert.equal(windows,0);
+ }finally{await transport.close();fs.rmSync(dir,{recursive:true,force:true});}
 });

@@ -14,6 +14,7 @@ export interface User {
    *   - 老后端未迁移补列时不下发该字段，前端允许 undefined，按 false 处理。
    */
   isDemo?: boolean;
+  currentPasswordRequired?: boolean;
   /**
    * 个人空间导出/导入开关（v6 per-user 开关，从原来的全站 system_settings 下沉）。
    *   - 由管理员在「用户管理 → 编辑用户」里为每个用户独立控制；

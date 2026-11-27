@@ -20,7 +20,6 @@ function send(channel, payload) {
 }
 
 function buildMenu({
-  onCheckForUpdates,
   openAboutWindow,
   mode = "full",
   liteOnly = false,
@@ -63,18 +62,13 @@ function buildMenu({
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const template = [
     // ========== App 菜单（仅 macOS） ==========
-    // HIG：应用名为首项；About → 更新 → 偏好 → Services → Hide → Quit
+    // HIG：应用名为首项；About → 偏好 → Services → Hide → Quit
     ...(isMac
       ? [
           {
             label: app.name,
             submenu: [
               { role: "about", label: `关于 ${app.name}` },
-              { type: "separator" },
-              {
-                label: "检查更新…",
-                click: () => onCheckForUpdates?.(),
-              },
               { type: "separator" },
               {
                 label: "偏好设置…",
@@ -334,11 +328,6 @@ function buildMenu({
         {
           label: "报告问题",
           click: () => shell.openExternal("https://github.com/cropflre/nowen-note/issues"),
-        },
-        { type: "separator" },
-        {
-          label: "检查更新…",
-          click: () => onCheckForUpdates?.(),
         },
         ...(!isMac
           ? [

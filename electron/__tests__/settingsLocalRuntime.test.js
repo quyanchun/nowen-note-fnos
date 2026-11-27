@@ -200,3 +200,16 @@ test("settings.json 损坏时回退默认值而不是抛错", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Mac quick search restores the shortcut, including explicitly disabled", () => {
+  withTempSettings({}, dir => {
+    for (const key of ["Control+Space", "Alt+Space", "Control+Alt+Shift+8", ""]) {
+      settings.writeSettings({ quickPanelShortcut: key });
+      settings.setSettingsPath(dir);
+      assert.equal(settings.readSettings().quickPanelShortcut, key);
+    }
+  });
+  for (const invalid of ["Space", "Shift+A", "Command+Command+A", "Alt+🗒"]) {
+    assert.equal(settings.isQuickPanelShortcut(invalid), false);
+  }
+});

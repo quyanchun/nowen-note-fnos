@@ -52,6 +52,8 @@ export interface ReliableDiagnostics {
     score?: number;
     rankReason: string;
     indexedAt?: string | null;
+    updatedAt?: string;
+    notebook?: string;
     preview: string;
     contextChars: number;
     truncated: boolean;
@@ -95,6 +97,7 @@ export interface ReliableStatus {
 }
 
 export interface ReliableAskParams {
+  presentation?: "quick-panel";
   question: string;
   history?: Array<{ role: string; content: string }>;
   mode: ReliableAskMode;
@@ -104,7 +107,7 @@ export interface ReliableAskParams {
   includeChildren?: boolean;
 }
 
-function authHeaders(json = false): HeadersInit {
+function authHeaders(json = false): Record<string, string> {
   const token = localStorage.getItem("nowen-token") || "";
   return {
     ...(json ? { "Content-Type": "application/json" } : {}),
@@ -198,17 +201,23 @@ export async function reliableAsk(
     onReferences?: (references: ReliableReference[]) => void;
     onDiagnostics?: (diagnostics: ReliableDiagnostics) => void;
   } = {},
+  signal?: AbortSignal,
 ): Promise<string> {
   const response = await fetch(scopedPath("/ask"), {
     method: "POST",
-    headers: authHeaders(true),
+    headers: { ...authHeaders(true), Accept: "text/event-stream" },
     body: JSON.stringify(params),
+    signal,
   });
   if (!response.ok) throw await parseError(response);
 
   let output = "";
+  let finished = false;
   const dispatch = (item: ParsedEvent): boolean => {
-    if (item.event === "done" || item.data === "[DONE]") return true;
+    if (item.event === "done" || item.data === "[DONE]") {
+      finished = true;
+      return true;
+    }
     if (item.event === "references") {
       try { callbacks.onReferences?.(JSON.parse(item.data)); } catch { /* malformed diagnostics must not break chat */ }
       return false;
@@ -228,29 +237,25 @@ export async function reliableAsk(
 
   if (!response.body || typeof response.body.getReader !== "function") {
     const parsed = consumeSSE(await response.text(), true);
-    for (const item of parsed.events) {
-      if (dispatch(item)) break;
-    }
-    return output;
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let finished = false;
-  while (!finished) {
-    const result = await reader.read();
-    if (result.value) buffer += decoder.decode(result.value, { stream: !result.done });
-    const parsed = consumeSSE(buffer, !!result.done);
-    buffer = parsed.rest;
-    for (const item of parsed.events) {
-      if (dispatch(item)) {
-        finished = true;
-        break;
+    parsed.events.some(dispatch);
+  } else {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (!finished) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const parsed = consumeSSE(buffer, done);
+        buffer = parsed.rest;
+        parsed.events.some(dispatch);
+        if (done) break;
       }
+    } finally {
+      reader.releaseLock();
     }
-    if (result.done) break;
   }
+  if (!finished && params.presentation === "quick-panel") throw new Error("回答中途断开，按回车可重试");
   return output;
 }
 

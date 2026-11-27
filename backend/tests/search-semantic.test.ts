@@ -5,7 +5,7 @@ import test from "node:test";
 import { Hono } from "hono";
 import { getDb, closeDb } from "../src/db/schema";
 import searchRouter from "../src/routes/search";
-import { initVecStore, upsertVectors } from "../src/services/vec-store";
+import { initVecStore, upsertVectors,knnSearch } from "../src/services/vec-store";
 import { setUserAISettings } from "../src/services/user-ai-settings";
 
 const owner = "semantic-owner";
@@ -96,4 +96,23 @@ test("deletion during inference cannot return an earlier keyword body (DCC-006)"
   duringEmbedding = () => { getDb().prepare("UPDATE notes SET isTrashed=1 WHERE id='far'").run(); };
   try { assert.ok(!(await query("雨天")).rows.some(r => r.id === "far")); }
   finally { duringEmbedding = undefined; }
+});
+
+test("exact credentials without embeddings outrank weak vector hits and Chinese questions find the entry",async()=>{
+  const db=getDb(),body="### 音乐服务器\n地址：https://music.example.test\n账号：demo-user\n密码：Synthetic-42!";
+  db.prepare("INSERT INTO notes(id,userId,notebookId,title,content,contentText,contentFormat) VALUES('credentials',?,?,'账号密码本',?,?,'markdown')").run(owner,owner,body,body);
+  assert.equal((await query("music.example.test")).rows[0].id,'credentials');
+  assert.equal((await query("demo-user")).rows[0].id,'credentials');
+  assert.equal((await query("帮我找音乐服务器的密码","")).rows[0].id,'credentials');
+  assert.ok((await query("music.example.test")).rows.some(row=>row.id==='near'));
+});
+
+test("other accounts cannot consume the vector candidate budget (DCC-006)",()=>{
+  const db=getDb(),insert=db.prepare("INSERT INTO note_embeddings(noteId,userId,chunkIndex,chunkText,vectorJson,model,dim) VALUES('other-note','semantic-other',?,'other chunk','[0,1]','test',2)");
+  db.transaction(()=>{for(let index=1;index<=550;index++) {
+    const row=insert.run(index);upsertVectors([{rowid:Number(row.lastInsertRowid),vector:[0,1]}]);
+  }})();
+  const hits=knnSearch([0,1],owner,null,8,8);
+  assert.ok(hits.some(hit=>hit.noteId==='near'));
+  assert.ok(hits.every(hit=>hit.noteId!=='other-note'));
 });

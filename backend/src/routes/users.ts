@@ -15,6 +15,7 @@ import { Hono } from "hono";
 import { v4 as uuid } from "uuid";
 import bcrypt from "bcryptjs";
 import { getDb } from "../db/schema";
+import { markLocalPasswordSet } from "../lib/fnos-identity";
 import { isSystemAdmin, requireAdmin } from "../middleware/acl";
 import { invalidateUserAuthCache, verifySudoFromRequest, extractClientIp } from "../lib/auth-security";
 import { disconnectUser } from "../services/realtime";
@@ -456,6 +457,7 @@ users.post("/:id/reset-password", requireAdmin, async (c) => {
          updatedAt = datetime('now')
      WHERE id = ?`,
   ).run(hash, targetId);
+  markLocalPasswordSet(targetId);
 
   invalidateUserAuthCache(targetId);
   try { disconnectUser(targetId, "password_reset"); } catch {}

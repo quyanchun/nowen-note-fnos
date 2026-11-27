@@ -15,6 +15,7 @@ import {
   hasHanText,
   normalizeSearchText,
   splitSearchTerms,
+  splitNaturalSearchTerms,
 } from "../lib/searchQuery";
 import {
   getSearchIndexRebuiltAt,
@@ -66,6 +67,7 @@ type MatchSource = {
 type SearchResultWithScore = Omit<SearchRow, "contentText" | "tagText" | "attachmentNames" | "attachmentText"> & {
   resourceType: "note" | "mindmap" | "sheet";
   snippet: string;
+  previewText?: string;
   titleHtml: string;
   snippetHtml: string;
   matchedField: "title" | "content" | "title+content";
@@ -664,10 +666,11 @@ function buildSearchResult(
   const hasTitle = matchedFields.includes("title");
   const hasContent = matchedFields.includes("content");
   const matchedField = hasTitle && hasContent ? "title+content" : hasTitle ? "title" : "content";
+  const snippetSource = matchedSources.find(source => source.field === "content") || primary;
   const snippetHtml = buildPlainSnippet(
-    primary.text,
+    snippetSource.text,
     terms,
-    primary.field === "title" || primary.field === "content" ? undefined : primary.label,
+    snippetSource.field === "title" || snippetSource.field === "content" ? undefined : snippetSource.label,
   );
 
   const manualScore = primary.priority * 10
@@ -687,6 +690,7 @@ function buildSearchResult(
     contentFormat: row.contentFormat,
     notebookName: row.notebookName,
     snippet: snippetHtml,
+    previewText: primary.field === "title" && !hasContent && !isEncryptedNoteFormat(row.contentFormat) ? (row.contentText || "").slice(0, 180) : undefined,
     titleHtml: markPlainText(row.title, terms),
     snippetHtml,
     matchedField,
@@ -1124,7 +1128,7 @@ async function includeSemanticResults(
   try {
     const vector = await embedQuery(userId, query);
     if (!vector) return keywordResults;
-    const hits = knnSearch(vector, userId, workspaceId === "personal" ? null : workspaceId || null, 500, 50);
+    const hits = knnSearch(vector, userId, workspaceId === "personal" ? null : workspaceId || null, 500, 50,c.req.queries("notebookId"));
     // Recheck current access, trash, notebook exclusions and encryption after the async model call.
     const visibleIds = filterVisibleCandidates(db, new Set(hits.map((hit) => hit.noteId)), userId);
     const rows = new Map(fetchCandidateRows(db, visibleIds, userId, scope)
@@ -1142,9 +1146,12 @@ async function includeSemanticResults(
       return [visible];
     });
     const merged = new Map<string, SearchResult>(currentKeywords.map((row) => [row.id, { ...row, retrieval: "keyword" as const }]));
+    const keywordRanks = new Map(currentKeywords.map((row,index)=>[row.id,index+1]));
+    const vectorRanks = new Map<string,number>();
     for (const hit of hits) {
       const row = rows.get(hit.noteId);
       if (!row || !Number.isFinite(hit.distance) || merged.get(row.id)?.semanticRelevance !== undefined) continue;
+      vectorRanks.set(row.id,vectorRanks.size+1);
       const existing = merged.get(row.id);
       // Never display obsolete embedding chunks: use the current searchable text only.
       const currentText = hit.entityType === "attachment" ? row.attachmentText : row.contentText;
@@ -1165,8 +1172,14 @@ async function includeSemanticResults(
         semanticRelevance: 1 / (1 + Math.max(0, hit.distance)),
       });
     }
+    const normalized = normalizeSearchText(query);
+    const exact = (result:SearchResult) => {
+      const row = currentKeywordRows.get(result.id);
+      return keywordRanks.has(result.id) && normalizeSearchText([result.title,row?.contentText,row?.tagText,row?.attachmentText].filter(Boolean).join("\n")).includes(normalized);
+    };
+    const fusedScore = (id:string) => (keywordRanks.has(id)?2/(60+keywordRanks.get(id)!):0)+(vectorRanks.has(id)?1/(60+vectorRanks.get(id)!):0);
     return [...merged.values()]
-      .sort((a, b) => (b.semanticRelevance ?? -1) - (a.semanticRelevance ?? -1))
+      .sort((a, b) => Number(exact(b))-Number(exact(a)) || fusedScore(b.id)-fusedScore(a.id))
       .slice(0, 100)
       .map(({ score: _score, ...row }: SearchResult & { score?: number }) => row);
   } catch {
@@ -1189,16 +1202,21 @@ app.get("/", async (c) => {
   ensureSearchNotebookExclusionsTable(db);
   const scope = buildSearchScope(workspaceId, userId, includeExcluded);
   if (!scope) return c.json({ error: "无权访问该工作区" }, 403);
+  const notebookIds = [...new Set(c.req.queries("notebookId") || [])].slice(0,500);
+  if(notebookIds.length) {
+    scope.sql += ` AND n.notebookId IN (${notebookIds.map(()=>"?").join(",")})`;
+    scope.params.push(...notebookIds);
+  }
 
-  const terms = splitSearchTerms(q);
+  let terms = splitSearchTerms(q);
   if (terms.length === 0) return c.json([]);
   const normalizedQuery = normalizeSearchText(q);
 
   const candidateStarted = performance.now();
-  const candidate = collectCandidates(db, terms, scope, userId);
+  let candidate = collectCandidates(db, terms, scope, userId);
   candidate.ids = filterVisibleCandidates(db, candidate.ids, userId);
   const candidateDurationMs = performance.now() - candidateStarted;
-  const mindMapResults = fetchMindMapResults(
+  let mindMapResults = fetchMindMapResults(
     db,
     userId,
     workspaceId,
@@ -1206,13 +1224,23 @@ app.get("/", async (c) => {
     normalizedQuery,
   );
 
-  const sheetResults = fetchSheetResults(
+  let sheetResults = fetchSheetResults(
     db,
     userId,
     scope,
     terms,
     normalizedQuery,
   );
+  if(candidate.ids.size===0 && !mindMapResults.length && !sheetResults.length) {
+    const natural=splitNaturalSearchTerms(q);
+    if(natural.length&&natural.join("\n")!==terms.join("\n")) {
+      terms=natural;
+      candidate=collectCandidates(db,terms,scope,userId);
+      candidate.ids=filterVisibleCandidates(db,candidate.ids,userId);
+      mindMapResults=fetchMindMapResults(db,userId,workspaceId,terms,normalizedQuery);
+      sheetResults=fetchSheetResults(db,userId,scope,terms,normalizedQuery);
+    }
+  }
   const additionalResultCount = mindMapResults.length
     + sheetResults.filter((row) => !candidate.ids.has(row.id)).length;
 

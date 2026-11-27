@@ -757,6 +757,7 @@ app.post("/", async (c) => {
   }
 
   const legacyNoteCreateTx = db.transaction(() => {
+    validateCaptureReceipt(c.req.raw, db);
     db.prepare(`
       INSERT INTO notes (id, userId, workspaceId, notebookId, title, content, contentText, contentFormat, colorMark)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

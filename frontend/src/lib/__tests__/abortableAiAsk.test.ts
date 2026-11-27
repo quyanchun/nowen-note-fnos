@@ -24,13 +24,16 @@ describe("abortable AI ask bridge", () => {
     }) as typeof fetch;
 
     const controller = new AbortController();
+    const panel = new AbortController();
     await withAbortableAiFetch(controller, async () => {
       await fetch("/api/notes");
       await fetch("/api/ai/ask", { method: "POST" });
+      await fetch("/api/user-preferences/ai-reliable/ask", { signal: panel.signal });
     });
 
     expect(calls[0].signal).toBeUndefined();
     expect(calls[1].signal).toBe(controller.signal);
+    expect(calls[2].signal).toBe(panel.signal);
     expect(globalThis.fetch).not.toBeUndefined();
   });
 });

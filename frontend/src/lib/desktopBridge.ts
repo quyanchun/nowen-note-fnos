@@ -317,7 +317,26 @@ export interface DesktopHttpAPI {
   }>;
 }
 
+export interface QuickPanelAction { action: "open"; text: string }
+export interface QuickDraft { id: string; title: string; text: string }
+export interface QuickQuery {
+  id: number;
+  query: string;
+  kind: "clear" | "preview" | "search" | "ask" | "detail" | "save";
+  draft?: QuickDraft;
+  organize?: boolean;
+}
+export interface QuickRow { id: string; title: string; snippet?: string; notebook?: string; updatedAt?: string }
+export type QuickPanelReply = { rows: QuickRow[] } | { answerHtml: string; done?: boolean }
+  | { detail: { title: string; html: string; notice: string } } | { saved: string; folder?: string } | { error: string };
 interface NowenDesktopAPI {
+  quickPanel?: {
+    shortcut: (key?: string) => Promise<{ key: string; active: boolean; error?: string }>;
+    ready: (ready: boolean) => void;
+    onQuery: (listener: (request: QuickQuery) => void) => () => void;
+    results: (response: QuickQuery & QuickPanelReply) => void;
+    onAction: (listener: (action: QuickPanelAction) => void) => () => void;
+  };
   on: (channel: string, listener: (payload: unknown) => void) => () => void;
   checkForUpdates: () => Promise<{ ok: boolean; reason?: string; version?: string }>;
   openMicrosoftStoreUpdates?: () => Promise<{ ok: boolean; reason?: string }>;
@@ -384,6 +403,8 @@ function getBridge(): NowenDesktopAPI | null {
   if (typeof window === "undefined") return null;
   return (window as unknown as { nowenDesktop?: NowenDesktopAPI }).nowenDesktop ?? null;
 }
+
+export const getQuickPanel = () => getBridge()?.quickPanel;
 
 export const isDesktop = (): boolean => !!getBridge();
 

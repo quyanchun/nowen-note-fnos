@@ -1,13 +1,16 @@
 import { normalizeAICustomHeaders } from "../services/ai-custom-headers.js";
+import { resolveQuickNoteFolder } from "../services/quick-note-folder.js";
+import { KnowledgeTreeError } from "../services/knowledgeTree.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { aiCustomPromptsRepository } from "../repositories";
 import { canViewNoteThroughFolderPasswords } from "../lib/knowledgeTreePasswordAccess";
+import { projectMarkdownForUser } from "../lib/markdownUserContent";
 import { encryptedBlocksInContent, isEncryptedNoteFormat } from "../lib/encryptedNotes";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { getDb } from "../db/schema";
-import { getUserWorkspaceRole, hasPermission, resolveNotePermission } from "../middleware/acl";
+import { getUserWorkspaceRole, hasRole, hasPermission, resolveNotePermission } from "../middleware/acl";
 import { callAIChat, callAIChatStream, sanitizeError, type AISettings } from "../services/ai-client";
 import { embedQuery, getEmbeddingStats } from "../services/embedding-worker";
 import { isVecAvailable, knnSearch } from "../services/vec-store";
@@ -47,6 +50,7 @@ const GUARDED_AI_KEYS = [
 ];
 
 interface AskBody {
+  presentation?: "quick-panel";
   question?: string;
   history?: Array<{ role: string; content: string }>;
   mode?: "knowledge" | "current-note" | "selection";
@@ -89,6 +93,8 @@ interface DiagnosticHit {
   score?: number;
   rankReason: Candidate["reason"];
   indexedAt?: string | null;
+  notebook?: string;
+  updatedAt?: string;
   preview: string;
   contextChars: number;
   truncated: boolean;
@@ -252,7 +258,7 @@ function addCandidate(map: Map<string, Candidate>, candidate: Candidate): void {
   }
 }
 
-async function retrieveCandidates(scope: Scope, question: string): Promise<{
+async function retrieveCandidates(scope: Scope, question: string, allowRecentFallback = true): Promise<{
   candidates: Candidate[];
   retrieval: string[];
 }> {
@@ -369,7 +375,7 @@ async function retrieveCandidates(scope: Scope, question: string): Promise<{
     }
   }
 
-  if (map.size === 0) {
+  if (map.size === 0 && allowRecentFallback) {
     const rows = db.prepare(`
       SELECT n.id, n.title, n.contentText
       FROM notes n
@@ -471,7 +477,7 @@ function publicStatus(scope: Scope) {
   };
 }
 
-function buildKnowledgeContext(candidates: Candidate[]): {
+function buildKnowledgeContext(candidates: Candidate[], scope: Scope): {
   block: string;
   hits: DiagnosticHit[];
   budget: BudgetedContext;
@@ -484,15 +490,17 @@ function buildKnowledgeContext(candidates: Candidate[]): {
   const blocks: string[] = [];
   const hits: DiagnosticHit[] = [];
 
+  const readSource = db.prepare(`SELECT n.id, n.title, n.userId, n.notebookId, n.workspaceId, n.isTrashed,
+    n.content, n.contentText, n.contentFormat, n.updatedAt, b.name AS notebook
+    FROM notes n LEFT JOIN notebooks b ON b.id = n.notebookId WHERE n.id = ?`);
   for (const candidate of candidates) {
     if (remaining < 1_000) break;
-    let sourceText = candidate.snippet || "";
-    if (candidate.kind === "note") {
-      const note = db.prepare(
-        "SELECT content, contentText, contentFormat FROM notes WHERE id = ?",
-      ).get(candidate.noteId) as { content: string; contentText: string; contentFormat: string } | undefined;
-      if (note) sourceText = noteToPlainText(note);
-    }
+    const note = readSource.get(candidate.noteId) as (CollaborationNote & { updatedAt: string; notebook: string }) | undefined;
+    if (!note || !readableCollaborationNote(scope, note) || hasCollaborationCipher(note)) continue;
+    const source = note.contentFormat === "markdown" && candidate.kind === "note"
+      ? { ...note, content: projectMarkdownForUser(note.content || ""), contentText: projectMarkdownForUser(note.contentText || "") }
+      : note;
+    const sourceText = candidate.kind === "note" ? noteToPlainText(source) : candidate.snippet || "";
     const fitted = fitContextBudget(sourceText, Math.min(10_000, remaining));
     if (!fitted.text) continue;
     const label = candidate.kind === "attachment" ? "附件" : "笔记";
@@ -512,7 +520,9 @@ function buildKnowledgeContext(candidates: Candidate[]): {
       score: candidate.score,
       rankReason: candidate.reason,
       indexedAt: candidate.indexedAt,
-      preview: safeContextPreview(sourceText),
+      notebook: note.notebook,
+      updatedAt: note.updatedAt,
+      preview: safeContextPreview(fitted.text),
       contextChars: fitted.includedChars,
       truncated: fitted.truncated,
     });
@@ -647,6 +657,7 @@ app.post("/ask", async (c) => {
   if ("error" in scope) return scope.error;
 
   const mode = body.mode === "current-note" || body.mode === "selection" ? body.mode : "knowledge";
+  const panel = mode === "knowledge" && body.presentation === "quick-panel";
   let contextBlock = "";
   let retrieval: string[] = [];
   let candidates: Candidate[] = [];
@@ -688,10 +699,11 @@ app.post("/ask", async (c) => {
         truncated: contextBudget.truncated,
       }];
     } else {
-      const result = await retrieveCandidates(scope, question);
+      const wantsRecent = /(?:最近|近期|近几天|recent|latest).*(?:笔记|记录|notes)|(?:笔记|notes).*(?:最近|recent|latest)/i.test(question);
+      const result = await retrieveCandidates(scope, question, !panel || wantsRecent);
       candidates = result.candidates;
       retrieval = result.retrieval;
-      const built = buildKnowledgeContext(candidates);
+      const built = buildKnowledgeContext(candidates, scope);
       contextBlock = built.block;
       diagnosticHits = built.hits;
       contextBudget = built.budget;
@@ -739,7 +751,7 @@ app.post("/ask", async (c) => {
     ? `你是 Nowen Note 的知识库助手。仅把下面提供的上下文视为用户知识库证据。请优先依据证据回答，并用来源标题说明依据；证据不足时明确说“不足以从当前范围确认”，不要虚构。${truncationNotice}\n\n${contextBlock}`
     : "你是 Nowen Note 的知识库助手。当前检索范围没有找到可用上下文，请明确告知用户，再基于通用知识回答。";
   const messages = [
-    { role: "system", content: systemPrompt },
+    { role: "system", content: panel ? "请用简洁的 Markdown 正文回答，按需要使用小标题、列表或加粗。引用卡片由界面展示，无需另附来源清单。\n" + systemPrompt : systemPrompt },
     ...(Array.isArray(body.history) ? body.history : [])
       .slice(-MAX_HISTORY_MESSAGES)
       .map((message) => ({
@@ -749,8 +761,10 @@ app.post("/ask", async (c) => {
     { role: "user", content: question },
   ];
 
+  c.header("X-Accel-Buffering", "no");
   return streamSSE(c, async (stream) => {
-    const references = candidates.map((candidate) => ({
+    const included = new Set(diagnosticHits.map(hit => hit.id));
+    const references = candidates.filter(candidate => included.has(candidate.id)).map((candidate) => ({
       id: candidate.noteId,
       title: candidate.title,
       kind: candidate.kind,
@@ -766,18 +780,40 @@ app.post("/ask", async (c) => {
     }
     await stream.writeSSE({ event: "diagnostics", data: JSON.stringify(diagnostics) });
 
-    let streamed = false;
-    try {
-      for await (const chunk of callAIChatStream(settings, messages, { temperature: 0.35, max_tokens: 2500 })) {
-        streamed = true;
-        await stream.writeSSE({ event: "message", data: JSON.stringify({ t: chunk }) });
-      }
-    } catch (error) {
-      console.warn("[ai-reliable] stream failed, falling back:", sanitizeError(error));
+    if (panel && !diagnosticHits.length) {
+      await stream.writeSSE({ event: "done", data: "[DONE]" });
+      return;
     }
+
+    const controller = new AbortController();
+    stream.onAbort(() => controller.abort());
+    const signal = AbortSignal.any([controller.signal, c.req.raw.signal]);
+    if (stream.aborted || signal.aborted) return;
+    const options = { temperature: 0.35, max_tokens: 2500, signal, requireStreamEnd: panel };
+    let streamed = false;
+    for (let attempt = 0; !signal.aborted; attempt++) {
+      try {
+        for await (const chunk of callAIChatStream(settings, messages, options)) {
+          streamed = true;
+          await stream.writeSSE({ event: "message", data: JSON.stringify({ t: chunk }) });
+        }
+        break;
+      } catch (error) {
+        if (signal.aborted) return;
+        if (panel && streamed) {
+          await stream.writeSSE({ event: "error", data: "回答中途断开，按回车可重试" });
+          return;
+        }
+        const status = (error as { status?: number })?.status;
+        if (panel && attempt === 0 && (error instanceof TypeError || [502, 503, 504].includes(status ?? 0))) continue;
+        console.warn("[ai-reliable] stream failed:", sanitizeError(error));
+        break;
+      }
+    }
+    if (signal.aborted) return;
     if (!streamed) {
       try {
-        const text = await callAIChat(settings, messages, { temperature: 0.35, max_tokens: 2500 });
+        const text = await callAIChat(settings, messages, options);
         if (text) await stream.writeSSE({ event: "message", data: JSON.stringify({ t: text }) });
       } catch (error) {
         await stream.writeSSE({ event: "error", data: sanitizeError(error) || "AI 请求失败" });
@@ -836,6 +872,27 @@ app.get("/collaboration/skills", (c) => {
   return c.json({ items, limited: rows.length > 200 });
 });
 
+app.post("/collaboration/quick-folder", async (c) => {
+  const scope = resolveScope(c, {});
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
+  if (c.req.header("X-Auth-Mode") === "api-token" || (workspaceId && !hasRole(getUserWorkspaceRole(workspaceId, userId), "editor"))) {
+    return c.json({ error: "当前身份无权在此归档笔记" }, 403);
+  }
+  const draft = z.object({ title: z.string().max(200), text: z.string().trim().min(1).max(60000) }).safeParse(await c.req.json().catch(() => null));
+  if (!draft.success) return c.json({ error: "请输入笔记正文" }, 400);
+  const settings = getUserAISettings(userId);
+  if (!isUserManualAIEnabled(userId) || !settings.ai_api_url || !settings.ai_model || (!["ollama", "lmstudio"].includes(settings.ai_provider) && !settings.ai_api_key)) {
+    return c.json({ error: "请先在 AI 设置中启用并配置模型" }, 409);
+  }
+  try {
+    return c.json(await resolveQuickNoteFolder(userId, workspaceId, settings, draft.data, c.req.raw.signal));
+  } catch (error) {
+    if (error instanceof KnowledgeTreeError) return c.json({ error: error.message }, error.status);
+    return c.json({ error: "AI 归类失败，草稿已保留，可重试或直接保存" }, 502);
+  }
+});
+
 app.post("/collaboration/compose", async (c) => {
   const parsed = collaborationBody.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: "输入或 Skill 格式无效，想法最多 8000 字，Skill 最多 64000 字", code: "INVALID_COLLABORATION_INPUT" }, 400);
@@ -883,7 +940,7 @@ app.post("/collaboration/compose", async (c) => {
     for (const note of readable.slice(0, 30)) candidates.push({ key: `note:${note.id}`, id: note.id, noteId: note.id,
       title: note.title, kind: "note", reason: "direct" });
   }
-  const context = buildKnowledgeContext(candidates);
+  const context = buildKnowledgeContext(candidates, scope);
   const references = context.hits.map(hit => ({ id: hit.noteId, title: hit.title }));
   const messages = [
     { role: "system", content: "你是 Nowen Note 的写作协作助手，只生成供用户预览的 Markdown 草稿，不能执行操作，也不要声称已保存或修改笔记。"

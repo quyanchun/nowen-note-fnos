@@ -1,28 +1,38 @@
 import AppSelect from "@/components/ui/AppSelect";
 import ClipboardCaptureLogs from "./ClipboardCaptureLogs";
 import { useEffect, useState } from "react";
-import { ClipboardCopy, Copy, CircleHelp, Loader2, RefreshCw, Save, Trash2 } from "lucide-react";
+import { ClipboardCopy, Copy, CircleHelp, Loader2, RefreshCw, Save, Trash2, CheckCircle2, AlertCircle, Circle, Power } from "lucide-react";
 import { Portal as TooltipPortal } from "@radix-ui/react-tooltip";
 import { useTranslation } from "react-i18next";
 import { api } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { clipboardIntegrationApi, clipboardSubmissionUrl, standaloneClipboardEndpoint, type ClipboardIntegrationSettings, type ClipboardDelivery } from "@/lib/clipboardIntegration";
+import type { Note } from "@/types";
+import { toast } from "@/lib/toast";
 
 function Help({ title, hint }: { title: string; hint: string }) {
   return <Tooltip><TooltipTrigger asChild><button type="button" aria-label={`${title}说明`} className="inline-flex shrink-0 items-center text-tx-tertiary hover:text-tx-primary"><CircleHelp size={13} /></button></TooltipTrigger><TooltipPortal><TooltipContent className="z-[120] max-w-72 leading-relaxed">{hint}</TooltipContent></TooltipPortal></Tooltip>;
 }
-export default function ClipboardIntegrationPanel() {
+export default function ClipboardIntegrationPanel({onOpenSync,onOpenNote}:{onOpenSync?:()=>void;onOpenNote?:(note:Note)=>void}={}) {
   const { i18n } = useTranslation();
   const label = (cn: string, en: string) => i18n.language.startsWith("zh") ? cn : en;
   const [settings, setSettings] = useState<ClipboardIntegrationSettings | null>(null);
   const [tokenSet, setTokenSet] = useState(false);
+  const [tokenEnabled,setTokenEnabled]=useState(false);
   const [endpoint, setEndpoint] = useState(clipboardSubmissionUrl);
   const [delivery, setDelivery] = useState<ClipboardDelivery>("direct");
+  const [noteServerUrl,setNoteServerUrl]=useState("");
   const [folders, setFolders] = useState<Array<{id:string;name:string}>>([]);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [needsAuthorization, setNeedsAuthorization] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const reportError = (e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e));
+    const code = (e as { code?: string } | null)?.code;
+    setNeedsAuthorization(code === "DESKTOP_NAS_AUTH_EXPIRED" || code === "DESKTOP_NAS_REQUIRED");
+  };
   const [tab,setTab]=useState<"configuration"|"logs">("configuration");
   useEffect(() => {
     let disposed = false;
@@ -30,24 +40,38 @@ export default function ClipboardIntegrationPanel() {
       const notebooks = state.folders || await api.getNotebooks();
       if (disposed) return;
       setSettings({ ...state.settings, integrationMode: state.settings.integrationMode || "nas",
-        standaloneUrl: state.settings.standaloneUrl || (state.delivery !== "desktop" && !new URL(clipboardSubmissionUrl()).pathname.startsWith("/app/") ? clipboardSubmissionUrl().replace(/\/api\/clipboard\/captures$/, "") : "") }); setTokenSet(state.tokenSet);
+        standaloneUrl: state.settings.standaloneUrl || (state.delivery !== "desktop" && !new URL(clipboardSubmissionUrl()).pathname.startsWith("/app/") ? clipboardSubmissionUrl().replace(/\/api\/clipboard\/captures$/, "") : "") }); setTokenSet(state.tokenSet);setTokenEnabled(state.tokenEnabled??state.tokenSet);
       setEndpoint(state.delivery === "desktop"
         ? state.serverEndpoint || (state.serverUrl ? state.serverUrl.replace(/\/+$/, "") + "/api/clipboard/captures" : clipboardSubmissionUrl())
         : state.endpoint || clipboardSubmissionUrl());
       setDelivery(state.delivery || "direct");
+      setNoteServerUrl(state.delivery==="desktop"?state.serverUrl||"":"");
       setFolders(notebooks.filter(folder => !("workspaceId" in folder) || !folder.workspaceId));
-    }).catch(e => { if (!disposed) setError(e.message); });
+    }).catch(e => { if (!disposed) reportError(e); });
     return () => { disposed = true; };
-  }, []);
+  }, [loadAttempt]);
   const run = async (operation: () => Promise<void>) => {
-    setBusy(true); setError(""); setMessage("");
-    try { await operation(); } catch (e) { setError(e instanceof Error ? e.message : label("操作失败", "Operation failed")); }
+    setBusy(true); setError("");
+    try { await operation(); } catch (e) { reportError(e);toast.error(e instanceof Error?e.message:String(e)); }
     finally { setBusy(false); }
   };
   const copy = async (text: string) => {
     if (!await copyText(text)) throw new Error(label("复制失败，请检查剪贴板权限", "Copy failed. Check clipboard permission."));
   };
-  if (!settings) return <div role="status" className="p-3 text-sm text-tx-secondary">{error || label("正在加载剪贴板设置…", "Loading clipboard settings…")}</div>;
+  const retry = () => { setError(""); setNeedsAuthorization(false); setLoadAttempt(value => value + 1); };
+  const canReauthorize = needsAuthorization || !!(window as Window & { nowenDesktop?: { startBrowserAuth?: unknown } }).nowenDesktop?.startBrowserAuth;
+  const recovery = <div className="flex gap-2">
+    {canReauthorize && <button type="button" disabled={busy} onClick={onOpenSync} className="rounded-md bg-accent-primary px-3 py-1.5 text-sm text-white disabled:opacity-50">{label("前往同步设置", "Open sync settings")}</button>}
+    <button type="button" disabled={busy} onClick={retry} className="rounded-md border border-app-border px-3 py-1.5 text-sm hover:bg-app-hover">{label("重试", "Retry")}</button>
+  </div>;
+  const connectionFailed=needsAuthorization||(!settings&&!!error);
+  const integrated=!!settings?.enabled&&tokenSet&&tokenEnabled;
+  const header=<div className="flex items-center gap-2"><ClipboardCopy size={19} className="text-accent-primary"/><h2 className="text-base font-semibold text-tx-primary">{label("剪贴板集成","Clipboard integration")}</h2><span role="status" aria-label={label(connectionFailed?"需要连接":integrated?"已集成":"未集成",connectionFailed?"Connection required":integrated?"Connected":"Not connected")}>
+    {connectionFailed?<AlertCircle size={17} className="text-amber-500"/>:integrated?<CheckCircle2 size={17} className="text-emerald-500"/>:<Circle size={17} className="text-tx-tertiary"/>}
+  </span></div>;
+  if (!settings) return error
+    ? <div className="space-y-3 p-3">{header}<p role="alert" className="text-sm text-red-500">{error}</p>{recovery}</div>
+    : <div role="status" className="p-3 text-sm text-tx-secondary">{label("正在加载剪贴板设置…", "Loading clipboard settings…")}</div>;
   const patch = <K extends keyof ClipboardIntegrationSettings>(key: K, value: ClipboardIntegrationSettings[K]) => setSettings({ ...settings, [key]: value });
   const fieldClass = "mt-1 w-full rounded-md border border-app-border bg-app-surface px-2.5 py-1.5 text-sm text-tx-primary focus:outline-none focus:ring-2 focus:ring-accent-primary/40";
   const buttonClass = "inline-flex items-center justify-center gap-1.5 rounded-md border border-app-border px-2.5 py-1.5 text-xs hover:bg-app-hover disabled:opacity-50";
@@ -65,22 +89,23 @@ export default function ClipboardIntegrationPanel() {
   const copyEndpoint = () => standalone ? standaloneClipboardEndpoint(settings.standaloneUrl || "") : endpoint;
   const normalized = () => ({ ...settings, ...Object.fromEntries((["includeKeywords", "excludeKeywords", "excludeApps", "excludeExtensions"] as const).map(key => [key, settings[key].map(item => item.trim()).filter(Boolean)])) });
   return <TooltipProvider delayDuration={200}><div className="space-y-3" data-testid="clipboard-settings-compact">
-    <div className="flex items-center gap-2"><ClipboardCopy size={19} className="text-accent-primary" /><h2 className="text-base font-semibold text-tx-primary">{label("剪贴板集成", "Clipboard integration")}</h2><Help title={label("剪贴板集成", "Clipboard integration")} hint={label("智能收集文本，按规则和 AI 判断筛选，整理后自动归档到合适的目录或笔记，并保留原文。", "Collect text, filter it with rules and AI, organize it into suitable folders or notes, and preserve the original.")} /></div>
+    {header}
     <div role="tablist" aria-label={label("剪贴板集成页面","Clipboard integration pages")} className="flex gap-5 border-b border-app-border text-sm">
-      {(["configuration","logs"] as const).map(value=><button key={value} type="button" role="tab" aria-selected={tab===value} onClick={()=>setTab(value)} className={`border-b-2 px-1 py-2 ${tab===value?"border-accent-primary text-accent-primary":"border-transparent text-tx-secondary"}`}>{value==="logs"?label("日志","Logs"):label("配置","Configuration")}</button>)}
+      {(["configuration","logs"] as const).map(value=><button key={value} type="button" role="tab" aria-selected={tab===value} onClick={()=>setTab(value)} className={`border-b-2 px-1 py-2 ${tab===value?"border-accent-primary text-accent-primary":"border-transparent text-tx-secondary"}`}>{value==="logs"?label("收集记录","Collection records"):label("配置","Configuration")}</button>)}
     </div>
-    {tab==="logs"&&<ClipboardCaptureLogs/>}
+    {tab==="logs"&&<ClipboardCaptureLogs onOpenNote={onOpenNote} serverUrl={noteServerUrl}/>}
     <div hidden={tab!=="configuration"} className="space-y-3">
     <section className="space-y-2.5 rounded-lg border border-app-border p-3">
-      <div className="flex items-center justify-between gap-3">{toggle("enabled",label("启用剪贴板集成","Enable clipboard integration"),label("修改后保存。关闭时立即拒绝新的专用Token请求。","Save to apply. Disabling rejects new token requests."))}<span className="text-xs text-tx-tertiary">{label(tokenSet?"Token 已生成":"尚未生成 Token",tokenSet?"Token ready":"No token yet")}</span></div>
+      <div className="flex items-center justify-between gap-3">{toggle("enabled",label("启用剪贴板集成","Enable clipboard integration"),label("修改后保存。关闭时立即拒绝新的专用Token请求。","Save to apply. Disabling rejects new token requests."))}<span className="text-xs text-tx-tertiary">{label(tokenSet?(tokenEnabled?"Token 已启用 · 长期有效":"Token 已停用"):"尚未生成 Token",tokenSet?(tokenEnabled?"Token enabled · No expiry":"Token disabled"):"No token yet")}</span></div>
       <label className="flex items-center gap-3 text-xs text-tx-secondary">{label("集成方式","Connection method")}<AppSelect aria-label={label("集成方式","Connection method")} value={settings.integrationMode || "nas"} onChange={e=>patch("integrationMode",e.target.value as "nas" | "standalone")} className="rounded-md border border-app-border bg-app-surface px-2 py-1.5 text-sm text-tx-primary"><option value="nas">{label("NAS 网关","NAS gateway")}</option><option value="standalone">{label("独立服务","Standalone service")}</option></AppSelect><Help title={label("集成方式","Connection method")} hint={label("NAS 网关由剪贴板软件登录飞牛；独立服务通过专用 Token 直接调用笔记服务。两种方式共用当前账号的过滤和归档规则。","NAS gateway uses its existing sign-in session. Standalone connects directly with a dedicated token. Both use this account’s filtering and filing rules.")} /></label>
       {standalone && <label className="block text-xs text-tx-secondary">{label("独立服务地址","Standalone service address")}<input aria-label={label("独立服务地址","Standalone service address")} value={settings.standaloneUrl || ""} onChange={e=>patch("standaloneUrl",e.target.value)} placeholder="https://notes.example.com" className={fieldClass} /></label>}
       <label className="block text-xs text-tx-secondary">{label(standalone ? "提交接口地址" : delivery === "direct" ? "提交接口" : "NAS 服务地址",standalone ? "Submission endpoint" : delivery === "direct" ? "Submission endpoint" : "NAS service address")}<input aria-label={label(standalone ? "提交接口地址" : delivery === "direct" ? "提交接口" : "NAS 服务地址",standalone ? "Submission endpoint" : delivery === "direct" ? "Submission endpoint" : "NAS service address")} readOnly value={standalone ? standaloneEndpoint : endpoint} className={fieldClass} /></label>
       <div className="flex flex-wrap gap-2">
-        <button type="button" disabled={busy} className={buttonClass} onClick={() => void run(async()=>{await copy(copyEndpoint());setMessage(label("服务地址已复制","Service address copied"));})}><Copy size={14}/>{label(standalone || delivery === "direct" ? "复制接口地址" : "复制 NAS 地址",standalone || delivery === "direct" ? "Copy endpoint" : "Copy NAS address")}</button>
-        <button type="button" disabled={busy} className={buttonClass} onClick={() => void run(async()=>{const value=await clipboardIntegrationApi.token();setTokenSet(true);await copy(value.token);setMessage(label("Token 已复制","Token copied"));})}><ClipboardCopy size={14}/>{label("复制 Token","Copy token")}</button>
-        <button type="button" disabled={busy||!tokenSet} className={buttonClass} onClick={() => void run(async()=>{const value=await clipboardIntegrationApi.token(true);setTokenSet(true);await copy(value.token);setMessage(label("新 Token 已复制，旧 Token 已失效，请更新剪贴板软件配置。","New token copied. The old token is revoked; update your clipboard app."));})}><RefreshCw size={14}/>{label("重置并复制","Reset and copy")}</button>
-        <button type="button" disabled={busy||!tokenSet} className={buttonClass} onClick={() => void run(async()=>{await clipboardIntegrationApi.revoke();setTokenSet(false);setMessage(label("Token 已撤销","Token revoked"));})}><Trash2 size={14}/>{label("撤销 Token","Revoke token")}</button>
+        <button type="button" disabled={busy} className={buttonClass} onClick={() => void run(async()=>{await copy(copyEndpoint());toast.success(label("服务地址已复制","Service address copied"));})}><Copy size={14}/>{label(standalone || delivery === "direct" ? "复制接口地址" : "复制 NAS 地址",standalone || delivery === "direct" ? "Copy endpoint" : "Copy NAS address")}</button>
+        <button type="button" disabled={busy} className={buttonClass} onClick={() => void run(async()=>{const value=await clipboardIntegrationApi.token();if(!tokenSet)setTokenEnabled(true);setTokenSet(true);await copy(value.token);toast.success(label("Token 已复制","Token copied"));})}><ClipboardCopy size={14}/>{label("复制 Token","Copy token")}</button>
+        <button type="button" disabled={busy||!tokenSet} className={buttonClass} onClick={() => void run(async()=>{const value=await clipboardIntegrationApi.token(true);setTokenSet(true);setTokenEnabled(true);await copy(value.token);toast.success(label("新 Token 已复制，旧 Token 已失效，请更新剪贴板软件配置。","New token copied. The old token is revoked; update your clipboard app."));})}><RefreshCw size={14}/>{label("重置并复制","Reset and copy")}</button>
+        <button type="button" disabled={busy||!tokenSet} className={buttonClass} onClick={()=>void run(async()=>{const state=await clipboardIntegrationApi.setTokenEnabled(!tokenEnabled);setTokenEnabled(state.tokenEnabled??false);toast.success(label(state.tokenEnabled?"Token 已启用":"Token 已停用",state.tokenEnabled?"Token enabled":"Token disabled"));})}><Power size={14}/>{label(tokenEnabled?"停用 Token":"启用 Token",tokenEnabled?"Disable token":"Enable token")}</button>
+        <button type="button" disabled={busy||!tokenSet} className={buttonClass} onClick={() => void run(async()=>{await clipboardIntegrationApi.revoke();setTokenSet(false);setTokenEnabled(false);toast.success(label("Token 已撤销","Token revoked"));})}><Trash2 size={14}/>{label("撤销 Token","Revoke token")}</button>
         <Help title="Token" hint={label("首次复制时生成，之后可重复复制。请求头为Authorization: Bearer <Token>，仅允许智能收集。重置后旧Token立即失效。","Created on first copy and reusable. Header: Authorization: Bearer <Token>. Capture access only; resetting revokes the old token.")} />
       </div>
 
@@ -99,7 +124,7 @@ export default function ClipboardIntegrationPanel() {
         {field("excludeExtensions",label("排除扩展名","Excluded extensions"),label("例如exe、zip，每行一项；客户端需提供fileName。","For example exe or zip, one per line; requires fileName metadata."))}
       </div>
       <div className="mt-2.5 border-t border-app-border pt-2.5">
-        {toggle("aiFilterEnabled",label("启用 AI 过滤","Enable AI filtering"),label("规则通过后，AI按提示词判断是否收集。关闭时不执行额外AI过滤；归档时仍会跳过用途不明内容。AI异常保留原文，可重试。","After rules pass, AI decides whether to collect. Disabling skips the extra AI filter; filing still skips unclear content. AI errors retain the original and allow retry."))}
+        {toggle("aiFilterEnabled",label("启用 AI 过滤","Enable AI filtering"),label("自动收集始终检查内容价值和凭据上下文。开启此项可增加自定义条件；关闭仅停用自定义条件。AI异常保留待处理内容，可重试。","Automatic capture always checks usefulness and credential context. This switch adds custom conditions; disabling removes only those conditions. AI failures retain pending content for retry."))}
         {settings.aiFilterEnabled && <label className="mt-2 block text-xs text-tx-secondary">{label("AI 过滤提示词","AI filter instructions")}<textarea aria-label={label("AI 过滤提示词","AI filter instructions")} rows={2} maxLength={4000} value={settings.aiFilterPrompt} onChange={e=>patch("aiFilterPrompt",e.target.value)} placeholder={label("例如：只收集技术方案、学习资料和工作知识，忽略验证码、广告和闲聊。","For example: collect technical, learning and work knowledge; skip codes, ads and casual chat.")} className={fieldClass} /></label>}
       </div>
     </section>
@@ -112,8 +137,8 @@ export default function ClipboardIntegrationPanel() {
       </div>
     </section>
     <div className="sticky bottom-0 flex items-center gap-3 border-t border-app-border bg-app-surface py-2">
-      <button type="button" disabled={busy} onClick={() => void run(async()=>{if(standalone){if(!settings.standaloneUrl?.trim())throw new Error(label("请填写独立服务地址","Enter the standalone service address"));standaloneClipboardEndpoint(settings.standaloneUrl);}if(settings.aiFilterEnabled&&!settings.aiFilterPrompt.trim())throw new Error(label("请填写 AI 过滤提示词","Enter AI filter instructions"));const result=await clipboardIntegrationApi.save(normalized());setSettings(result.settings);setTokenSet(result.tokenSet);setMessage(label("剪贴板设置已保存","Clipboard settings saved"));})} className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-accent-primary px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50">{busy?<Loader2 size={15} className="animate-spin"/>:<Save size={15}/>} {label("保存设置","Save settings")}</button>
-      {error && <p role="alert" className="text-xs text-red-500">{error}</p>}{message && <p role="status" className="text-xs text-accent-primary">{message}</p>}
+      <button type="button" disabled={busy} onClick={() => void run(async()=>{if(standalone){if(!settings.standaloneUrl?.trim())throw new Error(label("请填写独立服务地址","Enter the standalone service address"));standaloneClipboardEndpoint(settings.standaloneUrl);}if(settings.aiFilterEnabled&&!settings.aiFilterPrompt.trim())throw new Error(label("请填写 AI 过滤提示词","Enter AI filter instructions"));const result=await clipboardIntegrationApi.save(normalized());setSettings(result.settings);setTokenSet(result.tokenSet);setTokenEnabled(result.tokenEnabled??result.tokenSet);toast.success(label("剪贴板设置已保存","Clipboard settings saved"));})} className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-accent-primary px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50">{busy?<Loader2 size={15} className="animate-spin"/>:<Save size={15}/>} {label("保存设置","Save settings")}</button>
+      {needsAuthorization&&recovery}
     </div>
     </div>
   </div></TooltipProvider>;

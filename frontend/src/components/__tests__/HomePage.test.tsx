@@ -25,12 +25,23 @@ async function render(refreshToken = 0) { await act(async () => root.render(<Hom
 function button(text: string) { return [...host.querySelectorAll("button")].find(el => el.textContent === text)!; }
 function input(el: HTMLInputElement | HTMLTextAreaElement, text: string) { act(() => { Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value")!.set!.call(el, text); el.dispatchEvent(new Event("input", { bubbles: true })); }); }
 const summaryNote = (id: string, extra = {}) => ({ id, title: `概览笔记${id}`, contentText: "预览正文", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...extra });
-it("shows the site logo and name above the home capture area", async () => {
+it("puts the full-width search below the brand without repeating the action label", async () => {
   await render();
   const header = host.querySelector("header")!;
   expect(header.textContent).toContain("nowen-note");
   expect(header.querySelector('[aria-hidden="true"]')?.textContent).toBe("N");
-  expect(header.textContent).toContain("让想法，有迹可循");
+  expect(header.querySelector("h1")?.textContent).toBe("nowen-note");
+  expect(header.textContent).not.toContain("让想法，有迹可循");
+  expect(host.textContent).not.toContain("记下灵感，也找回每一次思考。");
+  const search = host.querySelector('section[aria-label="搜索"]')!;
+  const capture = host.querySelector('section[aria-label="随手收集"]')!;
+  expect(header.nextElementSibling).toBe(search);
+  expect(search.parentElement).toBe(capture.parentElement?.parentElement);
+  expect(search.querySelector("h2")).toBeNull();
+  const submit = search.querySelector('button[type="submit"]')!;
+  expect(submit.textContent).toBe("");
+  expect(submit.getAttribute("aria-label")).toBe("搜索笔记");
+  expect(capture.querySelector("textarea")?.placeholder).toBe("粘贴文字，或拖入文件…");
 });
 it("loads the home overview without first opening a list and refreshes after changes", async () => {
   m.list.mockResolvedValueOnce([summaryNote("a"), summaryNote("b"), summaryNote("trash", { isTrashed: 1 }), summaryNote("archive", { isArchived: 1 })]);
@@ -50,20 +61,32 @@ it("does not show zero or another account's overview while a scoped request is p
 it("shows an overview failure instead of inventing an empty library", async () => {
   m.list.mockRejectedValueOnce(new Error("HTTP 503")); await render(); expect(host.textContent).toContain("无法加载笔记概览"); expect(host.textContent).not.toContain("全部 0 条");
 });
-it("parses SQLite UTC timestamps consistently with ISO timestamps in the overview", async () => {
-  const sql = new Date().toISOString().slice(0, 19).replace("T", " ");
-  m.list.mockResolvedValueOnce([summaryNote("sql", { createdAt: sql, updatedAt: sql })]);
-  await render(); expect(host.textContent).toContain("刚刚"); expect(host.textContent).not.toContain("8 小时前");
+it("sorts recent cards across timestamp formats and only shows their titles", async () => {
+  m.list.mockResolvedValueOnce([
+    summaryNote("iso", { updatedAt: "2026-11-19T12:00:00Z", contentText: " " }),
+    summaryNote("sql", { updatedAt: "2026-11-19 13:00:00" }),
+  ]);
+  await render();
+  const cards = [...host.querySelectorAll('section[aria-labelledby="home-recent-title"] button')];
+  expect(cards.map(card => card.textContent)).toEqual(["概览笔记sql", "概览笔记iso"]);
+  expect(host.textContent).not.toContain("最近更新于");
 });
 it("opens the dedicated search page and delegates knowledge questions", async () => {
   m.search.mockResolvedValue([{ id: "note-1", title: "项目记录", snippet: "相关正文" }]);
   m.ask.mockImplementation(async (_q, _h, chunk, refs) => { chunk("回答正文"); refs([{ id: "note-1", title: "来源笔记" }]); return "回答正文"; });
-  await render(); input(host.querySelector("input")!, "项目");
+  await render();
+  const field = host.querySelector("input")!;
+  expect(button("搜索笔记").getAttribute("aria-pressed")).toBe("true");
+  expect(field.placeholder).toBe("搜索笔记标题与正文…");
+  input(field, "项目");
   await act(async () => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   expect(resource).toHaveBeenCalledWith("项目");
   expect(m.search).not.toHaveBeenCalled();
   expect(host.textContent).not.toContain("项目记录");
   await act(async () => button("知识问答").click());
+  expect(button("知识问答").getAttribute("aria-pressed")).toBe("true");
+  expect(button("搜索笔记").getAttribute("aria-pressed")).toBe("false");
+  expect(field.placeholder).toBe("向你的笔记提个问题…");
   await act(async () => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   expect(m.openAsk).toHaveBeenCalledWith("项目");expect(m.ask).not.toHaveBeenCalled();expect(host.textContent).not.toContain("回答正文");
 });

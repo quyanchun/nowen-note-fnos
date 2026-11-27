@@ -8,7 +8,7 @@ const crypto = require("crypto");
 
 const { buildMenu, applyFormatState } = require("./menu");
 const { createTray, destroyTray, markQuitting, getIsQuitting } = require("./tray");
-const { initAutoUpdater, checkForUpdatesManually, setUpdaterContext } = require("./updater");
+const { initAutoUpdater, setUpdaterContext } = require("./updater");
 const { isMicrosoftStorePackage } = require("./storeChannel");
 const { initLogger, getLogDir } = require("./logger");
 const { createRendererRecoveryGate } = require("./renderer-recovery");
@@ -63,6 +63,7 @@ initLogger({
 
 let mainWindow = null;
 let splashWindow = null;
+let disposeQuickPanel;
 let backendProcess = null;
 let backendPort = 0;
 // 当前运行模式快照（在 ready 时读 settings.json 后赋值）
@@ -2628,9 +2629,12 @@ app.whenReady().then(async () => {
     return;
   }
 
+  if (process.platform === "darwin") {
+    disposeQuickPanel = require("./quick-panel").installQuickPanel(() => mainWindow);
+  }
+
   // 原生菜单（accelerator 同时担当全局快捷键）
   buildMenu({
-    onCheckForUpdates: () => checkForUpdatesManually(),
     openAboutWindow,
     mode: currentMode,
     liteOnly: isLiteOnlyBuild(),
@@ -2839,6 +2843,7 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   markQuitting();
+  disposeQuickPanel?.();
   stopBackend();
   destroyTray();
   try { shutdownDiscovery(); } catch { /* ignore */ }

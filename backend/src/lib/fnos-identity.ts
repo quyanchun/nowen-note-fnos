@@ -29,11 +29,36 @@ export function getLinkedFnosUid(userId: string): string | null {
   return (db.prepare("SELECT uid FROM fnos_identities WHERE userId = ?").get(userId) as { uid: string } | undefined)?.uid ?? null;
 }
 
+function ensurePasswordState() {
+  const db = getDb();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fnos_identities'").get()) return false;
+  if (!(db.prepare("PRAGMA table_info(fnos_identities)").all() as { name: string }[]).some(column => column.name === "localPasswordSet")) {
+    db.transaction(() => {
+      db.exec("ALTER TABLE fnos_identities ADD COLUMN localPasswordSet INTEGER NOT NULL DEFAULT 0");
+      // Earlier password changes/reset operations incremented tokenVersion. Preserve their verification.
+      db.exec("UPDATE fnos_identities SET localPasswordSet = 1 WHERE userId IN (SELECT id FROM users WHERE tokenVersion > 0)");
+    })();
+  }
+  return true;
+}
+
+export function requiresCurrentPassword(userId: string): boolean {
+  if (!ensurePasswordState()) return true;
+  const link = getDb().prepare("SELECT localPasswordSet FROM fnos_identities WHERE userId = ?").get(userId) as { localPasswordSet: number } | undefined;
+  return !link || link.localPasswordSet !== 0;
+}
+
+export function markLocalPasswordSet(userId: string): void {
+  if (ensurePasswordState()) getDb().prepare("UPDATE fnos_identities SET localPasswordSet = 1 WHERE userId = ?").run(userId);
+}
+
 export function getFnosAccount(identity: FnosIdentity) {
   const db = getDb();
   db.exec(`CREATE TABLE IF NOT EXISTS fnos_identities (
-    uid TEXT PRIMARY KEY, userId TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE
+    uid TEXT PRIMARY KEY, userId TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    localPasswordSet INTEGER NOT NULL DEFAULT 0
   )`);
+  ensurePasswordState();
   return db.transaction(() => {
     const link = db.prepare("SELECT userId FROM fnos_identities WHERE uid = ?").get(identity.uid) as { userId: string } | undefined;
     let id = link?.userId;

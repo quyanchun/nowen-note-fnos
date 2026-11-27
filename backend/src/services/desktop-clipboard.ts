@@ -33,10 +33,10 @@ async function management(localUserId: string, suffix = "", method = "GET", body
     throw new CaptureError("DESKTOP_NAS_NETWORK", "当前服务连接未完成，请重试；操作结果请刷新日志确认",502);
   }
   const data = await response.json().catch(() => null) as any;
-  if (!response.ok || !data) throw new CaptureError(data?.code || "DESKTOP_NAS_UNAVAILABLE",
+  if (!response.ok || !data) throw new CaptureError(response.status === 401 || response.status === 403 ? "DESKTOP_NAS_AUTH_EXPIRED" : data?.code || "DESKTOP_NAS_UNAVAILABLE",
     response.status === 401 || response.status === 403 ? "NAS 授权已失效，请在桌面客户端重新授权"
       : response.status === 404 ? `笔记服务入口未找到（HTTP 404），${getRemoteCredential(profile.id)?.transport === "fnos-session" ? "请检查飞牛应用中心是否已启用笔记应用" : "请检查笔记服务地址和部署版本"}`
-      : data?.error || (suffix.startsWith("/logs") ? "无法读取服务端收集日志" : "无法读取服务端剪贴板设置"),
+      : data?.error || (suffix.startsWith("/logs") ? "无法读取服务端收集记录" : "无法读取服务端剪贴板设置"),
     response.status === 401 || response.status === 403 ? 409 : response.status >= 500 ? 502 : 400);
   if (profileFor(localUserId).profile.id !== profile.id) throw required();
   return data;
@@ -46,9 +46,11 @@ export async function desktopClipboardSettings(localUserId: string) {
   const { profile } = profileFor(localUserId);
   const [state, response] = await Promise.all([
     management(localUserId),
-    scopedFetch(profile.id, profile.serverUrl)(`${profile.serverUrl}/api/notebooks`, { signal: AbortSignal.timeout(15000) }),
+    scopedFetch(profile.id, profile.serverUrl)(`${profile.serverUrl}/api/notebooks`, { signal: AbortSignal.timeout(15000) })
+      .catch(() => { throw new CaptureError("DESKTOP_NAS_NETWORK", "无法连接笔记服务，请重试或重新授权", 502); }),
   ]);
   const folders = await response.json().catch(() => null) as any;
+  if (response.status === 401 || response.status === 403) throw new CaptureError("DESKTOP_NAS_AUTH_EXPIRED", "NAS 授权已失效，请在桌面客户端重新授权", 409);
   if (!response.ok || !Array.isArray(folders)) throw new CaptureError("DESKTOP_NAS_UNAVAILABLE", "无法读取 NAS 文件夹", 502);
   if (profileFor(localUserId).profile.id !== profile.id) throw required();
   return { ...state, delivery: "desktop", serverUrl: profile.serverUrl,
@@ -75,7 +77,9 @@ export async function revokeDesktopClipboardToken(localUserId: string) {
   await management(localUserId, "/token", "DELETE");
   return { success: true };
 }
+export const setDesktopClipboardTokenEnabled=(userId:string,enabled:boolean)=>management(userId,"/token/status","PUT",{enabled});
 
-export const desktopClipboardLogs = (userId:string,offset:number) => management(userId,`/logs?offset=${offset}`);
+export const desktopClipboardLogs = (userId:string,offset:number,status:"all"|"completed"|"filtered"="all") => management(userId,`/logs?offset=${offset}${status==="all"?"":"&status="+status}`);
 
-export const desktopClipboardLogAction=(userId:string,requestId:string,action:"delete"|"force"|"undo")=>management(userId,`/logs/${encodeURIComponent(requestId)}${action==="delete"?"":`/${action}`}`,action==="delete"?"DELETE":"POST",action==="delete"?undefined:{});
+export const desktopClipboardLogContent=(userId:string,requestId:string)=>management(userId,`/logs/${encodeURIComponent(requestId)}`);
+export const desktopClipboardLogAction=(userId:string,requestId:string,action:"delete"|"force"|"undo"|"edit",body?:unknown)=>management(userId,`/logs/${encodeURIComponent(requestId)}${action==="delete"?"":`/${action}`}`,action==="delete"?"DELETE":"POST",action==="delete"?undefined:body||{});

@@ -53,7 +53,18 @@ describe("笔记管理菜单的可视区域与滚动", () => {
     await act(async () => root.unmount());
     host.remove();
     vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("按未缩放的实际高度避让底边，不受打开动画影响", async () => {
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width: 182.4, height: 570, top: 0, left: 0, bottom: 570, right: 182.4, x: 0, y: 0, toJSON() {} });
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(600);
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(192);
+    await act(async () => host.querySelector<HTMLButtonElement>("#open")!.click());
+    await settle();
+    expect(Number.parseFloat(menu()!.style.top) + 600).toBeLessThanOrEqual(792);
   });
 
   it("菜单内部滚动不关闭，末项仍可选择", async () => {

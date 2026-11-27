@@ -6,6 +6,7 @@ import { initApiTokensTable } from "../lib/api-tokens.js";
 import { CaptureError, captureInput, getCapture, initCaptures, presentCapture, submitCapture, type CaptureActor } from "./captures.js";
 import { hasPermission, resolveNotebookPermission } from "../middleware/acl.js";
 import { captureImagesSchema } from "./capture-images";
+import { clipboardQualityFilter } from "./clipboard-quality";
 
 const lines = z.array(z.string().trim().min(1).max(200)).max(100);
 const serviceAddress = z.string().trim().max(2000).default("").refine(value => {
@@ -88,8 +89,9 @@ function integration(userId: string): Integration {
 }
 export function getClipboardSettings(userId: string) {
   const row = integration(userId);
-  const active = row.tokenId && getDb().prepare("SELECT 1 FROM api_tokens WHERE id=? AND revokedAt IS NULL").get(row.tokenId);
-  return { settings: clipboardSettingsSchema.parse(JSON.parse(row.settings)), tokenSet: !!active,
+  const token = row.tokenId ? getDb().prepare("SELECT revokedAt,expiresAt FROM api_tokens WHERE id=?").get(row.tokenId) as {revokedAt:string|null;expiresAt:string|null}|undefined : undefined;
+  return { settings: clipboardSettingsSchema.parse(JSON.parse(row.settings)), tokenSet: !!token,
+    tokenEnabled:!!token&&!token.revokedAt,tokenExpiresAt:token?.expiresAt||null,
     endpoint: process.env.NOWEN_CLIPBOARD_PUBLIC_URL || null,
     delivery: process.env.NOWEN_FNOS_SOCKET ? "desktop-required" : "direct" };
 }
@@ -119,7 +121,7 @@ export function saveClipboardSettings(userId: string, settings: ClipboardSetting
 export function copyClipboardToken(userId: string, rotate = false) {
   return getDb().transaction(() => {
     let row = integration(userId);
-    const active = row.tokenId && getDb().prepare("SELECT 1 FROM api_tokens WHERE id=? AND revokedAt IS NULL").get(row.tokenId);
+    const active = row.tokenId && getDb().prepare("SELECT 1 FROM api_tokens WHERE id=?").get(row.tokenId);
     if (!active || !row.nonce || hash(rawToken(row)!) !== row.tokenHash || rotate) {
       if (row.tokenId) getDb().prepare("UPDATE api_tokens SET revokedAt=datetime('now') WHERE id=?").run(row.tokenId);
       row = { ...row, nonce: randomBytes(32).toString("base64url"), tokenId: randomUUID() };
@@ -141,6 +143,12 @@ export function revokeClipboardToken(userId: string) {
     getDb().prepare("UPDATE clipboard_integrations SET nonce=NULL,tokenId=NULL,tokenHash=NULL WHERE userId=?").run(userId);
   })();
 }
+export function setClipboardTokenEnabled(userId:string,enabled:boolean) {
+  const row=integration(userId);
+  if(!row.tokenId||!row.nonce)throw new CaptureError("CLIPBOARD_TOKEN_MISSING","请先生成 Token",409);
+  getDb().prepare("UPDATE api_tokens SET revokedAt=? WHERE id=? AND userId=?").run(enabled?null:new Date().toISOString(),row.tokenId,userId);
+  return getClipboardSettings(userId);
+}
 export function authenticateClipboard(raw: string): CaptureActor {
   initClipboardIntegration();
   if (!/^ncc_[A-Za-z0-9_-]{43}$/.test(raw)) throw new CaptureError("CLIPBOARD_TOKEN_INVALID", "剪贴板Token无效或已撤销", 401);
@@ -160,13 +168,15 @@ export function clipboardFilter(settings: ClipboardSettings, input: Submission):
   if (settings.excludeApps.some(app => input.sourceApp.toLowerCase() === app.toLowerCase())) return "APP_EXCLUDED";
   const extension = input.fileName.split(".").slice(1).at(-1)?.toLowerCase();
   if (extension && settings.excludeExtensions.some(ext => ext.replace(/^\./, "").toLowerCase() === extension)) return "EXTENSION_EXCLUDED";
-  // A bare credential carries no service/account context for automatic filing.
-  if (!input.noteId && input.kind === "text" && !input.images?.length
-    && /^(?:Bearer\s+)?(?:sk-|ncc_)[A-Za-z0-9._~+\/-]{16,}={0,2}$/i.test(input.content.trim())) return "CAPTURE_UNCLEAR_PURPOSE";
+  if (input.kind === "text" && !input.images?.length) {
+    const quality = clipboardQualityFilter(input.content);
+    if (quality && (quality.sensitive || !input.noteId)) return quality.code;
+  }
   return null;
 }
 export function submitClipboard(actor: CaptureActor, input: Submission) {
-  const metadata = JSON.stringify({preview:input.content.slice(0,160),sourceApp:input.sourceApp,kind:input.kind});
+  const sensitive = input.kind === "text" && !input.images?.length && !!clipboardQualityFilter(input.content)?.sensitive;
+  const metadata = JSON.stringify({preview:sensitive?"缺少所属服务的账号或敏感片段（原文未保留）":input.content.slice(0,160),sourceApp:input.sourceApp,kind:input.kind});
   try { return getDb().transaction(() => {
     const db = getDb();
     const inputHash = hash(JSON.stringify(input));
@@ -184,6 +194,7 @@ export function submitClipboard(actor: CaptureActor, input: Submission) {
     if (reasonCode) result = { requestId: input.requestId, status: "filtered", reasonCode, duplicate: false };
     else {
       const effective = captureInput.parse({ requestId: input.requestId, content: input.content,
+        autoCollect: true,
         minFolderDepth: 2,
         organize: input.organize ?? settings.organize,
         instruction: [settings.instruction, input.instruction].filter(Boolean).join("\n").slice(0,2000),
@@ -196,20 +207,19 @@ export function submitClipboard(actor: CaptureActor, input: Submission) {
       const submitted = submitCapture(actor, effective); jobId = submitted.job.id;
       result = { ...presentCapture(submitted.job), duplicate: submitted.duplicate };
     }
-    const logMetadata=reasonCode==="CAPTURE_UNCLEAR_PURPOSE"?JSON.stringify({preview:"无用途说明的密钥片段",sourceApp:input.sourceApp,kind:input.kind}):metadata;
     db.prepare("INSERT INTO clipboard_submissions(userId,requestId,tokenId,inputHash,jobId,reasonCode,createdAt,metadata,originalInput) VALUES(?,?,?,?,?,?,datetime('now'),?,?)")
-      .run(actor.userId,input.requestId,actor.tokenId,inputHash,jobId,reasonCode,logMetadata,jobId?null:JSON.stringify(input));
+      .run(actor.userId,input.requestId,actor.tokenId,inputHash,jobId,reasonCode,metadata,jobId||sensitive?null:JSON.stringify(input));
     db.prepare("DELETE FROM clipboard_rejections WHERE userId=? AND requestId=?").run(actor.userId,input.requestId);
     return result;
   })(); } catch(error) {
     if (error instanceof CaptureError && !["CAPTURE_REQUEST_CONFLICT","CAPTURE_NOT_FOUND"].includes(error.code)) getDb().prepare(`INSERT INTO clipboard_rejections(userId,requestId,metadata,errorCode,originalInput) VALUES(?,?,?,?,?)
-      ON CONFLICT(userId,requestId) DO UPDATE SET errorCode=excluded.errorCode,updatedAt=datetime('now'),originalInput=excluded.originalInput`).run(actor.userId,input.requestId,metadata,error.code,JSON.stringify(input));
+      ON CONFLICT(userId,requestId) DO UPDATE SET metadata=excluded.metadata,errorCode=excluded.errorCode,updatedAt=datetime('now'),originalInput=excluded.originalInput`).run(actor.userId,input.requestId,metadata,error.code,sensitive?null:JSON.stringify(input));
     throw error;
   }
 }
 
 /** Account-only log: external collection Tokens cannot enumerate submitted content. */
-export function listClipboardLogs(userId:string, offset=0) {
+export function listClipboardLogs(userId:string, offset=0,filter:"all"|"completed"|"filtered"="all") {
   initClipboardIntegration();
   const rows=getDb().prepare(`WITH entries AS (
     SELECT s.requestId,COALESCE(a.forcedJobId,s.jobId) jobId,s.reasonCode,s.createdAt,s.metadata,s.originalInput,a.hiddenAt,'filtered' fallbackStatus FROM clipboard_submissions s
@@ -223,9 +233,11 @@ export function listClipboardLogs(userId:string, offset=0) {
     json_extract(j.result,'$.noteId') noteId,json_extract(j.result,'$.action') action,
     json_extract(j.result,'$.warnings') warnings,json_extract(j.result,'$.imageCount') imageCount,j.errorMessage,
     CASE WHEN e.originalInput IS NOT NULL OR j.input IS NOT NULL THEN 1 ELSE 0 END canForce
-    FROM entries e LEFT JOIN capture_jobs j ON j.id=e.jobId AND j.userId=? WHERE e.hiddenAt IS NULL ORDER BY createdAt DESC,e.requestId DESC LIMIT 31 OFFSET ?`).all(userId,userId,userId,offset) as any[];
+    FROM entries e LEFT JOIN capture_jobs j ON j.id=e.jobId AND j.userId=? WHERE e.hiddenAt IS NULL
+    AND (?='all' OR CASE WHEN j.undoneAt IS NOT NULL THEN 'undone' ELSE COALESCE(j.status,e.fallbackStatus) END=?)
+    ORDER BY createdAt DESC,e.requestId DESC LIMIT 31 OFFSET ?`).all(userId,userId,userId,filter,filter,offset) as any[];
   const hasMore=rows.length>30;
   return {items:rows.slice(0,30).map(({metadata,preview,warnings,...row})=>{
-    const meta=JSON.parse(metadata);return {...row,canForce:!!row.canForce&&["filtered","failed","undone"].includes(row.status),canUndo:row.status==="completed",warnings:warnings?JSON.parse(warnings):[],preview:preview??meta.preview??"",sourceApp:meta.sourceApp||"",kind:meta.kind||"text"};
+    const meta=JSON.parse(metadata);return {...row,canEdit:row.status==="filtered"||row.status==="completed"&&!!row.jobId,canForce:!!row.canForce&&["filtered","failed","undone"].includes(row.status),canUndo:row.status==="completed",warnings:warnings?JSON.parse(warnings):[],preview:preview??meta.preview??"",sourceApp:meta.sourceApp||"",kind:meta.kind||"text"};
   }),hasMore};
 }

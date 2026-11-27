@@ -49,4 +49,13 @@ describe("toast burst deduplication", () => {
     toast.dismiss(later);
     unsubscribe();
   });
+  it("automatically removes operation feedback after 2.8 seconds",()=>{
+    let latest:ToastItem[]=[];
+    const unsubscribe=subscribeToasts(items=>{latest=items;});
+    const id=toast.success("已撤销本次收集");
+    expect(latest.find(item=>item.id===id)?.duration).toBe(2800);
+    vi.advanceTimersByTime(2799);expect(latest.some(item=>item.id===id)).toBe(true);
+    vi.advanceTimersByTime(1);expect(latest.some(item=>item.id===id)).toBe(false);
+    unsubscribe();
+  });
 });
